@@ -60,12 +60,11 @@ drafts). Tokens a second: all requests together, per request, and the time to fi
 
 | Requests at once | NVFP4 | per request | TTFT | INT4-AR | per request | TTFT |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 66.8 | 66.8 | 101 ms | 89.3 | 89.3 | 76 ms |
-| 2 | 97.1 | 50.2 | 190 ms | 135.0 | 73.7 | 113 ms |
-| 3 | 125.5 | 45.0 | 179 ms | - | - | - |
-| 4 | 150.8 | 40.3 | 262 ms | 220.2 | 58.8 | 167 ms |
-| 8 | 221.3 | 30.9 | 344 ms | 284.9 | 43.0 | 288 ms |
-| 16 | 395.7 | 26.6 | 536 ms | 483.6 | 35.1 | 461 ms |
+| 1 | 67.4 | 67.4 | 104 ms | 89.3 | 89.3 | 76 ms |
+| 2 | 98.9 | 50.5 | 174 ms | 135.0 | 73.7 | 113 ms |
+| 4 | 152.2 | 40.9 | 248 ms | 220.2 | 58.8 | 167 ms |
+| 8 | 231.2 | 31.6 | 349 ms | 284.9 | 43.0 | 288 ms |
+| 16 | 390.1 | 26.8 | 516 ms | 483.6 | 35.1 | 461 ms |
 
 **Prefill** (tokens a second, and the time to first token), measured earlier the same day (bf16 KV, 8 requests at
 once); this release's prompt path is faster still.
@@ -90,7 +89,7 @@ or pass `./start.sh --quant int4ar` (`./start.sh restart --quant ...` switches a
 
 | `QUANT` | Checkpoint | What it is | Speed here |
 | --- | --- | --- | --- |
-| `nvfp4` (default) | [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) @ `fc694b54`, ~124 GiB | the full model: all 10 routed experts a token, 6.0B active parameters | prose 66.8 tok/s alone, 221.3 for 8 requests, 395.7 for 16; prefill ~2,500-2,750 tok/s |
+| `nvfp4` (default) | [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) @ `fc694b54`, ~124 GiB | the full model: all 10 routed experts a token, 6.0B active parameters | prose 67.4 tok/s alone, 231.2 for 8 requests, 390.1 for 16; prefill ~2,500-2,750 tok/s |
 | `int4ar` | [`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound) @ `1464274`, ~122 GiB | 5 routed experts a token instead of 10, with a healed shared expert, 4.8B active: faster, and about 10% lower general capability on its authors' own harness (46.6-47.6 against the original's 51.8; tool use 91 against 91-92), per its model card | prose 89.3 tok/s alone, 284.9 for 8 requests, 483.6 for 16; prefill ~2,700-3,300 tok/s |
 
 Speeds from the sparkDash runs above ([Performance](#performance)). Both serve the same API, window and drafts; the replies differ between them (different weights), each exact against
