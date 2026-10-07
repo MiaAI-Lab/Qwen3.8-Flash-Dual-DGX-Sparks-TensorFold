@@ -7,6 +7,10 @@
   <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
 </p>
 
+<p align="center">
+  <img src=".github/image.png" alt="Qwen3.8 Flash Next on TensorFold, 2x DGX Sparks" width="100%" />
+</p>
+
 Serve **Qwen3.8-Flash-Next** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports) through
 an OpenAI-compatible API, with a **1,048,576-token context** (Qwen's YaRN over the
 native 262,144). It runs [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine, `tensorfold-native`
