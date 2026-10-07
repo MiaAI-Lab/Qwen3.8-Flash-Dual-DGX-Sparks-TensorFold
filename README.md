@@ -17,19 +17,29 @@ Up to **16 requests at once**, an **FP8 KV cache** (about 3.9M tokens of KV with
 and video input**, tool calls (including `tool_choice: "required"`), and two checkpoints to choose from: NVIDIA's
 NVFP4 or the faster INT4-AutoRound ([Choose a quant](#choose-a-quant)).
 
-**Credits** (full list in [Credits](#credits) and [`CREDITS.md`](CREDITS.md)):
-
-- [TensorFold](https://github.com/ashhart/TensorFold) and its Zig engine (branch [`zig-flashnext`](https://github.com/ashhart/TensorFold/tree/zig-flashnext)): by Ash Hart ([ashhart](https://github.com/ashhart)) and the [TensorFold contributors](https://github.com/ashhart/TensorFold/graphs/contributors)
-- The Zig CUDA serving path and the CUDA family registry: by Jürgen Schmied ([jschmied](https://github.com/jschmied)), [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443) (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac))
-- [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next): by the Qwen team (Alibaba)
-- The NVFP4 checkpoint [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4): by NVIDIA, with [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
-- The INT4-AR checkpoint [`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound), its top-5 expert cut and shared-expert healing: by azampatti ([azampatti](https://huggingface.co/azampatti))
-- Its AutoRound int4 quantization [`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound): by Intel
-- Its hybrid checkpoint and FP8 n-gram table [`Saren/Qwen3.8-Flash-Next-ple-table-fp8`](https://huggingface.co/Saren/Qwen3.8-Flash-Next-ple-table-fp8): by Saren-Arterius ([Saren-Arterius](https://github.com/Saren-Arterius))
-- The RoCEnante protocol our one-shot RoCE all-gather implements (new code): [b12x](https://github.com/local-inference-lab/b12x) by local-inference-lab (Apache-2.0)
-- Image and video input: adapted from patches 0008 and 0009 of MiaAI-Lab's [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold), running TensorFold's vision code by Ash Hart and the TensorFold contributors
-- The FP8 KV cache format: adapted from patch 0038-glm-kv-fp8 of MiaAI-Lab's [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
-- [Zig](https://ziglang.org): by the Zig Software Foundation and the Zig contributors
+**Credits.** Built on [TensorFold](https://github.com/ashhart/TensorFold) and its Zig engine by Ash Hart
+([ashhart](https://github.com/ashhart)) and the [TensorFold contributors](https://github.com/ashhart/TensorFold/graphs/contributors)
+(the Flash Next CUDA engine here is ported from TensorFold's Python Flash Next CUDA engine, written by them), branch [`zig-flashnext`](https://github.com/ashhart/TensorFold/tree/zig-flashnext);
+the Zig CUDA serving path and the CUDA family registry, authored by Jürgen Schmied
+([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
+(commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac));
+[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team (Alibaba); the NVFP4 checkpoint
+[`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) by NVIDIA, made with
+[NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer); the INT4-AR checkpoint
+[`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound)
+by azampatti ([azampatti](https://huggingface.co/azampatti)), who authored its top-5 expert cut and the
+shared-expert healing, built on Intel's AutoRound int4 quantization
+([`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)) and on
+the hybrid checkpoint and FP8 n-gram table by Saren-Arterius ([Saren-Arterius](https://github.com/Saren-Arterius),
+[`Saren/Qwen3.8-Flash-Next-ple-table-fp8`](https://huggingface.co/Saren/Qwen3.8-Flash-Next-ple-table-fp8)); and [Zig](https://ziglang.org) by the Zig
+Software Foundation and the Zig contributors. The one-shot RoCE all-gather (`TF_FLASHNEXT_ROCE`) implements the
+RoCEnante protocol of [b12x](https://github.com/local-inference-lab/b12x) by local-inference-lab (Apache-2.0); our
+implementation is new code written for this engine. Image and video input is adapted from the patches 0008 and 0009 of
+MiaAI-Lab's [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) and uses TensorFold's vision code by Ash Hart and the TensorFold contributors; the FP8 KV cache
+format is adapted from MiaAI-Lab's GLM recipe patch 0038-glm-kv-fp8; image decoding and the tower use Hugging Face
+[transformers](https://github.com/huggingface/transformers) (Apache-2.0), [PyAV](https://github.com/PyAV-Org/PyAV) / FFmpeg and Pillow. The scripts are MiaAI-Lab's, adapted from its
+[GLM-5.3-Flash two-Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold). The full
+list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).
 
 - Checkpoint ([choose a quant](#choose-a-quant)): [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
   at revision `fc694b54` by default: routed experts in NVFP4, the n-gram table and the MTP experts in FP8, bf16
@@ -475,26 +485,16 @@ above covers this repository's own work only.
 
 ## Credits
 
-Built on [TensorFold](https://github.com/ashhart/TensorFold) and its Zig engine by Ash Hart
-([ashhart](https://github.com/ashhart)) and the [TensorFold contributors](https://github.com/ashhart/TensorFold/graphs/contributors)
-(the Flash Next CUDA engine here is ported from TensorFold's Python Flash Next CUDA engine, written by them), branch [`zig-flashnext`](https://github.com/ashhart/TensorFold/tree/zig-flashnext);
-the Zig CUDA serving path and the CUDA family registry, authored by Jürgen Schmied
-([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
-(commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac));
-[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team (Alibaba); the NVFP4 checkpoint
-[`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) by NVIDIA, made with
-[NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer); the INT4-AR checkpoint
-[`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound)
-by azampatti ([azampatti](https://huggingface.co/azampatti)), who authored its top-5 expert cut and the
-shared-expert healing, built on Intel's AutoRound int4 quantization
-([`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)) and on
-the hybrid checkpoint and FP8 n-gram table by Saren-Arterius ([Saren-Arterius](https://github.com/Saren-Arterius),
-[`Saren/Qwen3.8-Flash-Next-ple-table-fp8`](https://huggingface.co/Saren/Qwen3.8-Flash-Next-ple-table-fp8)); and [Zig](https://ziglang.org) by the Zig
-Software Foundation and the Zig contributors. The one-shot RoCE all-gather (`TF_FLASHNEXT_ROCE`) implements the
-RoCEnante protocol of [b12x](https://github.com/local-inference-lab/b12x) by local-inference-lab (Apache-2.0); our
-implementation is new code written for this engine. Image and video input is adapted from the patches 0008 and 0009 of
-MiaAI-Lab's [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) and uses TensorFold's vision code by Ash Hart and the TensorFold contributors; the FP8 KV cache
-format is adapted from MiaAI-Lab's GLM recipe patch 0038-glm-kv-fp8; image decoding and the tower use Hugging Face
-[transformers](https://github.com/huggingface/transformers) (Apache-2.0), [PyAV](https://github.com/PyAV-Org/PyAV) / FFmpeg and Pillow. The scripts are MiaAI-Lab's, adapted from its
-[GLM-5.3-Flash two-Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold). The full
-list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).
+The full list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).
+
+- [TensorFold](https://github.com/ashhart/TensorFold) and its Zig engine (branch [`zig-flashnext`](https://github.com/ashhart/TensorFold/tree/zig-flashnext)): by Ash Hart ([ashhart](https://github.com/ashhart)) and the [TensorFold contributors](https://github.com/ashhart/TensorFold/graphs/contributors)
+- The Zig CUDA serving path and the CUDA family registry: by Jürgen Schmied ([jschmied](https://github.com/jschmied)), [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443) (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac))
+- [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next): by the Qwen team (Alibaba)
+- The NVFP4 checkpoint [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4): by NVIDIA, with [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
+- The INT4-AR checkpoint [`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound), its top-5 expert cut and shared-expert healing: by azampatti ([azampatti](https://huggingface.co/azampatti))
+- Its AutoRound int4 quantization [`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound): by Intel
+- Its hybrid checkpoint and FP8 n-gram table [`Saren/Qwen3.8-Flash-Next-ple-table-fp8`](https://huggingface.co/Saren/Qwen3.8-Flash-Next-ple-table-fp8): by Saren-Arterius ([Saren-Arterius](https://github.com/Saren-Arterius))
+- The RoCEnante protocol our one-shot RoCE all-gather implements (new code): [b12x](https://github.com/local-inference-lab/b12x) by local-inference-lab (Apache-2.0)
+- Image and video input: adapted from patches 0008 and 0009 of MiaAI-Lab's [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold), running TensorFold's vision code by Ash Hart and the TensorFold contributors
+- The FP8 KV cache format: adapted from patch 0038-glm-kv-fp8 of MiaAI-Lab's [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+- [Zig](https://ziglang.org): by the Zig Software Foundation and the Zig contributors
