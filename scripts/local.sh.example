@@ -1,0 +1,11 @@
+# Copy to scripts/local.sh (not in git) and fill in this setup's values; scripts/config.sh reads it first.
+WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-copy-id user@192.0.2.2)
+# FABRIC_PEER=192.0.2.12       # the worker's CX7 address, when WORKER is reached over another network
+WORKER_WEIGHTS=nfs             # rank 1 reads the head's Hugging Face cache over NFS (README "Worker weights over NFS");
+                               # copy: the worker keeps its own copy instead (prepare.sh copies ~124 GiB)
+# NFS_PATH=/                   # the exported path as the worker mounts it: / (or the exported subpath) for an NFSv4
+                               # export with fsid=0; default: the head's HF_CACHE
+# NFS_SERVER=192.0.2.1         # the head's address the export allows (default: its address on the link)
+# WORKER_HF_CACHE=/models/hf   # the worker's Hugging Face cache when it is not its HF_HOME
+# HF_TOKEN=hf_...              # optional: a Hugging Face read token for the download (the checkpoint is public)
+# QUANT=int4ar                 # the INT4-AutoRound checkpoint instead of NVIDIA's NVFP4 (README "Choose a quant")
