@@ -5,9 +5,10 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## v1.0 (2026-10-07): Qwen3.8-Flash-Next on two DGX Sparks with TensorFold's Zig engine
 
-Image: TensorFold `zig-flashnext` at `db281878` with `patches/0001`-`0009` (the engine at `zig-next` `20e709a`), Zig
-0.17.0, on NVIDIA's PyTorch 26.07 container. Until a published image is pinned, `prepare.sh` builds it locally; the
-image build compiles the engine's Triton kernel set itself (no GPU, no checkpoint), byte for byte the gated set.
+Image: `ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold:zig-db28187-57a020c8d666`
+(`sha256:ab25d95979709261a2ac1cd50d9d14e8e29f775c784a4629230358ad94ffefab`): TensorFold `zig-flashnext` at `db281878`
+with `patches/0001`-`0009` (the engine at `zig-next` `20e709a`), Zig 0.17.0, on NVIDIA's PyTorch 26.07 container
+(`PULL=0` builds it locally instead). The image build compiles the engine's Triton kernel set itself (no GPU, no checkpoint), byte for byte the gated set.
 
 ### The engine (`patches/`)
 - **TensorFold's Flash Next CUDA engine ported to the Zig engine** (`tensorfold-native`): bit-exact against TensorFold's

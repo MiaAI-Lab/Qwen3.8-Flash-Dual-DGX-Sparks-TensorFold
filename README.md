@@ -134,7 +134,7 @@ set `FABRIC_PEER` to the worker's CX7 address. The worker needs no copy of this 
 NFS, which needs the head to export its Hugging Face cache once ([Worker weights over NFS](#worker-weights-over-nfs));
 `WORKER_WEIGHTS=copy` (the default without `scripts/local.sh`) copies the checkpoint to the worker instead.
 
-The first run sets up both Sparks (see below): the image on each (built on the head until a published one is pinned),
+The first run sets up both Sparks (see below): the image on each (pulled from GitHub Container Registry, or built on the head with `PULL=0`),
 the checkpoint (~124 GiB) downloaded on the head and read by the worker over NFS (or copied to it). Later starts load half of the weights on
 each Spark (about two minutes). `start.sh` shows each step and the server's log, runs a smoke test through both ranks, and
 prints `Qwen3.8-Flash-Next is now LIVE! on port 8888` with the endpoint.
@@ -206,8 +206,7 @@ other one. `DRY_RUN=1 ./start.sh` prints both ranks' `docker run` and the link f
    against its sha256), `zig build -Doptimize=fast fatbins install native` into `/opt/tensorfold`, on NVIDIA's
    `nvcr.io/nvidia/pytorch:26.07-py3`. Only the build reaches the image, with TensorFold's license files. It first
    pulls the published image `ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold:zig-db28187-<image hash>`,
-   by the digest pinned in `scripts/config.sh` (`IMAGE_TAG` / `IMAGE_DIGEST`; empty until the first image is
-   published) while the image hash is this release's (the patches, the kernel set and the Dockerfile); otherwise, or
+   by the digest pinned in `scripts/config.sh` (`IMAGE_TAG` / `IMAGE_DIGEST`, this release's image) while the image hash is this release's (the patches, the kernel set and the Dockerfile); otherwise, or
    with `PULL=0`, it builds.
 3. The same image on the worker: pulled, else streamed from the head (`docker save | docker load`), checked identical.
 4. The checkpoint, downloaded into `~/.cache/huggingface` on the head at its pinned revision, checked (every shard its

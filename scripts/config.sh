@@ -90,10 +90,9 @@ image_hash() {
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold}"
 # The published image of this release's patches, pinned: prepare.sh pulls it by digest (a tag can be moved, a digest
 # cannot) while image_hash still gives IMAGE_TAG's hash. Other hashes pull $GHCR_IMAGE:<TF_TAG>-<hash> when one is
-# published, else build locally. scripts/publish-image.sh prints both. Empty until the first image is published: then
-# prepare.sh builds the image on the head.
-IMAGE_TAG="${IMAGE_TAG:-}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-}"
+# published, else build locally. scripts/publish-image.sh prints both. Empty: prepare.sh builds the image on the head.
+IMAGE_TAG="${IMAGE_TAG:-zig-db28187-57a020c8d666}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:ab25d95979709261a2ac1cd50d9d14e8e29f775c784a4629230358ad94ffefab}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_TAG}-$(image_hash)"
