@@ -1,0 +1,47 @@
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -739,8 +739,8 @@
+         fn preparePrefill(self: *Self, s: *lanes.Stream) !*Lane {
+             const e = self.e;
+             const ids = s.prompt();
+-            const limit = ids.len + s.max_new + self.window;
+-            if (ids.len == 0 or limit > self.context) return error.PromptTooLong;
++            if (ids.len == 0 or ids.len > self.context or s.max_new > self.context - ids.len) return error.PromptTooLong;
++            const limit = ids.len + s.max_new + self.window; // speculative rows are outside the public context
+             // an image or video prompt also holds its rotary table and features while it fills (attachMedia)
+             const media_bytes: usize = if (s.media) |m| std.mem.alignForward(usize, ids.len * 12, 256) + std.mem.alignForward(usize, m.featureBytes(), 256) else 0;
+             const need = self.footprint(limit) + media_bytes;
+@@ -1582,12 +1582,31 @@
+     try std.testing.expectEqual(@as(usize, 0), t.seqs);
+ }
+ 
++test "a full prompt and reply window keeps speculative rows outside the context" {
++    const gpa = std.testing.allocator;
++    for ([_]usize{ 1, max_rows }) |window| {
++        for ([_]bool{ false, true }) |drafting| {
++            var t: Toy = .{ .gpa = gpa };
++            var b = Lanes(Toy).init(gpa, &t, drafting, 32, window);
++            defer b.deinit();
++            var s = try lanes.Stream.init(gpa, .{ .id = "full", .prompt = &.{ 1, 2, 3 }, .max_new = 29 });
++            defer s.deinit(gpa);
++            try b.backend().prefill(&s);
++            try std.testing.expectEqual(@as(usize, 32) + window, b.lanes.get(&s).?.seq.limit);
++            try std.testing.expectEqual((@as(usize, 32) + window) * 100, b.reserved);
++            b.backend().release(&s);
++            try std.testing.expectEqual(@as(usize, 0), t.seqs);
++            try std.testing.expectEqual(@as(usize, 0), b.reserved);
++        }
++    }
++}
++
+ test "a prompt past the window is refused before a sequence is made" {
+     const gpa = std.testing.allocator;
+     var t: Toy = .{ .gpa = gpa };
+     var b = Lanes(Toy).init(gpa, &t, false, 32, max_rows);
+     defer b.deinit();
+-    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 20 });
++    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 30 });
+     defer s.deinit(gpa);
+     try std.testing.expectError(error.PromptTooLong, b.backend().prefill(&s));
+     try std.testing.expectEqual(@as(usize, 0), t.seqs);
