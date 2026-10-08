@@ -144,7 +144,9 @@ index 4f9761b..7b2059f 100644
 +        fn lastMark(s: *lanes.Stream, at: usize) ?u32 {
 +            var mark: ?u32 = null;
 +            const n = s.prompt().len;
-+            for (s.reuse.marks) |m| if (m > at and m < n) mark = m;
++            for (s.reuse.marks) |m| {
++                if (m > at and m < n) mark = m;
++            }
 +            return mark;
 +        }
 +
