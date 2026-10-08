@@ -1,4 +1,4 @@
-TensorFold db281878ddb8..20e709a5e027 (20e709a): triton-replay-torch-ops
+TensorFold db281878ddb8..37763dfc3ee3 (37763df): triton-replay-torch-ops
 Apply from the checkout root with: git apply 0004-triton-replay-torch-ops.patch
 
  tools/zig/check_flashnext_lse.py                     |   68 ++++++++++

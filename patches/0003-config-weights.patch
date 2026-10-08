@@ -1,4 +1,4 @@
-TensorFold db281878ddb8..20e709a5e027 (20e709a): config-weights
+TensorFold db281878ddb8..37763dfc3ee3 (37763df): config-weights
 Apply from the checkout root with: git apply 0003-config-weights.patch
 
  zig/src/core/safetensors.zig                                    |    45 +-

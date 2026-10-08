@@ -1,28 +1,28 @@
-TensorFold db281878ddb8..20e709a5e027 (20e709a): engine
+TensorFold db281878ddb8..37763dfc3ee3 (37763df): engine
 Apply from the checkout root with: git apply 0005-engine.patch
 
- zig/src/cli/flashnext_cuda.zig                         | 1639 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_decode.zig             |  259 ++++++++++++++++++
- zig/src/families/flashnext/cuda_engine.zig             | 2020 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_forward.zig            | 2024 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ zig/src/cli/flashnext_cuda.zig                         | 1639 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_decode.zig             |  259 +++++++++++++++++
+ zig/src/families/flashnext/cuda_engine.zig             | 2085 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_forward.zig            | 2024 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  zig/src/families/flashnext/cuda_fp4_serial.zig         |  134 +++++++++
- zig/src/families/flashnext/cuda_fp8.zig                |  467 ++++++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_int4.zig               |  408 ++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_int4_check.zig         |  616 ++++++++++++++++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_moe_prompt.zig         |  377 ++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_mtp.zig                |  323 ++++++++++++++++++++++
- zig/src/families/flashnext/cuda_mtp_q4.zig             |  198 ++++++++++++++
- zig/src/families/flashnext/cuda_ngram.zig              |  200 ++++++++++++++
- zig/src/families/flashnext/cuda_nucleus.zig            |  380 ++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_prof.zig               |  199 ++++++++++++++
- zig/src/families/flashnext/cuda_prompt.zig             |  760 +++++++++++++++++++++++++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_rope.zig               |  442 ++++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_sampler.zig            |  150 +++++++++++
- zig/src/families/flashnext/cuda_state.zig              |  553 +++++++++++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_fp8.zig                |  467 +++++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_int4.zig               |  408 +++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_int4_check.zig         |  616 ++++++++++++++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_moe_prompt.zig         |  377 +++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_mtp.zig                |  323 +++++++++++++++++++++
+ zig/src/families/flashnext/cuda_mtp_q4.zig             |  198 +++++++++++++
+ zig/src/families/flashnext/cuda_ngram.zig              |  200 +++++++++++++
+ zig/src/families/flashnext/cuda_nucleus.zig            |  380 +++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_prof.zig               |  199 +++++++++++++
+ zig/src/families/flashnext/cuda_prompt.zig             |  760 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_rope.zig               |  442 +++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_sampler.zig            |  150 ++++++++++
+ zig/src/families/flashnext/cuda_state.zig              |  553 ++++++++++++++++++++++++++++++++++++
  zig/src/families/flashnext/cuda_vmm.zig                |  157 +++++++++++
  zig/src/families/flashnext/fixtures_cuda_gathered.json |    1 +
  zig/src/families/flashnext/fixtures_cuda_nucleus.json  |    1 +
- 21 files changed, 11308 insertions(+)
+ 21 files changed, 11373 insertions(+)
 
 diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
 new file mode 100644
@@ -1936,10 +1936,10 @@ index 0000000000000000000000000000000000000000..a85e807eaca4c195ff7044633e0a9bc1
 +}
 diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..df2cd741f22f9f315c4fa323013042791f93d070
+index 0000000000000000000000000000000000000000..9f2ec3a3497047ef8461fbecc36d03aa31469669
 --- /dev/null
 +++ b/zig/src/families/flashnext/cuda_engine.zig
-@@ -0,0 +1,2020 @@
+@@ -0,0 +1,2085 @@
 +//! The Flash Next CUDA engine (Python qwen4_exp/cuda/decode.py Engine and engine.py's setup), the contract of
 +//! work/PLAN.md "Engine API contract": the config, the extension kernels (cuda_kernels.zig), the torch-op kernels
 +//! (cuda_torch_ops.zig), the captured Triton set (`kernels_dir`: aot.json + cubins), the weights (cuda_weights.zig),
@@ -2053,6 +2053,9 @@ index 0000000000000000000000000000000000000000..df2cd741f22f9f315c4fa32301304279
 +/// Shared-round graphs kept at most (drafted rounds vary their windows' lengths; a composition is captured
 +/// the second time it is seen).
 +const max_multi_graphs = 192;
++
++/// The state of a class of captures after failures: rounds left to run eagerly, and the failures in a row.
++const CaptureFault = struct { pause: u32 = 0, streak: u32 = 0, total: u64 = 0 };
 +/// TF_FLASHNEXT_MULTI_GRAPHS: the most streams a shared step is captured for. Wider steps rarely repeat their
 +/// composition, are GPU-bound (the launches hide behind the kernels), and a capture costs a second enqueue plus the
 +/// instantiation: measured at TP=2, x8/x16/x32 run 2-27% faster eagerly (work/research/W6-rounds-profile.md).
@@ -2286,6 +2289,14 @@ index 0000000000000000000000000000000000000000..df2cd741f22f9f315c4fa32301304279
 +    pfill: ?*const Fill = null,
 +    graphs: std.AutoHashMapUnmanaged(GraphKey, cuda.graph.Exec) = .empty,
 +    captures: usize = 0,
++    /// a failed capture, instantiate or upload is not fatal: that round runs eagerly (the same bits) and captures
++    /// pause for a while (solo windows and shared rounds apart); TF_FLASHNEXT_GRAPH_LOG=1 logs the graph counts,
++    /// TF_FLASHNEXT_GRAPH_FAIL=N fails every N-th instantiate (a test of the fallback)
++    solo_fault: CaptureFault = .{},
++    multi_fault: CaptureFault = .{},
++    instantiated: u64 = 0,
++    graph_log: bool = false,
++    inject_every: u64 = 0,
 +    /// shared rounds' and shared MTP steps' graphs by composition (multiKey), and compositions seen once
 +    multi: std.AutoHashMapUnmanaged(u64, MultiGraph) = .empty,
 +    seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -2382,6 +2393,8 @@ index 0000000000000000000000000000000000000000..df2cd741f22f9f315c4fa32301304279
 +        // the shared expert's single-slice gate/up on fn_ops' K-serial kernel where it is faster (the same bits,
 +        // fp4-check; TF_FLASHNEXT_FP4_SERIAL=0 off)
 +        e.f.fp4_serial = !envOff("TF_FLASHNEXT_FP4_SERIAL");
++        e.graph_log = envGet("TF_FLASHNEXT_GRAPH_LOG") != null;
++        if (envGet("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
 +        if (envGet("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
 +        // shared rounds past the captured widths run their attention in one launch a kernel (attn_multi.py's
 +        // kernels, aot/w6-ks1 and later; without them, a stream at a time): TF_FLASHNEXT_ATTN_MULTI=N from N
@@ -3731,22 +3744,78 @@ index 0000000000000000000000000000000000000000..df2cd741f22f9f315c4fa32301304279
 +        if (e.graphs.get(key)) |g| return g.launchOn(e.stream);
 +        e.dropGraphsOf(key.seq, key.version, key.media);
 +        try e.body(head, rows);
++        // the eager run above is this call's result; a capture that fails from here on only costs the graph
++        if (e.solo_fault.pause > 0) {
++            e.solo_fault.pause -= 1;
++            return;
++        }
 +        try e.stream.synchronize();
-+        try cuda.graph.beginCapture(e.stream, .thread_local);
-+        e.body(head, rows) catch |err| {
-+            if (cuda.graph.endCapture(e.stream)) |g| {
-+                var x = g;
-+                x.deinit();
-+            } else |_| {}
-+            return err;
-+        };
-+        var g = try cuda.graph.endCapture(e.stream);
-+        defer g.deinit();
-+        var exec = try g.instantiate();
++        if (!e.capBegin(&e.solo_fault, "solo")) return;
++        const ok = if (e.body(head, rows)) |_| true else |err| e.capNote(&e.solo_fault, "solo", "capture", err);
++        var exec = e.capEnd(&e.solo_fault, "solo", ok) orelse return;
 +        errdefer exec.deinit();
-+        try exec.upload(e.stream);
 +        try e.graphs.put(e.gpa, key, exec);
 +        e.captures += 1;
++        e.capLog("solo");
++    }
++
++    /// Starts a thread-local capture on the engine's stream; false (noted) when the driver refuses.
++    fn capBegin(e: *Engine, f: *CaptureFault, comptime class: []const u8) bool {
++        cuda.graph.beginCapture(e.stream, .thread_local) catch |err| {
++            _ = e.capNote(f, class, "begin capture", err);
++            return false;
++        };
++        return true;
++    }
++
++    /// Ends the capture (always) and, when `ok`, instantiates and uploads it; null (noted) on any failure, with the
++    /// stream no longer capturing and nothing left allocated.
++    fn capEnd(e: *Engine, f: *CaptureFault, comptime class: []const u8, ok: bool) ?cuda.graph.Exec {
++        var g = cuda.graph.endCapture(e.stream) catch |err| {
++            if (ok) _ = e.capNote(f, class, "end capture", err);
++            return null;
++        };
++        defer g.deinit();
++        if (!ok) return null;
++        e.instantiated += 1;
++        if (e.inject_every > 0 and e.instantiated % e.inject_every == 0) {
++            std.log.warn("graph instantiate: injected failure (TF_FLASHNEXT_GRAPH_FAIL={d})", .{e.inject_every});
++            _ = e.capNote(f, class, "instantiate", error.CudaFailed);
++            return null;
++        }
++        if (e.graph_log) { // an earlier asynchronous error anywhere in the context would surface in the next graph call
++            const d = e.ctx.d;
++            const r = d.api.cuCtxSynchronize();
++            if (r != 0) std.log.warn("graph log: cuCtxSynchronize before an instantiate returned {s} ({d})", .{ d.errorName(r), r });
++        }
++        var exec = g.instantiate() catch |err| {
++            _ = e.capNote(f, class, "instantiate", err);
++            return null;
++        };
++        exec.upload(e.stream) catch |err| {
++            exec.deinit();
++            _ = e.capNote(f, class, "upload", err);
++            return null;
++        };
++        f.streak = 0;
++        return exec;
++    }
++
++    /// A capture failed: warn, run eagerly, and pause this class of captures for 64 rounds, doubling with each
++    /// failure in a row up to 4096. Returns false (the capture body's `ok`).
++    fn capNote(e: *Engine, f: *CaptureFault, comptime class: []const u8, what: []const u8, err: anyerror) bool {
++        f.total += 1;
++        f.streak +|= 1;
++        f.pause = @as(u32, 64) << @intCast(@min(f.streak - 1, 6));
++        const free: usize = if (e.ctx.memInfo()) |m| m.free else |_| 0;
++        std.log.warn("{s} graph {s} failed ({s}); the round runs eagerly (same result), no {s} captures for {d} rounds (failure {d}, {d} in a row); graphs live: {d} solo, {d} shared; {d} instantiated; {d} MiB device memory free", .{ class, what, @errorName(err), class, f.pause, f.total, f.streak, e.graphs.count(), e.multi.count(), e.instantiated, free >> 20 });
++        return false;
++    }
++
++    fn capLog(e: *Engine, comptime class: []const u8) void {
++        if (!e.graph_log or e.captures % 50 != 0) return;
++        const free: usize = if (e.ctx.memInfo()) |m| m.free else |_| 0;
++        std.log.info("graphs after {d} captures ({s}): {d} solo, {d} shared live; {d} instantiated; {d} MiB device memory free", .{ e.captures, class, e.graphs.count(), e.multi.count(), e.instantiated, free >> 20 });
 +    }
 +
 +    /// Graphs.warm: every decode window (1 .. depth + 1 rows) at both DeltaNet parities and every MTP step size
@@ -3824,26 +3893,22 @@ index 0000000000000000000000000000000000000000..df2cd741f22f9f315c4fa32301304279
 +            e.dropMulti(null);
 +            e.seen.clearRetainingCapacity();
 +        }
++        if (e.multi_fault.pause > 0) {
++            e.multi_fault.pause -= 1;
++            return;
++        }
 +        try e.stream.synchronize();
-+        try cuda.graph.beginCapture(e.stream, .thread_local);
++        if (!e.capBegin(&e.multi_fault, "shared")) return;
 +        const r = if (head) mtp.computeSegs(&e.f, segs, x) else e.f.computeSegs(segs, x, true);
-+        _ = r catch |err| {
-+            if (cuda.graph.endCapture(e.stream)) |g| {
-+                var y = g;
-+                y.deinit();
-+            } else |_| {}
-+            return err;
-+        };
-+        var g = try cuda.graph.endCapture(e.stream);
-+        defer g.deinit();
-+        var exec = try g.instantiate();
++        const ok = if (r) |_| true else |err| e.capNote(&e.multi_fault, "shared", "capture", err);
++        var exec = e.capEnd(&e.multi_fault, "shared", ok) orelse return;
 +        errdefer exec.deinit();
-+        try exec.upload(e.stream);
 +        const seqs = try e.gpa.alloc(usize, segs.len);
 +        errdefer e.gpa.free(seqs);
 +        for (segs, seqs) |sg, *q| q.* = @intFromPtr(sg.seq);
 +        try e.multi.put(e.gpa, k, .{ .exec = exec, .seqs = seqs });
 +        e.captures += 1;
++        e.capLog("shared");
 +    }
 +
 +    /// mtp_forward through a graph when it fits one (the stage stays outside).

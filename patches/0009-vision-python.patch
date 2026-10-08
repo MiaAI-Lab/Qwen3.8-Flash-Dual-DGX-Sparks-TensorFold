@@ -1,4 +1,4 @@
-TensorFold db281878ddb8..20e709a5e027 (20e709a): vision-python
+TensorFold db281878ddb8..37763dfc3ee3 (37763df): vision-python
 Apply from the checkout root with: git apply 0009-vision-python.patch
 
  src/tensorfold/cli.py                                  |   5 ++-

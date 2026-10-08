@@ -1,4 +1,4 @@
-TensorFold db281878ddb8..20e709a5e027 (20e709a): two-ranks
+TensorFold db281878ddb8..37763dfc3ee3 (37763df): two-ranks
 Apply from the checkout root with: git apply 0006-two-ranks.patch
 
  zig/src/cuda/nccl.zig                      |    5 +

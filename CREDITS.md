@@ -60,6 +60,10 @@ third-party notices that go with it (TensorFold's MIT and Apache-2.0 notices, Zi
 
 ## Recipe
 
+- **[321sssrt-bit](https://github.com/321sssrt-bit)**: reported, diagnosed and fixed the context-admission bug
+  ([issue #1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
+  [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2)): the admission change in
+  the engine patches, its tests, and `tools/context_boundary.py` are theirs.
 - The scripts (`start.sh`, `stop.sh`, `scripts/`) and the checks in `tools/` (`client.py`, `needle.py`,
   `toolcheck.py`, `prompt_reuse.py`; `long_context.py` and `exact.py` are new) are MiaAI-Lab's, adapted from
   MiaAI-Lab's own two-Spark recipe

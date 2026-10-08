@@ -439,6 +439,7 @@ checked and failed, 2 when it could not run, 3 when it ran but could not verify 
 | `tools/long_context.py [--sizes 128k,256k,512k,1M] [--out FILE]` | needles at five depths and key = value retrieval over long documents, scored exactly; `--compare A.json B.json` sets two server settings side by side on identical prompts |
 | `tools/toolcheck.py` | a tool call with an array argument comes back as a JSON array, streamed the same, and a tool result turn answers from it |
 | `tools/prompt_reuse.py [size] [turns]` | a conversation takes more turns, each resuming at least 90% of its prompt from the kept state |
+| `tools/context_boundary.py --context N` | use the running server's `--context`: full prompt/reply budgets succeed with drafts on/off, while one token over the window returns HTTP 400 |
 | `tools/exact.py` | the same greedy requests one at a time, with `"draft": false`, and all at once: the replies must be identical |
 | `tools/client.py "message"` | one chat request (thinking off unless `--think`), for a quick look |
 

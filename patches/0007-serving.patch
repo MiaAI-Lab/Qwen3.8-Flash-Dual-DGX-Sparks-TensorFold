@@ -1,7 +1,7 @@
-TensorFold db281878ddb8..20e709a5e027 (20e709a): serving
+TensorFold db281878ddb8..37763dfc3ee3 (37763df): serving
 Apply from the checkout root with: git apply 0007-serving.patch
 
- zig/src/core/lane_host.zig                 |  115 ++++++++--
+ zig/src/core/lane_host.zig                 |  115 +++++++--
  zig/src/core/lane_host_reuse_test.zig      |   61 +++++
  zig/src/core/lanes/backend.zig             |   14 ++
  zig/src/core/lanes/call_gate.zig           |  220 ++++++++++++++++++
@@ -11,10 +11,10 @@ Apply from the checkout root with: git apply 0007-serving.patch
  zig/src/core/lanes/engine_test.zig         |  107 +++++++++
  zig/src/core/lanes/fake.zig                |   43 ++++
  zig/src/core/lanes/lanes.zig               |    1 +
- zig/src/core/lanes/stream.zig              |   76 +++++++
- zig/src/families/flashnext/cuda_lanes.zig  | 1860 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- zig/src/families/flashnext/cuda_native.zig |  458 +++++++++++++++++++++++++++++++++++++
- 13 files changed, 3170 insertions(+), 23 deletions(-)
+ zig/src/core/lanes/stream.zig              |   76 ++++++
+ zig/src/families/flashnext/cuda_lanes.zig  | 1879 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ zig/src/families/flashnext/cuda_native.zig |  458 ++++++++++++++++++++++++++++++++++++
+ 13 files changed, 3189 insertions(+), 23 deletions(-)
 
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
 index 1ce29eb6c230e955a439d43fd4f196b5a8850183..5f8738449e85a80418e86ac1103bd7e692e473ff 100644
@@ -1277,10 +1277,10 @@ index ffa03ed9cae9730b81a26c10ee0fbccade9bf52e..1e3c65f6c0a46cfe36ab20b1ef510d97
 +}
 diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
 new file mode 100644
-index 0000000000000000000000000000000000000000..4f9761b0ac3c54ba308db090a6429671d58f93d2
+index 0000000000000000000000000000000000000000..d6408c957fcef7331776196e1af5207e76fe110b
 --- /dev/null
 +++ b/zig/src/families/flashnext/cuda_lanes.zig
-@@ -0,0 +1,1860 @@
+@@ -0,0 +1,1879 @@
 +//! The lane core's backend for Flash Next on CUDA (work/PLAN.md, W7): each stream has its own sequence on the
 +//! engine; a round runs up to `streams` (--parallel) streams' windows in one forward, each row's bits as alone
 +//! (the engine's shared rounds). The decode semantics are cuda_decode.zig's, made call by call: verify forwards
@@ -2022,8 +2022,8 @@ index 0000000000000000000000000000000000000000..4f9761b0ac3c54ba308db090a6429671
 +        fn preparePrefill(self: *Self, s: *lanes.Stream) !*Lane {
 +            const e = self.e;
 +            const ids = s.prompt();
-+            const limit = ids.len + s.max_new + self.window;
-+            if (ids.len == 0 or limit > self.context) return error.PromptTooLong;
++            if (ids.len == 0 or ids.len > self.context or s.max_new > self.context - ids.len) return error.PromptTooLong;
++            const limit = ids.len + s.max_new + self.window; // speculative rows are outside the public context
 +            // an image or video prompt also holds its rotary table and features while it fills (attachMedia)
 +            const media_bytes: usize = if (s.media) |m| std.mem.alignForward(usize, ids.len * 12, 256) + std.mem.alignForward(usize, m.featureBytes(), 256) else 0;
 +            const need = self.footprint(limit) + media_bytes;
@@ -2865,12 +2865,31 @@ index 0000000000000000000000000000000000000000..4f9761b0ac3c54ba308db090a6429671
 +    try std.testing.expectEqual(@as(usize, 0), t.seqs);
 +}
 +
++test "a full prompt and reply window keeps speculative rows outside the context" {
++    const gpa = std.testing.allocator;
++    for ([_]usize{ 1, max_rows }) |window| {
++        for ([_]bool{ false, true }) |drafting| {
++            var t: Toy = .{ .gpa = gpa };
++            var b = Lanes(Toy).init(gpa, &t, drafting, 32, window);
++            defer b.deinit();
++            var s = try lanes.Stream.init(gpa, .{ .id = "full", .prompt = &.{ 1, 2, 3 }, .max_new = 29 });
++            defer s.deinit(gpa);
++            try b.backend().prefill(&s);
++            try std.testing.expectEqual(@as(usize, 32) + window, b.lanes.get(&s).?.seq.limit);
++            try std.testing.expectEqual((@as(usize, 32) + window) * 100, b.reserved);
++            b.backend().release(&s);
++            try std.testing.expectEqual(@as(usize, 0), t.seqs);
++            try std.testing.expectEqual(@as(usize, 0), b.reserved);
++        }
++    }
++}
++
 +test "a prompt past the window is refused before a sequence is made" {
 +    const gpa = std.testing.allocator;
 +    var t: Toy = .{ .gpa = gpa };
 +    var b = Lanes(Toy).init(gpa, &t, false, 32, max_rows);
 +    defer b.deinit();
-+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 20 });
++    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 30 });
 +    defer s.deinit(gpa);
 +    try std.testing.expectError(error.PromptTooLong, b.backend().prefill(&s));
 +    try std.testing.expectEqual(@as(usize, 0), t.seqs);

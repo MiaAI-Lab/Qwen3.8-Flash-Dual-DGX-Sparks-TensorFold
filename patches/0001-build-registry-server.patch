@@ -1,10 +1,11 @@
-TensorFold db281878ddb8..20e709a5e027 (20e709a): build-registry-server
+TensorFold db281878ddb8..37763dfc3ee3 (37763df): build-registry-server
 Apply from the checkout root with: git apply 0001-build-registry-server.patch
 
  tests/test_native_contract.py       |   2 +
  zig/build/cuda.zig                  |  55 ++++++++++++++++++++++-----
  zig/src/cli/cuda_main.zig           |   3 ++
  zig/src/core/engine_api.zig         |  22 ++++++++++-
+ zig/src/cuda/graph.zig              |  15 ++++++--
  zig/src/cuda/kernels.zig            |  18 +++++++++
  zig/src/families/flashnext/cuda.zig |  62 ++++++++++++++++++++++++++++++
  zig/src/native/cuda.zig             |  88 +++++++++++++++++++++++++++++++++++++++---
@@ -22,7 +23,7 @@ Apply from the checkout root with: git apply 0001-build-registry-server.patch
  zig/src/server/serve.zig            |  11 ++++++
  zig/src/server/server.zig           |  32 +++++++++++++++-
  zig/src/server/vision.zig           | 325 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- 21 files changed, 932 insertions(+), 39 deletions(-)
+ 22 files changed, 943 insertions(+), 43 deletions(-)
 
 diff --git a/tests/test_native_contract.py b/tests/test_native_contract.py
 index 6e15ce60ae2334793b611ebc2cbf119642912f48..c7a7f89755e067b17b37a3110f1f84a3bd4607ce 100644
@@ -242,6 +243,53 @@ index 21d77be3cf41769d65cdf6c0d821707b7a42fd1d..ec26b4a95f8ab73847ca0c30715c9dbb
  
  pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0 };
  
+diff --git a/zig/src/cuda/graph.zig b/zig/src/cuda/graph.zig
+index a5ad3e1bd548d72a842f843ca616b1ea6a4b6f14..7d8ebd5d5f12c3f8e9ec19f8ff6c11c16d905c6f 100644
+--- a/zig/src/cuda/graph.zig
++++ b/zig/src/cuda/graph.zig
+@@ -10,15 +10,22 @@ const launch = @import("launch.zig");
+ 
+ pub const Node = abi.GraphNode;
+ 
++/// A check for the graph calls a caller recovers from (capture end, instantiate, upload): a warning, not an error.
++fn soft(d: *const Driver, res: abi.Result, what: []const u8) Error!void {
++    if (res == abi.success) return;
++    std.log.warn("{s}: {s} ({d}) {s}", .{ what, d.errorName(res), res, d.errorText(res) });
++    return if (res == 2) error.OutOfDeviceMemory else error.CudaFailed;
++}
++
+ /// Starts capturing `stream`; every launch on it is recorded until `endCapture`, nothing runs.
+ pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
+-    try stream.d.check(stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
++    try soft(stream.d, stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
+ }
+ 
+ /// Ends the capture; an invalidated capture returns an error and no graph.
+ pub fn endCapture(stream: Stream) Error!Graph {
+     var g: abi.Graph = null;
+-    try stream.d.check(stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
++    try soft(stream.d, stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+     return .{ .d = stream.d, .handle = g };
+ }
+ 
+@@ -95,7 +102,7 @@ pub const Graph = struct {
+ 
+     pub fn instantiate(self: Graph) Error!Exec {
+         var e: abi.GraphExec = null;
+-        try self.d.check(self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
++        try soft(self.d, self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
+         return .{ .d = self.d, .handle = e };
+     }
+ };
+@@ -111,7 +118,7 @@ pub const Exec = struct {
+ 
+     /// Moves the graph's work to the device ahead of the first launch, so that launch pays no setup.
+     pub fn upload(self: Exec, stream: Stream) Error!void {
+-        try self.d.check(self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
++        try soft(self.d, self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
+     }
+ 
+     pub fn launchOn(self: Exec, stream: Stream) Error!void {
 diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
 index 7881d97b11af1525603ad4b6dff93dfff7f6832f..b719c7c73f786e8a2588397843b6735e313fc6f7 100644
 --- a/zig/src/cuda/kernels.zig
