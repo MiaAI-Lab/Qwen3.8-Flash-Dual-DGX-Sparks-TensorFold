@@ -461,6 +461,10 @@ NOTICE        third-party notices (TensorFold's MIT and Apache-2.0 notices, Zig,
 and weights, the Triton replay, the engine, two ranks, serving, the kernel spec, TensorFold's Python vision helper), applied to TensorFold's source in
 filename order by `prepare.sh` (`git apply` in the checkout's root); the kernel set is compiled in the image build.
 
+`0011-record-notification-first.patch` sends a long record's notification before its TCP payload, so rank 1 can
+start reading even when the sender's socket buffer fills. Its host regression transfers 1 MiB with a 4 KiB send
+buffer and bounded socket waits; run `zig build test` in the patched TensorFold checkout (loopback sockets required).
+
 ## License
 
 Apache License 2.0, see [`LICENSE`](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices that go with it: the
