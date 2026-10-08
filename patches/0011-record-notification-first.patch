@@ -1,0 +1,79 @@
+diff --git a/zig/src/families/flashnext/cuda_mirror.zig b/zig/src/families/flashnext/cuda_mirror.zig
+--- a/zig/src/families/flashnext/cuda_mirror.zig
++++ b/zig/src/families/flashnext/cuda_mirror.zig
+@@ -660,9 +660,9 @@
+         if (r.idle) try r.link.send(.request, &.{}); // rank 1 back on the wire
+         r.idle = false;
+         const k = packRecord(&r.rec, kind, bytes);
+-        // the long batch is on the link before its record: rank 1 reads it after the record
++        // Rank 1 needs the record before it can drain a long batch from the control link.
++        try r.wire.put(r.wire.ptr, &r.rec);
+         if (k == .on_link) try r.link.send(.round, bytes);
+-        try r.wire.put(r.wire.ptr, &r.rec);
+     }
+
+     fn sendFn(p: *anyopaque, bytes: []const u8) anyerror!void {
+@@ -1685,6 +1685,63 @@
+     try std.testing.expectEqual(@as(u32, 0), rank1.target.lanes.count());
+ }
+
++test "records deliver a payload larger than the control link send buffer" {
++    const gpa = std.testing.allocator;
++    var threaded: std.Io.Threaded = .init(gpa, .{});
++    defer threaded.deinit();
++    const server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
++    defer server.close();
++    const peer = try Link.join(threaded.io(), try net.IpAddress.parse("127.0.0.1", server.port()), 5000);
++    defer peer.close();
++    const leader = try server.accept(5000);
++    defer leader.close();
++    const wire_server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
++    defer wire_server.close();
++    const peer_wire = try Link.join(threaded.io(), try net.IpAddress.parse("127.0.0.1", wire_server.port()), 5000);
++    defer peer_wire.close();
++    const leader_wire = try wire_server.accept(5000);
++    defer leader_wire.close();
++    const room: c_int = 4096;
++    try std.posix.setsockopt(leader.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&room));
++    const timeout: std.posix.timeval = .{ .sec = 2, .usec = 0 };
++    for ([_]Link{ leader, peer, leader_wire, peer_wire }) |link| {
++        try std.posix.setsockopt(link.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
++        try std.posix.setsockopt(link.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
++    }
++    var send_wire: LinkWire = .{ .link = leader_wire };
++    var recv_wire: LinkWire = .{ .link = peer_wire };
++    var sender: Records = .{ .gpa = gpa, .wire = send_wire.wire(), .link = leader };
++    defer sender.deinit();
++    var receiver: Records = .{ .gpa = gpa, .wire = recv_wire.wire(), .link = peer };
++    defer receiver.deinit();
++    const Receive = struct {
++        records: *Records,
++        bytes: ?[]const u8 = null,
++        err: ?anyerror = null,
++
++        fn run(r: *@This()) void {
++            r.bytes = r.records.channel().recv() catch |err| {
++                r.err = err;
++                return;
++            };
++        }
++    };
++    const payload = try gpa.alloc(u8, 1 << 20);
++    defer gpa.free(payload);
++    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
++    var receive: Receive = .{ .records = &receiver };
++    const thread = try std.Thread.spawn(.{}, Receive.run, .{&receive});
++    var send_err: ?anyerror = null;
++    sender.channel().send(payload) catch |err| {
++        send_err = err;
++    };
++    thread.join();
++    if (send_err) |err| return err;
++    if (receive.err) |err| return err;
++    try std.testing.expect(receive.bytes != null);
++    try std.testing.expectEqualSlices(u8, payload, receive.bytes.?);
++}
++
+ test "rank 0 closing the link while no stream is open stops rank 1 cleanly" {
+     const gpa = std.testing.allocator;
+     var threaded: std.Io.Threaded = .init(gpa, .{});
