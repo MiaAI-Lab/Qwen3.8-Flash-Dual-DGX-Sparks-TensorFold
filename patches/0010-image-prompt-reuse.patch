@@ -133,10 +133,10 @@ index df2cd74..7701dd9 100644
          errdefer e.gpa.destroy(fl);
          fl.* = .{ .seq = seq, .prompt = try e.gpa.dupe(u32, prompt), .sampling = if (sampling) |x| (if (x.temperature > 0) x else null) else null, .keep_at = o.keep_at, .use_mtp = e.absorbing and e.w.mtp != null, .start = 0 };
 diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
-index 4f9761b..7b2059f 100644
+index 4f9761b..397d40f 100644
 --- a/zig/src/families/flashnext/cuda_lanes.zig
 +++ b/zig/src/families/flashnext/cuda_lanes.zig
-@@ -253,9 +253,26 @@ pub fn Lanes(comptime E: type) type {
+@@ -253,9 +253,28 @@ pub fn Lanes(comptime E: type) type {
              l.fill = f;
          }
  
@@ -165,7 +165,7 @@ index 4f9761b..7b2059f 100644
              const next_mark: ?u32 = for (s.reuse.marks) |m| {
                  if (m > f.at and m < ids.len) break m;
              } else null;
-@@ -296,6 +313,19 @@ pub fn Lanes(comptime E: type) type {
+@@ -296,6 +315,19 @@ pub fn Lanes(comptime E: type) type {
                      self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
                      continue;
                  }
@@ -185,7 +185,7 @@ index 4f9761b..7b2059f 100644
                  _ = self.take(f.fl.first);
                  self.e.fillFree(f.fl);
                  if (f.owned) self.e.freeSnapshot(f.cur.?);
-@@ -508,6 +538,27 @@ pub fn Lanes(comptime E: type) type {
+@@ -508,6 +540,27 @@ pub fn Lanes(comptime E: type) type {
              const times = timed and std.c.getenv("TF_FLASHNEXT_PASS_TIMES") != null;
              var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
              var parts: [3]f64 = @splat(0); // to the marks, keeping, the rest
