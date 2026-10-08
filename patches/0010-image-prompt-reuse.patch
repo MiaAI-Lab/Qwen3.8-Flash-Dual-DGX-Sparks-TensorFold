@@ -1,0 +1,259 @@
+# Image and video prompts resume from kept states.
+# The cache key mixes each picture row with a hash of its features, so a different
+# picture does not reuse the old rows. Only rows past the resume point are filled again.
+# Applies after patches 0001-0009. A running server is unchanged until this branch
+# is built into a new image and relaunched.
+#
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 5f87384..d93f909 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -56,12 +56,20 @@ pub const LaneHost = struct {
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
++        /// Tokens the cache matches. Same as the prompt, except image rows are mixed with a hash of
++        /// their features so two pictures in the same placeholder run do not share a state.
++        cache_ids: []const u32 = &.{},
++        cache_owned: bool = false,
++
++        fn promptKey(job: *const Job) []const u32 {
++            return if (job.cache_owned) job.cache_ids else job.request.prompt;
++        }
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s);
++            if (job.host.cache) |store| _ = store.keep(job.promptKey(), at, s);
+         }
+ 
+         /// The pass started from its kept state, or its copy failed (the entry goes); a pass that never got there: neither.
+@@ -71,7 +79,7 @@ pub const LaneHost = struct {
+             const store = job.host.cache orelse return;
+             if (!job.started) return;
+             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
+-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (job.stream.cached == e.at) store.resumed(e, job.request.prompt, true);
++            if (job.stream.reuse_failed) store.resumed(e, job.promptKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.promptKey(), true);
+         }
+     };
+ 
+@@ -218,6 +226,7 @@ pub const LaneHost = struct {
+     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
+         job.reported();
+         h.gpa.free(job.marks);
++        if (job.cache_owned) h.gpa.free(job.cache_ids);
+         const s = &job.stream;
+         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
+@@ -280,6 +289,23 @@ pub const LaneHost = struct {
+ 
+     const Prep = union(enum) { none, dropped, job: *Job };
+ 
++    /// The tokens the prompt cache matches. Text stays as it is. Each image row is mixed with a hash of
++    /// that row's features, so the same pixels resume and a different picture does not. Rank 0 holds the
++    /// features; rank 1 follows the resume point rank 0 sends and does not look the prompt up.
++    fn cacheTokens(a: Allocator, prompt: []const u32, media: ?*const lanes.Media) !struct { ids: []const u32, owned: bool } {
++        const m = media orelse return .{ .ids = prompt, .owned = false };
++        if (m.follower_rows != 0 or m.rows.len == 0 or m.features.len == 0 or m.width == 0) return .{ .ids = prompt, .owned = false };
++        const row_bytes = @as(usize, m.width) * 2;
++        if (m.features.len != m.rows.len * row_bytes) return .{ .ids = prompt, .owned = false };
++        const key = try a.dupe(u32, prompt);
++        for (m.rows, 0..) |row, i| {
++            if (row >= key.len) break;
++            const feat = m.features[i * row_bytes ..][0..row_bytes];
++            key[row] ^= @as(u32, @truncate(std.hash.Wyhash.hash(0xC0FFEE, feat)));
++        }
++        return .{ .ids = key, .owned = true };
++    }
++
+     /// Takes the next queued request into a free lane and builds its stream, not yet prefilled: `none` when none waits
+     /// or no lane is free, `dropped` when it ended here.
+     fn admitPrepare(h: *LaneHost) Prep {
+@@ -298,8 +324,10 @@ pub const LaneHost = struct {
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        // a prompt with images or video is neither resumed nor kept (Python keeps token-only states)
+-        if (r.media == null) if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
++        const keyed = cacheTokens(h.gpa, r.prompt, r.media) catch return h.droppedJob(job, "out of memory");
++        job.cache_ids = keyed.ids;
++        job.cache_owned = keyed.owned;
++        if (h.cache) |store| if (store.lookup(h.gpa, job.promptKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 1e3c65f..733f099 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -99,7 +99,8 @@ pub const Held = struct {
+ /// A prompt's images and video frames as the vision frontend prepared them (Python's EncodedVision): the prompt
+ /// rows the visual features replace (ascending), each prompt row's three rotary positions (t, h, w: [n, 3] row
+ /// major, i32), the decode offset (text after the prompt rotates at its position + delta) and the features
+-/// (bf16 [rows.len, width]). A prompt with media prefills from its start and keeps no prefix states.
++/// (bf16 [rows.len, width]). A prompt with media resumes and keeps: the cache key distinguishes
++/// pictures, and only rows past the resume point are filled again.
+ pub const Media = struct {
+     rows: []const u32,
+     positions: []const i32,
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index df2cd74..7701dd9 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -779,7 +779,8 @@ pub const Engine = struct {
+         keep_at: ?usize = null,
+         /// resume from a kept state of this sequence (the prompt extends its tokens)
+         resume_from: ?*const Snapshot = null,
+-        /// the prompt's images and video frames (Python prefill(..., vision=)): fresh prompts only, nothing kept
++        /// the prompt's images and video frames. A resume copies the kept rows; injectMedia fills
++        /// only picture rows at or past that point.
+         media: ?*const lanes.Media = null,
+     };
+ 
+@@ -882,7 +883,8 @@ pub const Engine = struct {
+         if (prompt.len + e.depth + 1 > e.bound.st.limit) return error.ContextPastWindow;
+         if (o.keep_at) |k| if (k == 0 or k > prompt.len) return error.BadKeepPoint;
+         // an image prompt prefills from its start and keeps no token-only snapshot (Python decode.prefill)
+-        if (o.media != null and (o.keep_at != null or o.resume_from != null)) return error.MediaPromptKept;
++        // media may resume and keep: lane_host keys pictures by their features, and injectMedia
++        // writes only the rows of the chunk in progress.
+         e.setSampling(sampling);
+         const seq = e.bound;
+         const Wd = e.g.wide();
+@@ -1084,7 +1086,8 @@ pub const Engine = struct {
+         if (prompt.len == 0) return error.EmptyPrompt;
+         if (prompt.len + e.depth + 1 > seq.st.limit) return error.ContextPastWindow;
+         if (o.keep_at) |k| if (k == 0 or k > prompt.len) return error.BadKeepPoint;
+-        if (o.media != null and (o.keep_at != null or o.resume_from != null)) return error.MediaPromptKept;
++        // media may resume and keep: lane_host keys pictures by their features, and injectMedia
++        // writes only the rows of the chunk in progress.
+         const fl = try e.gpa.create(Fill);
+         errdefer e.gpa.destroy(fl);
+         fl.* = .{ .seq = seq, .prompt = try e.gpa.dupe(u32, prompt), .sampling = if (sampling) |x| (if (x.temperature > 0) x else null) else null, .keep_at = o.keep_at, .use_mtp = e.absorbing and e.w.mtp != null, .start = 0 };
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 4f9761b..397d40f 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -253,9 +253,28 @@ pub fn Lanes(comptime E: type) type {
+             l.fill = f;
+         }
+ 
++        /// The latest mark strictly inside the prompt and past `at`.
++        fn lastMark(s: *lanes.Stream, at: usize) ?u32 {
++            var mark: ?u32 = null;
++            const n = s.prompt().len;
++            for (s.reuse.marks) |m| {
++                if (m > at and m < n) mark = m;
++            }
++            return mark;
++        }
++
+         /// The next segment's fill: up to the next mark (its state kept there), else to the prompt's end.
+         fn startSegment(self: *Self, s: *lanes.Stream, l: *Lane, f: *Filling) !void {
+             const ids = s.prompt();
++            // A picture prompt is one fill of the whole prompt. Splitting it would prefill picture
++            // rows as text: only the call that carries media injects features. The last mark, after
++            // the pictures already in this prompt, is the state the next turn resumes.
++            if (s.media != null) {
++                const mark = lastMark(s, f.at);
++                f.fl = try self.e.fillBegin(l.seq, ids, s.sampling, .{ .keep_at = if (mark) |m| @as(usize, m) else null, .resume_from = f.cur, .media = s.media });
++                f.final = true;
++                return;
++            }
+             const next_mark: ?u32 = for (s.reuse.marks) |m| {
+                 if (m > f.at and m < ids.len) break m;
+             } else null;
+@@ -296,6 +315,19 @@ pub fn Lanes(comptime E: type) type {
+                     self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
+                     continue;
+                 }
++                if (f.fl.kept) |snap| {
++                    const m: u32 = @intCast(f.fl.keep_at orelse 0);
++                    f.fl.kept = null;
++                    if (m == 0) {
++                        self.e.freeSnapshot(snap);
++                    } else if (self.keep(l, snap, m)) |k| {
++                        self.tentative.append(self.gpa, .{ .at = m, .kept = k }) catch |err| return self.lost("a prompt's fill", err);
++                        if (s.reuse.hook) |h| h.at(h.ptr, s, m);
++                    } else |err| {
++                        std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
++                        self.e.freeSnapshot(snap);
++                    }
++                }
+                 _ = self.take(f.fl.first);
+                 self.e.fillFree(f.fl);
+                 if (f.owned) self.e.freeSnapshot(f.cur.?);
+@@ -508,6 +540,27 @@ pub fn Lanes(comptime E: type) type {
+             const times = timed and std.c.getenv("TF_FLASHNEXT_PASS_TIMES") != null;
+             var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
+             var parts: [3]f64 = @splat(0); // to the marks, keeping, the rest
++            if (s.media != null) {
++                // One pass over the whole prompt. A mark loop without media would embed picture
++                // rows as text. The last mark is kept after its rows, pictures included, are committed.
++                const mark = lastMark(s, at);
++                const r = try e.prefillWith(ids, s.sampling, .{ .keep_at = if (mark) |mm| @as(usize, mm) else null, .resume_from = cur, .media = s.media });
++                if (mark) |mm| if (r.kept) |snap| {
++                    cur = snap;
++                    owned = true;
++                    if (self.keepAt(l, snap, mm, false)) |k| {
++                        owned = false;
++                        self.tentative.append(self.gpa, .{ .at = mm, .kept = k }) catch |err| return self.lost("a prompt's prefill", err);
++                    } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ mm, @errorName(err) });
++                    if (s.reuse.hook) |h| h.at(h.ptr, s, mm);
++                };
++                self.endPass();
++                if (times) {
++                    parts[2] = passSince(e, &t_last);
++                    std.log.info("pass times: {d} tokens from {d}, image prompt, mark {any}: the rest {d:.1} ms", .{ ids.len, s.cached, mark, parts[2] });
++                }
++                return r.first;
++            }
+             for (s.reuse.marks) |m| {
+                 if (m <= at or m >= ids.len) continue;
+                 const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = cur });
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 65a8a39..cb327b9 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -63,7 +63,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+ 
+ /// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, the
+ /// media in order), normalized with their parts, rendered, then the vision helper's processor and tower: Python's
+-/// token ids and the media the engine takes. Such a prompt is neither kept nor resumed.
++/// token ids and the media the engine takes. The prompt is kept and resumed; pictures are part of the cache key.
+ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
+     const helper = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+     if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+@@ -93,8 +93,28 @@ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinkin
+             return cx.fail(if (r.status == 503) .capacity else .request, "{s}", .{r.message});
+         },
+         .ok => |p| {
+-            log.line("vision: {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, helper GPU peak {d:.2} GiB, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, @as(f64, @floatFromInt(p.peak)) / (1 << 30), if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha });
+-            return .{ .ids = p.tokens, .media = p.media };
++            // The generation suffix is text after the pictures. When it tokenizes as the tail of the
++            // expanded prompt, history_len is everything before it and the next turn can resume through
++            // the pictures. A mismatch leaves history_len at 0, the same as not keeping the prompt.
++            var history_len: usize = 0;
++            const history_options: model_text.RenderOptions = .{
++                .tools = options.tools,
++                .add_generation_prompt = false,
++                .enable_thinking = thinking,
++                .reasoning_effort = if (thinking) effort else null,
++            };
++            if (srv.text.render(cx.a, normalized, history_options, &problem)) |history_text| {
++                if (std.mem.eql(u8, history_text, text)) {
++                    if (p.tokens.len > 1) history_len = p.tokens.len - 1;
++                } else if (history_text.len < text.len and std.mem.startsWith(u8, text, history_text)) {
++                    if (srv.text.encode(cx.a, text[history_text.len..], false)) |suffix| {
++                        if (suffix.len < p.tokens.len and std.mem.eql(u32, p.tokens[p.tokens.len - suffix.len ..], suffix))
++                            history_len = p.tokens.len - suffix.len;
++                    } else |_| {}
++                }
++            } else |_| {}
++            log.line("vision: {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens, history {d} (prepare {d:.3}s, tower {d:.3}s, helper GPU peak {d:.2} GiB, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, history_len, p.prepare_s, p.encode_s, @as(f64, @floatFromInt(p.peak)) / (1 << 30), if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha });
++            return .{ .ids = p.tokens, .history_len = history_len, .media = p.media };
+         },
+     }
+ }
