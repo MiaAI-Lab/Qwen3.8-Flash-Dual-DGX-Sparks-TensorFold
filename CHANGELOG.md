@@ -3,26 +3,14 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
-## v1.1 (2026-10-08)
+## Image prompt reuse
 
-Image: `ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold:zig-db28187-f3e1300f4f62`
-(`sha256:e188128ddabdc67ac02c05781f5c0c6b348db5f050cac297861d82b7f086e18c`), the engine at `zig-g1` `37763df`.
+`patches/0010-image-prompt-reuse.patch`. A prompt that contains a picture is kept and resumed.
+The cache key mixes each picture row with a hash of its features, so a different picture does not
+reuse the old rows, and the engine refills only the rows past the resume point. Text prompts are
+unchanged. `python3 tools/image_prompt_reuse.py 12k 3` checks it: a follow-up with the same picture
+should resume at least 85% of the prompt, and the same words with different pixels should not.
 
-### Fixed
-- **A server exit under long load:** after ~15 minutes of many concurrent thinking requests, a rank could stop on
-  `cuGraphInstantiateWithFlags: CUDA_ERROR_NOT_PERMITTED`, which took both ranks down. A CUDA graph capture,
-  instantiate or upload that fails now leaves the round's result from its eager run in place (same bits), pauses
-  graph captures for a while, and logs a warning; the server keeps serving. `TF_FLASHNEXT_GRAPH_LOG=1` logs the graph
-  counts and a context-wide check before each instantiate.
-- **Requests that fill the window exactly were refused** ([#1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
-  [#2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), reported, diagnosed and fixed by
-  [321sssrt-bit](https://github.com/321sssrt-bit)): admission counted the draft window against `--context`, so a
-  prompt plus `max_tokens` equal to the window got `PromptTooLong`. The engine already keeps those rows beyond the
-  window; admission now checks prompt + reply against `--context`.
-
-### Added
-- `tools/context_boundary.py` (by [321sssrt-bit](https://github.com/321sssrt-bit), from PR #2): full prompt/reply
-  budgets succeed with drafts on and off, one token over the window returns HTTP 400.
 
 ## v1.0 (2026-10-07): Qwen3.8-Flash-Next on two DGX Sparks with TensorFold's Zig engine
 
