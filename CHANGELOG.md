@@ -3,6 +3,15 @@
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
+## Unreleased (2026-10-11)
+
+- Reverted the context-admission change authored by [321sssrt-bit](https://github.com/321sssrt-bit)
+  in [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), including its
+  integrated lane regression and `tools/context_boundary.py`. Admission again counts speculative workspace
+  against `--context`; requests near the limit may need a smaller `max_tokens` budget.
+- Kept v1.1's CUDA graph failure recovery. The changed serving patch produces a new image hash, so setup
+  builds an image locally if no matching image has been published; the v1.1 image digest does not apply.
+
 ## v1.1 (2026-10-08)
 
 Image: `ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold:zig-db28187-f3e1300f4f62`
