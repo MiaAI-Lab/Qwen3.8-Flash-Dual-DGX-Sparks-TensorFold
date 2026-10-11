@@ -5,8 +5,8 @@ Every change to this recipe, newest first. Each release names the image it serve
 
 ## Unreleased (2026-10-11)
 
-- Reverted the context-admission change authored by [321sssrt-bit](https://github.com/321sssrt-bit)
-  in [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), including its
+- Reverted the context-admission change in
+  [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), including its
   integrated lane regression and `tools/context_boundary.py`. Admission again counts speculative workspace
   against `--context`; requests near the limit may need a smaller `max_tokens` budget.
 - Kept v1.1's CUDA graph failure recovery. The changed serving patch produces a new image hash, so setup
@@ -24,13 +24,13 @@ Image: `ghcr.io/miaai-lab/qwen3.8-flash-dual-dgx-sparks-tensorfold:zig-db28187-f
   graph captures for a while, and logs a warning; the server keeps serving. `TF_FLASHNEXT_GRAPH_LOG=1` logs the graph
   counts and a context-wide check before each instantiate.
 - **Requests that fill the window exactly were refused** ([#1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
-  [#2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), reported, diagnosed and fixed by
-  [321sssrt-bit](https://github.com/321sssrt-bit)): admission counted the draft window against `--context`, so a
+  [#2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), reverted on 2026-10-11):
+  admission counted the draft window against `--context`, so a
   prompt plus `max_tokens` equal to the window got `PromptTooLong`. The engine already keeps those rows beyond the
   window; admission now checks prompt + reply against `--context`.
 
 ### Added
-- `tools/context_boundary.py` (by [321sssrt-bit](https://github.com/321sssrt-bit), from PR #2): full prompt/reply
+- `tools/context_boundary.py` (from PR #2; removed on 2026-10-11): full prompt/reply
   budgets succeed with drafts on and off, one token over the window returns HTTP 400.
 
 ## v1.0 (2026-10-07): Qwen3.8-Flash-Next on two DGX Sparks with TensorFold's Zig engine
