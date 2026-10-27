@@ -322,7 +322,9 @@ curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: applic
 | Tokens | up to 16,384 for all images (`TENSORFOLD_IMAGE_TOKENS`), at most 4,096 an image (`"detail": "low"`: 256 an image) | 2 frames a second (at most 256 frames), up to 16,384 tokens a request (`TENSORFOLD_VIDEO_TOKENS`) |
 
 By default only data URLs are accepted; `VISION_URLS=1` also lets the server fetch public `https://` URLs. Image and
-video prompts are not kept for prefix reuse, so each turn of a chat with pictures processes them again. `VISION=0
+video prompts are kept and resumed. Each picture row is mixed into the cache key with a hash of its features, so a
+different picture does not reuse that state; a prompt whose features cannot be keyed is left out of the cache
+(`tools/image_prompt_reuse.py`). `VISION=0
 ./start.sh restart` serves text only and returns the helper's 2 GiB workspace (`TENSORFOLD_VISION_WORKSPACE_MIB`) to the KV pool.
 These are the names and meanings of the single-Spark recipe's "Images and video". Timings on this engine on one Spark
 (warm): one image (1,217 tokens) 1.0 s to first token, 10 images 2.3 s, a 30-second video (6,875 tokens)
@@ -424,7 +426,8 @@ These all work on the Flash Next TP=2 path; `"draft": false` gives the serial re
   `tool_choice: "required"` and a named function (Anthropic `tool_choice: {"type": "any"}` too): the reply then always
   opens a tool call.
 - Prompt reuse: a conversation's next turn resumes from the kept state of its earlier turns instead of prefilling the
-  whole prompt again (`tools/prompt_reuse.py`); image and video prompts are not kept.
+  whole prompt again (`tools/prompt_reuse.py`). A prompt with a picture resumes the same way, keyed by its pixels
+  (`tools/image_prompt_reuse.py`).
 - Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not enforce
   them yet.
 - Images and video: see [Images and video](#images-and-video).
@@ -448,6 +451,7 @@ checked and failed, 2 when it could not run, 3 when it ran but could not verify 
 | `tools/long_context.py [--sizes 128k,256k,512k,1M] [--out FILE]` | needles at five depths and key = value retrieval over long documents, scored exactly; `--compare A.json B.json` sets two server settings side by side on identical prompts |
 | `tools/toolcheck.py` | a tool call with an array argument comes back as a JSON array, streamed the same, and a tool result turn answers from it |
 | `tools/prompt_reuse.py [size] [turns]` | a conversation takes more turns, each resuming at least 90% of its prompt from the kept state |
+| `tools/image_prompt_reuse.py [size] [turns]` | a prompt with a picture resumes, a resumed reply equals a fresh prefill, and a different picture does not resume |
 | `tools/exact.py` | the same greedy requests one at a time, with `"draft": false`, and all at once: the replies must be identical |
 | `tools/client.py "message"` | one chat request (thinking off unless `--think`), for a quick look |
 
@@ -459,7 +463,7 @@ stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER), prepare.sh (image + checkpoint on both
               Sparks), nodes.sh (ssh and the RoCE link), publish-image.sh (push the image to GHCR),
               banner.sh (start.sh's banner)
-tools/        checks against the running server (needle, long context, tool calls, prompt reuse, exactness)
+tools/        checks against the running server (needle, long context, tool calls, prompt reuse, image prompt reuse, exactness)
 CHANGELOG.md  what changed in each release
 CREDITS.md    who and what this builds on
 LICENSE       Apache License 2.0
@@ -469,7 +473,7 @@ NOTICE        third-party notices (TensorFold's MIT and Apache-2.0 notices, Zig,
 `patches/` holds the Zig engine's Flash Next port (`0001`-`0009`: build and server flags, the CUDA kernels, config
 and weights, the Triton replay, the engine, two ranks, serving, the kernel spec, TensorFold's Python vision helper) and its
 fixes (`0010`-`0012`: the prompt cache's eviction inside a pass, the ranks' prefill admission, the control link's record
-order), applied to TensorFold's source in
+order) and image prompt reuse (`0013`), applied to TensorFold's source in
 filename order by `prepare.sh` (`git apply` in the checkout's root); the kernel set is compiled in the image build.
 
 ## License
