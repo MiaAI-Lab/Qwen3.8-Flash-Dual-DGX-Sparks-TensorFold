@@ -125,7 +125,7 @@ if [[ "$ENGINE" == lanes ]]; then
   export TF_FLASHNEXT_ENGINE="${TF_FLASHNEXT_ENGINE:-mia}"
   # the compute lane: a Python cell the model writes is run and its output returned (TF_COMPUTE_LANE_*), and the
   # in-model runner computes inline arithmetic exactly (TF_RUNNER_*); both only inside the reasoning
-  # (TF_RUNNER_SPANS=reasoning): a reply without thinking is the same bytes as without lanes
+  # (TF_RUNNER_SPANS=reasoning): a reply without thinking has the same tokens as without lanes
   _r=/opt/tensorfold/share/runner
   export TF_COMPUTE_LANE="${TF_COMPUTE_LANE:-1}" TF_COMPUTE_LANE_DEFAULT="${TF_COMPUTE_LANE_DEFAULT:-1}"
   export TF_RUNNER="${TF_RUNNER:-1}" TF_RUNNER_SPANS="${TF_RUNNER_SPANS:-reasoning}"

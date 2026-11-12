@@ -463,8 +463,11 @@ the exact value instead of working digits by hand. Two parts do this:
 - **The in-model runner** (`TF_RUNNER_*`) computes integer arithmetic on a compiled circuit (`calc.tfpc`) and a graph
   bank, through a RISC-V frontend (clang-18 / lld-18).
 
-Both act only inside the reasoning (`TF_RUNNER_SPANS=reasoning`). A reply without thinking is the same bytes as
-without lanes, and drafted replies still equal serial ones.
+Both act only inside the reasoning (`TF_RUNNER_SPANS=reasoning`). Measured against this recipe's image, every
+thinking-off reply had the same tokens. The text can differ only in trailing whitespace: the lane engine's server
+trims the trailing newline of `reasoning_content`. A thinking request that brings no tools of its own gets the
+engine's compute tool in its prompt. Drafting is this recipe's engine: per request it drafted exactly as this
+recipe's image does.
 
 **Enable it.** Set the following in `scripts/local.sh` or `.env`, then run `./start.sh restart`:
 
