@@ -171,6 +171,13 @@ fi
 # The ranks' /cache (CUDA's JIT cache), a folder per image hash
 KCACHE=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 [[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(image_hash)
+# ENGINE=lanes: the lane engine keeps its timed lane costs between starts, in a folder beside that JIT cache (the
+# engine's ~/.cache/tensorfold); the first start times them (~40 s), later starts of the same image read them back
+KEEP_WORKER=(); KEEP_HERE=()
+if [[ "$ENGINE" == lanes ]]; then
+  KEEP_WORKER=(-v "\$HOME/.cache/tensorfold-qwen38fn/$KCACHE/tensorfold:/root/.cache/tensorfold")
+  KEEP_HERE=(-v "$KERNEL_CACHE/$KCACHE/tensorfold:/root/.cache/tensorfold")
+fi
 # The snapshot both ranks serve (config.sh's pin, else refs/main), as a path under the containers' cache mount: the
 # ranks read it offline, whatever the Hub's main is now. The worker's cache is its own HF_HOME (prepare.sh copies into
 # the same place), or the head's over NFS (WORKER_WEIGHTS=nfs).
@@ -300,7 +307,7 @@ launch() {
   log "Rank 1 on $WORKER: ${RANK_ARGV[*]}"
   worker_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
               $(rank_nccl_env 1)
-              -v "$WORKER_MOUNT" -v "\$HOME/.cache/tensorfold-qwen38fn/$KCACHE:/cache"
+              -v "$WORKER_MOUNT" -v "\$HOME/.cache/tensorfold-qwen38fn/$KCACHE:/cache" "${KEEP_WORKER[@]}"
               "$IMAGE" "${RANK_ARGV[@]}")
   remote=""; for a in "${worker_cmd[@]}"; do
     case "$a" in '$HOME'*) remote+=" \"$a\"" ;; *) remote+=" $(printf '%q' "$a")" ;; esac
@@ -314,7 +321,7 @@ launch() {
   log "Rank 0 here: ${RANK_ARGV[*]}"
   here_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}" "${KEY_ARGS[@]}"
             $(rank_nccl_env 0)
-            -v "$HF_CACHE":/root/.cache/huggingface:ro -v "$KERNEL_CACHE/$KCACHE":/cache
+            -v "$HF_CACHE":/root/.cache/huggingface:ro -v "$KERNEL_CACHE/$KCACHE":/cache "${KEEP_HERE[@]}"
             "$IMAGE" "${RANK_ARGV[@]}")
   if (( DRY )); then
     printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here_cmd[@]}" | sed 's/ $//')"

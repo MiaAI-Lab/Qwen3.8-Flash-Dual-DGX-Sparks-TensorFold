@@ -52,8 +52,9 @@ ARG LANES_REF
 RUN git init -q /lanes && cd /lanes && git remote add origin "${LANES_REPO}" && \
     git fetch -q --depth 1 origin "${LANES_REF}" && git checkout -q --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${LANES_REF}"
-# the measured builds' flags: ReleaseFast for sm_121, stripped; the runner frontend's boot check
-RUN cd /lanes && /opt/zig/zig build native -Dtarget=aarch64-linux-gnu -Dcpu=baseline+sha2+aes \
+# ReleaseFast for sm_121, stripped, host code for this Spark's own CPU (as her engine is built: the load repacks the
+# checkpoint on the CPU); the runner frontend's boot check
+RUN cd /lanes && /opt/zig/zig build native \
       -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121 -Doptimize=ReleaseFast -Dstrip=true --prefix /opt/lanes -j"$(nproc)" && \
     /opt/zig/zig build runner-frontend-check --prefix /opt/lanes -j"$(nproc)" && mkdir -p /opt/lanes-out && \
     for f in tensorfold-native tf-runner-frontend-check; do \

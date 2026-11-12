@@ -17,6 +17,9 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
     and its pinned assets.
   - `start.sh` passes `TF_RUNNER*` / `TF_COMPUTE_LANE*` to both ranks, and uses `--kv-cache` with this engine.
   - Text only (`VISION=0`).
+  - Startup: the lane engine keeps its timed lane costs between starts (`start.sh` mounts a folder beside the lane
+    image's CUDA cache), so a start after the first one is not slower than `ENGINE=patches` (77.2 s against 92.6 s to
+    the first 200, README "Compute lanes"). The lane engine is built for the Spark's own CPU, as this recipe's is.
   - `tool_choice` `"required"`, a named function and Anthropic `any` get HTTP 400 with `ENGINE=lanes`: patch 0007's
     call gate is not in the lane engine yet. `"auto"` and `"none"` work.
   - The default (`ENGINE=patches`), its image and its hash are unchanged.
