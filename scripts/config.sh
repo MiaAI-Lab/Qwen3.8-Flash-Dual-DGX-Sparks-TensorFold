@@ -111,7 +111,7 @@ case "$ENGINE" in
   *) printf '[%s] ERROR: ENGINE is patches or lanes, not %s\n' "$(basename "$0")" "$ENGINE" >&2; exit 1 ;;
 esac
 LANES_REPO="${LANES_REPO:-https://github.com/jayleaton/TensorFold.git}"
-LANES_REF="${LANES_REF:-4c4e966eb4709de9e4f42ee5b2c52f851c37a625}"   # the lane engine's commit (40 hex digits)
+LANES_REF="${LANES_REF:-52f6936c0c226fbe5d53a83b033683c172fc269d}"   # the lane engine's commit (40 hex digits)
 # the runner's circuit and graph bank: one archive at its sha256 (the engine's packaging/runner/assets.release)
 RUNNER_ASSETS_URL="${RUNNER_ASSETS_URL:-https://github.com/jayleaton/deepseek-v41-tensorfold-spark/releases/download/runner-assets-20261107/runner-assets-20261107.tar.gz}"
 RUNNER_ASSETS_SHA256="${RUNNER_ASSETS_SHA256:-b5c40d32bcab0fa896795d08aaa651d55d0574e500f3624e61db23058cdd800f}"

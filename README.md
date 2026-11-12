@@ -512,7 +512,9 @@ next ones are faster than `ENGINE=patches`:
 | `ENGINE=lanes`, kept lane costs, 2 starts | **77.2 / 77.2 s** |
 | `ENGINE=lanes`, a new image's first start (it times the costs) | 115.9 s |
 
-Starts were alternated, patches then lanes, on 2026-11-12. Most of the difference from the default is the image
+Starts were alternated, patches then lanes, on 2026-11-12. The published `52f6936c0` (below), fetched from GitHub and
+built by `ENGINE=lanes scripts/prepare.sh`, then started the same way: 117.3 s for its first start, 77.1 s for the
+next, with a passing smoke (thinking on and off, streaming, a tool call) after each. Most of the difference from the default is the image
 tower `VISION=1` loads: `ENGINE=patches` with `VISION=0` (the lanes' feature set) started in 75.7 / 77.1 s in an earlier
 session of the same day. With `ENGINE=lanes` both ranks log where their load spent its time (`rank N: loaded in ...`);
 the checkpoint load is about 65 s of it.
@@ -526,9 +528,12 @@ request, 4 at once, seed 101. The set and its answers are private, so it cannot 
 grader reads the reply's final JSON and compares it with the stored answer. A reply with no complete JSON, the wrong
 JSON shape or a wrong value counts as wrong. The same harness reproduced earlier baselines exactly.
 
-Both rows are lane engine `188d9c63c` on two Sparks, the same build and keys as here, with the 20 lane keys removed for
-lanes off. `03ad01b69` is `188d9c63c` plus two scheduling commits. The pinned `LANES_REF` `4c4e966eb` is
-`03ad01b69` plus two startup commits (kept lane costs, a load-stage log line).
+Both rows are lane engine `f9f75544a` on two Sparks, the same build and keys as here, with the 20 lane keys removed for
+lanes off. `220e5a068` is `f9f75544a` plus two scheduling commits. The pinned `LANES_REF` `52f6936c0` is
+`220e5a068` plus two startup commits (kept lane costs, a load-stage log line). These are the published commits on
+`jayleaton/TensorFold` branch `flashnext-mia-lanes`. The runs below were measured on a private twin of each, which
+differs only in 9 comment lines (8 files) and some commit message wording, so the built engine is the same code. The
+published `52f6936c0` itself was then built by `scripts/prepare.sh` and started twice by `start.sh` (Startup, above).
 
 | Lanes | Correct | Tokens a task | Median time a task | Cut at 8,192 tokens |
 | --- | ---: | ---: | ---: | ---: |
@@ -544,10 +549,10 @@ By family (20 tasks each), lanes off then on:
 All 62 lanes-off misses ran out of tokens (finish `length`) before giving an answer. With lanes, 26 misses are JSON
 form and 2 are wrong values. Task by task, lanes gain 44 and lose 10 (in aggregation, DP and graph).
 
-The engine `03ad01b69` was also set up exactly as this README says, on 2026-11-12:
+The engine `220e5a068` was also set up exactly as this README says, on 2026-11-12:
 `ENGINE=lanes scripts/prepare.sh` built the lane image on the head and copied it to the worker, and
 `ENGINE=lanes ./start.sh` served it. The same compute set gave 92/120 at 719 tokens a task, with the same tasks right
-and wrong as `188d9c63c`. That run shared the server with another test suite,
+and wrong as `f9f75544a`. That run shared the server with another test suite,
 so its 19.0 s median time is not comparable with the table.
 
 Speed, with sparkDash's prose protocol (400-token replies, thinking off). Tokens a second, all requests together,
@@ -556,15 +561,15 @@ against this recipe's image built at `dc05c91`:
 | Arm | c1 | c2 | c4 | c8 | c16 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | this recipe's image (2026-11-10) | 69.6 | 103.1 | 156.4 | 233.2 | 372.5 |
-| lane engine `2f77d333d`, lanes off (same session) | 70.1 | 103.5 | 158.0 | 238.5 | 380.6 |
+| lane engine `1849c2a9d`, lanes off (same session) | 70.1 | 103.5 | 158.0 | 238.5 | 380.6 |
 
-With the lane keys on (engine `188d9c63c`, 2026-11-11), c16 was 382.6 against this recipe's 386.4 in the same session
+With the lane keys on (engine `f9f75544a`, 2026-11-11), c16 was 382.6 against this recipe's 386.4 in the same session
 (99.0%). An agent-shaped session of tool calls and prompt reuse was within 0.5% on 6k-token prompts. It was 4.3% and
 2.5% slower on the first turn of 15k- and 34k-token prompts, all in the cold prefill of four prompts at once; the
-cached turns were equal. `03ad01b69` decodes at 0.998 of `188d9c63c`'s speed (paired server timings, 2026-11-12). Its
+cached turns were equal. `220e5a068` decodes at 0.998 of `f9f75544a`'s speed (paired server timings, 2026-11-12). Its
 image built and started by this recipe (`ENGINE=lanes`, the lane keys on) measured 69.9 / 101.7 / 156.4 / 237.6 / 383.3
 from c1 to c16. A separately built image of the same engine measured 70.1 / 103.2 / 157.6 / 237.6 / 385.1 in the same
-session, so c16 differs by 0.5%. The pinned `4c4e966eb`, built and started by this recipe, measured
+session, so c16 differs by 0.5%. The pinned `52f6936c0`, built and started by this recipe, measured
 69.8 / 101.6 / 160.4 / 239.1 / 386.5 (2026-11-12, kept lane costs). The same boot passed `tools/toolcheck.py` (3/3),
 `tools/exact.py` (drafted and concurrent replies equal the serial ones) and a 180-request mixed suite (180/180).
 
