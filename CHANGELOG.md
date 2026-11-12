@@ -24,8 +24,8 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
     0007's call gate is ported into the lane engine (`capabilities.call_gates: true` in `/v1/models`).
   - `LANES_REF` is `9c6c3d04c` (published on `jayleaton/TensorFold` `flashnext-mia-lanes`): that call gate, a
     thinking-budget fix, and a digit stop. On this model the stop keeps a big inline value from being extended by
-    thousands of invented digits. `TF_RUNNER_INLINE_MARK=1` (` @engine` after each owned value) also stopped the model
-    overriding a right value (README "Compute lanes", "Long inline values").
+    thousands of invented digits. `TF_RUNNER_INLINE_MARK=1` (` @engine` after each owned value, now
+    the default) also stopped the model overriding a right value (README "Compute lanes", "Long inline values").
   - The default (`ENGINE=patches`), its image and its hash are unchanged.
   - By Jay Leaton ([jayleaton](https://github.com/jayleaton)), on MiaAI-Lab's engine and patches.
 

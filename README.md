@@ -495,13 +495,12 @@ Limits:
 - **Forced tool calls** work as on this recipe's image: `tool_choice: "required"`, a named function and Anthropic
   `tool_choice: {"type": "any"}` always open a tool call (patch 0007's call gate, ported into the lane engine;
   `/v1/models` reports `capabilities.call_gates: true`). `"auto"` and `"none"` are unchanged.
-- **Long inline values.** An inline `<expr> =` gets its exact value spliced in with nothing after it
-  (`TF_RUNNER_INLINE_MARK=0`, the default). On this model a spliced big integer was sometimes extended by the model
+- **Long inline values.** An inline `<expr> =` gets its exact value spliced in with ` @engine` after it
+  (`TF_RUNNER_INLINE_MARK=1`, the default). Unmarked (`0`), a spliced big integer was sometimes extended by the model
   (7^222: 1,600 to 29,700 invented digits) until the reply ran out of tokens, and once the model replaced the engine's
-  right value with its own wrong arithmetic. The lane engine at `LANES_REF` replaces a digit drawn right after an
-  owned value, and stops a digit run in the reasoning at 1,024 digits, with a newline (`TF_RUNNER_DIGIT_STOP`,
-  `TF_RUNNER_DIGIT_RUN_MAX`; 0 turns each off). That ends the first kind; `TF_RUNNER_INLINE_MARK=1` ends both. It
-  writes ` @engine` after each owned value (Compute lanes, "Inline values", below).
+  right value with its own wrong arithmetic; the mark ended both. The lane engine at `LANES_REF` also replaces a digit
+  drawn right after an unmarked owned value, and stops a digit run in the reasoning at 1,024 digits, with a newline
+  (`TF_RUNNER_DIGIT_STOP`, `TF_RUNNER_DIGIT_RUN_MAX`; 0 turns each off) (Compute lanes, "Inline values", below).
 - Structured outputs (`response_format`, `guided_*`) get HTTP 400, as on this recipe's image. The lane image does not
   include the engine's structured-output library, so its boot log warns that `libtfgrammar.so` is missing. Adding the
   library would not change these answers: this engine port has no grammar hook yet.
