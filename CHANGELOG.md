@@ -17,6 +17,8 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
     and its pinned assets.
   - `start.sh` passes `TF_RUNNER*` / `TF_COMPUTE_LANE*` to both ranks, and uses `--kv-cache` with this engine.
   - Text only (`VISION=0`).
+  - `tool_choice` `"required"`, a named function and Anthropic `any` get HTTP 400 with `ENGINE=lanes`: patch 0007's
+    call gate is not in the lane engine yet. `"auto"` and `"none"` work.
   - The default (`ENGINE=patches`), its image and its hash are unchanged.
   - By Jay Leaton ([jayleaton](https://github.com/jayleaton)), on MiaAI-Lab's engine and patches.
 

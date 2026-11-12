@@ -423,7 +423,7 @@ These all work on the Flash Next TP=2 path; `"draft": false` gives the serial re
 - `"draft": false` in a request serves it without drafts, TensorFold's serial reference.
 - Tool calls work (`tools/toolcheck.py`: array arguments whole and streamed, a tool result turn), including
   `tool_choice: "required"` and a named function (Anthropic `tool_choice: {"type": "any"}` too): the reply then always
-  opens a tool call.
+  opens a tool call. With `ENGINE=lanes` only `"auto"` and `"none"` work (see [Compute lanes](#compute-lanes-opt-in)).
 - Prompt reuse: a conversation's next turn resumes from the kept state of its earlier turns instead of prefilling the
   whole prompt again (`tools/prompt_reuse.py`); image and video prompts are not kept.
 - Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not enforce
@@ -485,29 +485,52 @@ VISION=0
   build fails unless the runner computes its probe cells.
 
 The lane engine is TensorFold's Zig engine with this recipe's patches 0001-0008 and 0010-0012 ported in as
-MiaAI-Lab's own commits, served as `TF_FLASHNEXT_ENGINE=mia`. The lane keys are in `scripts/config.sh` and every one
-can be overridden.
+MiaAI-Lab's own commits (all but 0007's tool_choice call gate), served as `TF_FLASHNEXT_ENGINE=mia`. The lane keys
+are in `scripts/config.sh` and every one can be overridden.
 
 Limits:
 
 - **Text only.** Patch 0009 (vision) is not in the lane engine, so `ENGINE=lanes` needs `VISION=0`.
 - The KV flag is `--kv-cache`; `start.sh` passes it.
-- The lane image does not include the engine's structured-output library.
+- **Forced tool calls are refused.** `tool_choice: "required"`, a named function and Anthropic
+  `tool_choice: {"type": "any"}` get HTTP 400 ("cannot enforce tool_choice ... send \"auto\" or \"none\""). This
+  recipe's image enforces them; the lane engine does not have patch 0007's call gate yet. `"auto"` and `"none"` work,
+  and so do tool calls under them.
+- Structured outputs (`response_format`, `guided_*`) get HTTP 400, as on this recipe's image. The lane image does not
+  include the engine's structured-output library, so its boot log warns that `libtfgrammar.so` is missing. Adding the
+  library would not change these answers: this engine port has no grammar hook yet.
 
 **Measured** on two Sparks, NVFP4, the defaults above (16 at once, FP8 KV, a 1,048,576-token window, MTP drafts),
 through the OpenAI API.
 
-Compute set: 120 exact-computation tasks with integer, division, modular, aggregation, DP and graph tasks. Settings:
-thinking on, temperature 1.0, `max_tokens` 8192, 270 s a request, 4 at once, graded by a fixed grader
-(2026-11-11):
+Compute set, 2026-11-11. It has 120 exact-computation tasks: integer, division, modular, aggregation, DP and graph, 20
+of each. Each task asks for its answer as JSON. Settings: thinking on, temperature 1.0, `max_tokens` 8192, 270 s a
+request, 4 at once, seed 101. The set and its answers are private, so it cannot be rerun from this repository. A fixed
+grader reads the reply's final JSON and compares it with the stored answer. A reply with no complete JSON, the wrong
+JSON shape or a wrong value counts as wrong. The same harness reproduced earlier baselines exactly.
 
-| Engine | Lanes | Correct | Tokens a task |
-| --- | --- | ---: | ---: |
-| lane engine `2f77d333d` | on (runner in every span) | **92/120** | **738** |
-| lane engine `2f77d333d` | off | 18 of the 38 tasks that ran (82 cut by the time budget) | 6,118 |
+Both rows are lane engine `188d9c63c` on two Sparks, the same build and keys as here, with the 20 lane keys removed for
+lanes off. `03ad01b69` is `188d9c63c` plus two scheduling commits.
 
-The compute run predates the thinking-only default (`TF_RUNNER_SPANS=reasoning`, engine `188d9c63c` and later).
-The compute set's prompts are thinking-on, which is the case that default keeps.
+| Lanes | Correct | Tokens a task | Median time a task | Cut at 8,192 tokens |
+| --- | ---: | ---: | ---: | ---: |
+| on (`TF_RUNNER_SPANS=reasoning`) | **92/120** | **738** | **12.3 s** | 0 |
+| off | 58/120 | 6,038 | 141 s | 62 |
+
+By family (20 tasks each), lanes off then on:
+
+| aggregation | division | DP | graph | integer | modular |
+| --- | --- | --- | --- | --- | --- |
+| 20 / 18 | 0 / 16 | 18 / 16 | 20 / 16 | 0 / 13 | 0 / 13 |
+
+All 62 lanes-off misses ran out of tokens (finish `length`) before giving an answer. With lanes, 26 misses are JSON
+form and 2 are wrong values. Task by task, lanes gain 44 and lose 10 (in aggregation, DP and graph).
+
+The pinned `LANES_REF` (`03ad01b69`) was also set up exactly as this README says, on 2026-11-12:
+`ENGINE=lanes scripts/prepare.sh` built the lane image on the head and copied it to the worker, and
+`ENGINE=lanes ./start.sh` served it. The same compute set gave 92/120 at 719 tokens a task, with the same tasks right
+and wrong as `188d9c63c`. That run shared the server with another test suite,
+so its 19.0 s median time is not comparable with the table.
 
 Speed, with sparkDash's prose protocol (400-token replies, thinking off). Tokens a second, all requests together,
 against this recipe's image built at `dc05c91`:
@@ -521,7 +544,9 @@ With the lane keys on (engine `188d9c63c`, 2026-11-11), c16 was 382.6 against th
 (99.0%). An agent-shaped session of tool calls and prompt reuse was within 0.5% on 6k-token prompts. It was 4.3% and
 2.5% slower on the first turn of 15k- and 34k-token prompts, all in the cold prefill of four prompts at once; the
 cached turns were equal. `03ad01b69` (the pinned `LANES_REF`) decodes at 0.998 of `188d9c63c`'s speed (paired server
-timings, 2026-11-12).
+timings, 2026-11-12). Its image built and started by this recipe (`ENGINE=lanes`, the lane keys on) measured
+69.9 / 101.7 / 156.4 / 237.6 / 383.3 from c1 to c16. A separately built image of the same engine measured
+70.1 / 103.2 / 157.6 / 237.6 / 385.1 in the same session, so c16 differs by 0.5%.
 
 ## Repository layout
 
