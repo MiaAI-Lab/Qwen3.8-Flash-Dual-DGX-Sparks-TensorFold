@@ -31,8 +31,9 @@
 #            FOREGROUND=1 (stay attached to rank 0's log, exit with its code); WAIT_TIMEOUT (seconds, default 1800);
 #            DRY_RUN=1 (print the docker commands, change nothing); MEM_NEED_GIB, MEM_CHECK=0 (the memory check);
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
-#   ranks    every TENSORFOLD_*, TF_FLASHNEXT_*, TF_TP_* and TF_CUDA_* variable goes to both ranks
-#            (TENSORFOLD_API_KEY by name only, to rank 0)
+#   ranks    every TENSORFOLD_*, TF_FLASHNEXT_*, TF_TP_*, TF_CUDA_*, TF_RUNNER_* and TF_COMPUTE_LANE_* variable goes
+#            to both ranks (TENSORFOLD_API_KEY by name only, to rank 0)
+#   lanes    ENGINE=lanes (opt-in compute lanes, README "Compute lanes"), LANES_REPO, LANES_REF, LANES_IMAGE
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 # --quant Q (or --quant=Q) picks the checkpoint (QUANT) before the settings are read; the other arguments stay
@@ -72,7 +73,9 @@ SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKEN
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$DRAFTS" == 1 ]] || SERVE_ARGS+=(--no-drafts)
 [[ "$KV_DTYPE" =~ ^(bf16|fp8)$ ]] || die "KV_DTYPE is bf16 or fp8, not $KV_DTYPE"
-SERVE_ARGS+=(--kv-dtype "$KV_DTYPE")
+# the lane engine names the same cache format --kv-cache
+if [[ "$ENGINE" == lanes ]]; then SERVE_ARGS+=(--kv-cache "$KV_DTYPE"); else SERVE_ARGS+=(--kv-dtype "$KV_DTYPE"); fi
+[[ "$ENGINE" != lanes || "$VISION" == 0 ]] || die "ENGINE=lanes serves text only: set VISION=0 (README: Compute lanes)"
 [[ "$MAX_VIDEOS" =~ ^[0-9]+$ ]] || die "MAX_VIDEOS is a count, not $MAX_VIDEOS"
 if [[ "$VISION" == 1 ]]; then
   SERVE_ARGS+=(--vision --vision-max-images "$TENSORFOLD_MAX_IMAGES" --vision-max-videos "$MAX_VIDEOS"
@@ -113,8 +116,8 @@ banner "Qwen3.8-Flash-Next · $QUANT_LABEL"          # the TensorFold ribbon and
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
 printf '%s  %s (%s) · 2 x DGX Spark · %s at once · %s-token window · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID" "$QUANT_LABEL" \
   "$(arg_value --parallel)" "$(arg_value --context)" "$( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)" "$PORT" "$R"
-printf '%s  KV %s · vision %s · memory reserve %s GiB%s\n\n' "$D" "$KV_DTYPE" "$( [[ "$VISION" == 1 ]] && echo on || echo off)" \
-  "$TENSORFOLD_MEMORY_RESERVE_GIB" "$R"
+printf '%s  KV %s · vision %s · memory reserve %s GiB%s%s\n\n' "$D" "$KV_DTYPE" "$( [[ "$VISION" == 1 ]] && echo on || echo off)" \
+  "$TENSORFOLD_MEMORY_RESERVE_GIB" "$( [[ "$ENGINE" == lanes ]] && echo " · compute lanes (engine ${LANES_REF:0:9})")" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
@@ -270,7 +273,8 @@ else
   [[ -n "$WORKER_DOWN" ]] || (( there_gb >= need_gib )) || low_mem "on the worker" "$there_gb" "ssh $WORKER docker ps"
 fi
 
-# TensorFold's own switches (TENSORFOLD_*, TF_FLASHNEXT_*, TF_TP_*, TF_CUDA_*) reach both ranks with the same values:
+# TensorFold's own switches (TENSORFOLD_*, TF_FLASHNEXT_*, TF_TP_*, TF_CUDA_*, and the lanes' TF_RUNNER_*,
+# TF_COMPUTE_LANE*) reach both ranks with the same values:
 # the worker's docker command runs over ssh, where this shell's environment does not reach. TENSORFOLD_API_KEY is a
 # secret: it never goes on a command line, only by name to rank 0 (docker reads its value from this environment).
 env_args() {
@@ -279,7 +283,7 @@ env_args() {
   while IFS='=' read -r name _; do
     [[ "$name" == TENSORFOLD_API_KEY || "$name" == TENSORFOLD_CUDA_KERNELS ]] && continue
     ENV_ARGS+=(-e "$name=${!name}")
-  done < <(env | grep -E '^(TENSORFOLD|TF_FLASHNEXT|TF_TP|TF_CUDA)_[A-Z0-9_]+=' || true)
+  done < <(env | grep -E '^((TENSORFOLD|TF_FLASHNEXT|TF_TP|TF_CUDA)_[A-Z0-9_]+|(TF_RUNNER|TF_COMPUTE_LANE)[A-Z0-9_]*)=' || true)
 }
 env_args
 KEY_ARGS=(); [[ -z "${TENSORFOLD_API_KEY:-}" ]] || { export TENSORFOLD_API_KEY; KEY_ARGS=(-e TENSORFOLD_API_KEY); }

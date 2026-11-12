@@ -8,6 +8,18 @@ Every change to this recipe, newest first. Each release names the image it serve
 Patches `0010`-`0012` change the engine, so the image hash changes: setup builds the image locally until one is
 published for these patches (the v1.1 digest in `scripts/config.sh` does not apply).
 
+### Added
+- **Compute lanes, opt-in (`ENGINE=lanes`, README "Compute lanes").**
+  - What it does: the model can run a Python cell or an inline `<expr> =` while it thinks, and gets the exact result
+    back in its reasoning. The keys default to the thinking-only setting (`TF_RUNNER_SPANS=reasoning`).
+  - `scripts/lanes.sh` builds a lane image on top of the default image: `tensorfold-native` from the lane engine
+    (`LANES_REPO` @ `LANES_REF`, this recipe's patches ported into TensorFold's Zig engine), plus the runner's frontend
+    and its pinned assets.
+  - `start.sh` passes `TF_RUNNER*` / `TF_COMPUTE_LANE*` to both ranks, and uses `--kv-cache` with this engine.
+  - Text only (`VISION=0`).
+  - The default (`ENGINE=patches`), its image and its hash are unchanged.
+  - By Jay Leaton ([jayleaton](https://github.com/jayleaton)), on MiaAI-Lab's engine and patches.
+
 ### Fixed
 - **A segfault in `endPass` under a full prompt cache, and a state rank 1 kept that rank 0 had freed**
   ([#9](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/9), `0010`): the store could evict a

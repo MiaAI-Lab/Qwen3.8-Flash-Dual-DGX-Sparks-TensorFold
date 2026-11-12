@@ -4,7 +4,8 @@
 #   1. preflight checks: docker and the GPU on both nodes, key-based ssh to the worker, the RoCE link, disk space
 #   2. the image on the head: tensorfold-native built from TensorFold (TF_REF, branch zig-flashnext) plus
 #      patches/*.patch with Zig, on NVIDIA's PyTorch container, with the kernel set; pulled prebuilt from $GHCR_IMAGE
-#      when a matching tag is reachable (PULL=0 skips that), else built locally
+#      when a matching tag is reachable (PULL=0 skips that), else built locally; with ENGINE=lanes, the lane image
+#      on top of it (scripts/lanes.sh)
 #   3. the same image on the worker: pulled there, else streamed from the head (docker save | ssh docker load)
 #   4. download that checkpoint (only it) on the head into the Hugging Face cache (~124 GiB NVFP4, ~122 GiB INT4-AR,
 #      resumable), at its pinned revision (MODEL_REVISION)
@@ -61,7 +62,7 @@ WORKER_HF=$(worker_hf_cache)
   die "the worker's $WORKER_HF/hub is not writable (left root-owned by a container? fix its ownership there)"
 
 PATCHES_HASH=$(image_hash)
-built_hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
+built_hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$MIA_IMAGE" 2>/dev/null || true)
 free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
 worker_free_gb() { worker 1 "df -BG --output=avail '$2' | tail -1 | tr -dc '0-9'"; }
 models=("$MODEL_ID")
@@ -150,8 +151,8 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]
   log "Pulling the prebuilt image $prebuilt (PULL=0 builds instead)"
   if docker pull "$prebuilt" &&
      [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$PATCHES_HASH" ]]; then
-    docker tag "$prebuilt" "$IMAGE"; built_hash=$PATCHES_HASH
-    log "Using $prebuilt as $IMAGE"
+    docker tag "$prebuilt" "$MIA_IMAGE"; built_hash=$PATCHES_HASH
+    log "Using $prebuilt as $MIA_IMAGE"
   else
     warn "could not pull $prebuilt (no image for these patches, the package is not public, or no network): building it locally"
   fi
@@ -159,14 +160,14 @@ fi
 if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
   kernels=present
-  log "Building $IMAGE (TensorFold ${TF_REF:0:12} with Zig $ZIG_VERSION, patches $PATCHES_HASH: $(compgen -G 'patches/*.patch' | wc -l) patches; the engine, then its Triton kernel set)"
+  log "Building $MIA_IMAGE (TensorFold ${TF_REF:0:12} with Zig $ZIG_VERSION, patches $PATCHES_HASH: $(compgen -G 'patches/*.patch' | wc -l) patches; the engine, then its Triton kernel set)"
   # the build context: patches/ only (never the rest of the repository), in a fresh private directory
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
   trap 'rm -rf -- "$ctx"' EXIT
   mkdir -p "$ctx/patches"
   compgen -G 'patches/*.patch' >/dev/null && cp -- patches/*.patch "$ctx/patches/"
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
-  docker build "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
+  docker build "${nocache[@]}" -t "$MIA_IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" \
     --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" \
     --build-arg PATCHES_HASH="$PATCHES_HASH" --build-arg KERNELS="$kernels" \
@@ -221,11 +222,16 @@ WORKDIR /workspace
 DOCKERFILE
   rm -rf -- "$ctx"; trap - EXIT
 else
-  log "Image $IMAGE already built with patches $PATCHES_HASH (use --rebuild to force)"
+  log "Image $MIA_IMAGE already built with patches $PATCHES_HASH (use --rebuild to force)"
 fi
-docker run --rm --network none --entrypoint test "$IMAGE" -x /opt/tensorfold/native/bin/tensorfold-native ||
-  die "$IMAGE has no tensorfold-native"
-log "Image $IMAGE: tensorfold-native, kernel set $(docker image inspect -f '{{index .Config.Labels "tf.kernels"}}' "$IMAGE")"
+docker run --rm --network none --entrypoint test "$MIA_IMAGE" -x /opt/tensorfold/native/bin/tensorfold-native ||
+  die "$MIA_IMAGE has no tensorfold-native"
+log "Image $MIA_IMAGE: tensorfold-native, kernel set $(docker image inspect -f '{{index .Config.Labels "tf.kernels"}}' "$MIA_IMAGE")"
+# ENGINE=lanes: the lane image on top of it (scripts/lanes.sh); $IMAGE is then the lane image, which the worker gets
+if [[ "$ENGINE" == lanes ]]; then
+  source ./scripts/lanes.sh
+  lanes_image
+fi
 
 # ---------------------------------------------------------------- 3. image (worker)
 image_id=$(image_ident "$IMAGE")                    # by content: .Id differs between image stores
