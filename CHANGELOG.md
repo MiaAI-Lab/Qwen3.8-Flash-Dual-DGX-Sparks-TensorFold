@@ -20,8 +20,12 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   - Startup: the lane engine keeps its timed lane costs between starts (`start.sh` mounts a folder beside the lane
     image's CUDA cache), so a start after the first one is not slower than `ENGINE=patches` (77.2 s against 92.6 s to
     the first 200, README "Compute lanes"). The lane engine is built for the Spark's own CPU, as this recipe's is.
-  - `tool_choice` `"required"`, a named function and Anthropic `any` get HTTP 400 with `ENGINE=lanes`: patch 0007's
-    call gate is not in the lane engine yet. `"auto"` and `"none"` work.
+  - `tool_choice` `"required"`, a named function and Anthropic `any` force a tool call with `ENGINE=lanes` too: patch
+    0007's call gate is ported into the lane engine (`capabilities.call_gates: true` in `/v1/models`).
+  - `LANES_REF` is `9c6c3d04c` (published on `jayleaton/TensorFold` `flashnext-mia-lanes`): that call gate, a
+    thinking-budget fix, and a digit stop. On this model the stop keeps a big inline value from being extended by
+    thousands of invented digits. `TF_RUNNER_INLINE_MARK=1` (` @engine` after each owned value) also stopped the model
+    overriding a right value (README "Compute lanes", "Long inline values").
   - The default (`ENGINE=patches`), its image and its hash are unchanged.
   - By Jay Leaton ([jayleaton](https://github.com/jayleaton)), on MiaAI-Lab's engine and patches.
 

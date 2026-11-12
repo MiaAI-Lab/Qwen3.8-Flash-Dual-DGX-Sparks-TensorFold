@@ -485,17 +485,23 @@ VISION=0
   build fails unless the runner computes its probe cells.
 
 The lane engine is TensorFold's Zig engine with this recipe's patches 0001-0008 and 0010-0012 ported in as
-MiaAI-Lab's own commits (all but 0007's tool_choice call gate), served as `TF_FLASHNEXT_ENGINE=mia`. The lane keys
+MiaAI-Lab's own commits (0007's tool_choice call gate too, ported), served as `TF_FLASHNEXT_ENGINE=mia`. The lane keys
 are in `scripts/config.sh` and every one can be overridden.
 
 Limits:
 
 - **Text only.** Patch 0009 (vision) is not in the lane engine, so `ENGINE=lanes` needs `VISION=0`.
 - The KV flag is `--kv-cache`; `start.sh` passes it.
-- **Forced tool calls are refused.** `tool_choice: "required"`, a named function and Anthropic
-  `tool_choice: {"type": "any"}` get HTTP 400 ("cannot enforce tool_choice ... send \"auto\" or \"none\""). This
-  recipe's image enforces them; the lane engine does not have patch 0007's call gate yet. `"auto"` and `"none"` work,
-  and so do tool calls under them.
+- **Forced tool calls** work as on this recipe's image: `tool_choice: "required"`, a named function and Anthropic
+  `tool_choice: {"type": "any"}` always open a tool call (patch 0007's call gate, ported into the lane engine;
+  `/v1/models` reports `capabilities.call_gates: true`). `"auto"` and `"none"` are unchanged.
+- **Long inline values.** An inline `<expr> =` gets its exact value spliced in with nothing after it
+  (`TF_RUNNER_INLINE_MARK=0`, the default). On this model a spliced big integer was sometimes extended by the model
+  (7^222: 1,600 to 29,700 invented digits) until the reply ran out of tokens, and once the model replaced the engine's
+  right value with its own wrong arithmetic. The lane engine at `LANES_REF` replaces a digit drawn right after an
+  owned value, and stops a digit run in the reasoning at 1,024 digits, with a newline (`TF_RUNNER_DIGIT_STOP`,
+  `TF_RUNNER_DIGIT_RUN_MAX`; 0 turns each off). That ends the first kind; `TF_RUNNER_INLINE_MARK=1` ends both. It
+  writes ` @engine` after each owned value (Compute lanes, "Inline values", below).
 - Structured outputs (`response_format`, `guided_*`) get HTTP 400, as on this recipe's image. The lane image does not
   include the engine's structured-output library, so its boot log warns that `libtfgrammar.so` is missing. Adding the
   library would not change these answers: this engine port has no grammar hook yet.
@@ -530,7 +536,9 @@ JSON shape or a wrong value counts as wrong. The same harness reproduced earlier
 
 Both rows are lane engine `f9f75544a` on two Sparks, the same build and keys as here, with the 20 lane keys removed for
 lanes off. `220e5a068` is `f9f75544a` plus two scheduling commits. The pinned `LANES_REF` `52f6936c0` is
-`220e5a068` plus two startup commits (kept lane costs, a load-stage log line). These are the published commits on
+`220e5a068` plus two startup commits (kept lane costs, a load-stage log line). The pinned `LANES_REF` `9c6c3d04c` is
+`52f6936c0` plus patch 0007's call gate, a thinking-budget fix (a budget cut inside a compute result no longer fails
+the reply) and the digit stop. These are the published commits on
 `jayleaton/TensorFold` branch `flashnext-mia-lanes`. The runs below were measured on a private twin of each, which
 differs only in 9 comment lines (8 files) and some commit message wording, so the built engine is the same code. The
 published `52f6936c0` itself was then built by `scripts/prepare.sh` and started twice by `start.sh` (Startup, above).
@@ -572,6 +580,20 @@ from c1 to c16. A separately built image of the same engine measured 70.1 / 103.
 session, so c16 differs by 0.5%. The pinned `52f6936c0`, built and started by this recipe, measured
 69.8 / 101.6 / 160.4 / 239.1 / 386.5 (2026-11-12, kept lane costs). The same boot passed `tools/toolcheck.py` (3/3),
 `tools/exact.py` (drafted and concurrent replies equal the serial ones) and a 180-request mixed suite (180/180).
+
+**Inline values**, 2026-11-12, on `9c6c3d04c`'s private twin (the same tree; only one commit message differs). It was
+served on two Sparks with these lane keys, by TensorFold's own two-Spark setup rather than this recipe's `start.sh`,
+with `--thinking-budget 8192`:
+
+| `TF_RUNNER_INLINE_MARK` | 7^222 mod 1000003 written to a file by an agent client, 5 fresh sessions | 9 big-power replies (7^222, 3^300 and 2^500, 13^150; 3 seeds) with no digit run past the value | Compute set |
+| --- | ---: | ---: | --- |
+| 0 | 4/5 | 8/9 (one reply: 8 runaways, 10,402 tokens) | not run |
+| 1 | **5/5** | **9/9** (462 to 1,439 tokens a reply) | 92/120, 731 tokens a task, 12.2 s |
+
+With the mark, `tool_choice` required, named and Anthropic `any` each returned a call; `tools/toolcheck.py` passed 3/3,
+`tools/exact.py` passed, and so did the 180-request mixed suite (180/180). The 20 thinking-off replies were byte for
+byte those of `f9f75544a`'s engine. 7^222 with its mark is 191 tokens, under the 512-token limit for an owned value
+(`TF_RUNNER_MAX_TOKENS`); a marked value over it is not spliced, and the log says so.
 
 ## Repository layout
 
