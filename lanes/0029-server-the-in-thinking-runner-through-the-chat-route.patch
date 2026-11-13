@@ -1,0 +1,1817 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:19:07 +0700
+Subject: [PATCH 29/79] server: the in-thinking runner through the chat route,
+ on C3's owned span
+
+The server side of the in-model runner (slice 5 of C4), on top of C3
+(merged in from a parallel branch: no file is shared with slices 1-4).
+
+- runner_guide.zig and RUNNER-GUIDE.md: PREFIX_GUIDE's default guide in a
+  chat's system message, a request's own "runner_guide", and runner_trace*
+  checks; compute_turns.guideAsked keeps the compute default's rule.
+- runner_text.zig: the server gives the runner its tokenizer at start.
+- runner_commit_ask.zig: PREFIX_COMMIT's request settings (Request.run_commit).
+- chat.prepare sets run_cells, think_end, run_trace and run_commit when the
+  engine serves a runner (Info.runner).
+- Mailbox keeps the runner's records (Event.cells) and receipt; Generation
+  streams the records the client has (tensorfold.runner.cells), sets C3's
+  Generation.owned from reply_owned.of over the cell writes, and puts the
+  runner receipt and guide hash in the reply's runtime.
+- runner_projection.zig: abstain anchors mapped onto the fields the client got
+  (openai.zig's Run.sent); tool_parse's Envelope and envelopes are now pub.
+- openai passes the runner fields through; compute segments count the tokens
+  before them (Generation.base) for the records.
+- DeepSeek-V4.1's serve engine opens the runner through runner_binding.dsv41:
+  TF_RUNNER=1 or TF_DSV41_RUNNER=1, as before; Flash-Next stays unbound.
+- test-runner-server-host: the guide, commit ask, projection and live-record
+  tests.
+
+Ported from the dsv41 release line (s86 7b79ef92d); runner_owned.zig is not
+ported again (C3's reply_owned.zig). The DSV41 runner round trace waits for
+lanes' round_trace (slice 6).
+---
+ RUNNER-GUIDE.md                               |   1 +
+ zig/build/cuda_server_host.zig                |   1 +
+ .../families/deepseek_v41/serve_engine.zig    |  18 +
+ zig/src/server/chat.zig                       |  23 +-
+ zig/src/server/chat_generation.zig            |  71 +++
+ zig/src/server/compute_segments.zig           |   3 +-
+ zig/src/server/compute_turns.zig              |   8 +-
+ zig/src/server/mailbox.zig                    |  36 +-
+ zig/src/server/openai.zig                     |  10 +-
+ zig/src/server/root.zig                       |   6 +
+ zig/src/server/runner_commit_ask.zig          | 104 +++++
+ zig/src/server/runner_guide.zig               | 273 +++++++++++
+ zig/src/server/runner_live_test.zig           | 183 ++++++++
+ zig/src/server/runner_projection.zig          | 192 ++++++++
+ .../server/runner_projection_http_test.zig    | 438 ++++++++++++++++++
+ zig/src/server/runner_text.zig                |  31 ++
+ zig/src/server/server.zig                     |   9 +
+ zig/src/server/tool_parse.zig                 |   4 +-
+ 18 files changed, 1399 insertions(+), 12 deletions(-)
+ create mode 100644 RUNNER-GUIDE.md
+ create mode 100644 zig/src/server/runner_commit_ask.zig
+ create mode 100644 zig/src/server/runner_guide.zig
+ create mode 100644 zig/src/server/runner_live_test.zig
+ create mode 100644 zig/src/server/runner_projection.zig
+ create mode 100644 zig/src/server/runner_projection_http_test.zig
+ create mode 100644 zig/src/server/runner_text.zig
+
+diff --git a/RUNNER-GUIDE.md b/RUNNER-GUIDE.md
+new file mode 100644
+index 000000000..5b54d5403
+--- /dev/null
++++ b/RUNNER-GUIDE.md
+@@ -0,0 +1 @@
++Exact computation is available. Write the full expression inline as `<expr> =`, or a Python fenced cell with `print(<expr>)` followed by a `Result:` header. The exact value will follow. Request the whole computation early; wait for the result instead of working digits, loops, carries or long division by hand. Unsupported requests leave your own continuation.
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+index c6634bb4b..9d81f82b2 100644
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -59,6 +59,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     b.step("test-server-recovery-host", "Incomplete replies, token allocation and bounded SSE storage without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Server recovery:"} })).step);
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+     b.step("test-compute-lane-http-host", "The compute lane through the chat route: a held python call's result forced in").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"compute lane:"} })).step);
++    b.step("test-runner-server-host", "The in-model runner through the chat route: guide, live records, field anchors").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "runner guide:", "runner commit ask:", "runner projection:", "runner live records:" } })).step);
+     b.step("test-request-deadline-host", "deadline_s: the server ends a reply at its deadline with usage and ids").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request deadline:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     @import("request_starts_host.zig").steps(b, native_modules.engines, server_tests);
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index af8c6b9cf..72921c99d 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -135,6 +135,13 @@ pub const Served = struct {
+         const binding = api.hold.compute_lane.bindings.dsv41;
+         s.host.info_.compute = try binding.parse(&@import("serve_knobs.zig").env);
+         s.host.info_.compute_tool = binding.tool;
++        // TF_RUNNER=1 or TF_DSV41_RUNNER=1: code cells a reply writes run on the compiled circuit, results in place
++        if (try api.runner.bindings.dsv41.parse(&@import("serve_knobs.zig").env)) |parsed| {
++            var rc = parsed;
++            rc.place.engine = engineCpus; // PREFIX_CPUS=auto keeps the runner's threads off these
++            s.host.runner = try api.runner.open(gpa, rc);
++            s.host.info_.runner = s.host.runner;
++        }
+         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
+         s.host.on_thread = .{ .ctx = m, .run = bindContext };
+         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
+@@ -193,6 +200,17 @@ pub const Served = struct {
+         return .{ .active = u.device, .cache = 0, .peak = u.peak };
+     }
+ 
++    /// The CPUs the engine's own threads run on: the plan thread's pin and the TP knobs' CPUs.
++    fn engineCpus(set: *api.runner.place.Set) void {
++        const pinned = @import("tp").planlink.pinned_cpu.load(.acquire);
++        if (pinned >= 0) api.runner.place.add(set, @intCast(pinned));
++        const knobs = @import("serve_knobs.zig");
++        for ([_]?[]const u8{ knobs.env("TF_TP_PLAN_PIN"), knobs.env("TF_TP_ROCE_CPU") }) |v| {
++            const cpu = std.fmt.parseInt(u32, v orelse continue, 10) catch continue;
++            api.runner.place.add(set, cpu);
++        }
++    }
++
+     fn bindContext(ctx: *anyopaque) anyerror!void {
+         const m: *model.Model = @ptrCast(@alignCast(ctx));
+         try m.ctx.makeCurrent();
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 4b21c46b5..a544c6b18 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -75,6 +75,7 @@ pub const Reply = struct {
+     /// ``choices[0].prompt_logprobs`` (vLLM's form) for a request that asked; null otherwise.
+     prompt_logprobs: ?Value = null,
+     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
++    runner_raw: ?[2][]const u8 = null, // with abstain records: the runner's raw field bytes (runner_projection.zig)
+     compute_ran: usize = 0, // the lane's built-in calls the sandbox ran (not malformed or past the cap)
+     owned: ?@import("reply_owned.zig").Owned = null, // engine-owned bytes of `content`, which no strip may cut
+ };
+@@ -128,14 +129,24 @@ pub const Prepared = struct {
+     sampled: bool, // a sampling config, which the reply labels "exact"; greedy otherwise
+     drafts: bool,
+     token_ids: bool,
++    guide: ?[]const u8 = null, // the runner guide the chat got ("" none); null with the runner off
+     stops: fields_mod.Stops,
+     preparing: bool,
+     deadline_ns: ?i96 = null, // "deadline_s": the server ends the reply there itself (finish_reason "deadline")
+ };
+ 
+ /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
+-pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepared {
++pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepared {
+     const a = cx.a;
++    var input = given;
++    // the runner guide (runner_guide.zig) with the runner on: the request's, or the boot's under the compute default
++    const thinks = input.prompt == null and (flag(input.fields, "enable_thinking") orelse srv.config.enable_thinking);
++    const asked_guide = @import("compute_turns.zig").guideAsked(srv, input.fields, thinks);
++    const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
++        error.BadGuide => return cx.refuse(try srv.guides.refusal(a)),
++        error.OutOfMemory => return error.OutOfMemory,
++    };
++    input.messages = guided.messages;
+     const io = srv.io;
+     const received = nowNs(io);
+     const f = input.fields;
+@@ -216,13 +227,19 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     request.prompt_logprobs = input.prompt_logprobs;
+     // the compute lane: a reply offered the built-in tool holds at each EOS for its results (not with stop strings)
+     request.hold_eos = stops_opt.strings.len == 0 and @import("compute_turns.zig").arms(srv, input, &request);
++    // the in-model runner (runner_binding.zig): code cells this reply writes run, their results owned in place
++    request.run_cells = srv.info.runner != null;
++    if (request.run_cells and thinking and srv.think_close.len > 0) request.think_end = srv.think_close_end;
++    if (request.run_cells) request.run_trace = @import("runner_guide.zig").traceAsk(f) catch
++        return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once, runner_trace_check a boolean, runner_trace_repeat 0 to 3");
++    if (thinking) request.run_commit = try @import("runner_commit_ask.zig").of(a, srv.info.runner, srv.think_close, input.messages, input.tools, &request);
+     if (try engine_refusal.of(srv.engine, cx, &request)) |message| return cx.refuse(message);
+     const deadline: ?i96 = if (f.get("deadline_s")) |v| blk: {
+         const s = (if (v == .bool) null else v.float64()) orelse return cx.refuse("deadline_s must be a number of seconds");
+         if (!(s > 0 and s <= 1e6)) return cx.refuse("deadline_s must be more than 0 and at most 1000000 seconds");
+         break :blk received + @as(i96, @intFromFloat(s * std.time.ns_per_s));
+     } else null;
+-    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .reasoning = reasoning, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .deadline_ns = deadline };
++    return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .reasoning = reasoning, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing, .guide = guided.guide, .deadline_ns = deadline };
+ }
+ 
+ /// Submit a prepared request and collect its reply; ``sink`` hears the stream (null: not streamed).
+@@ -267,7 +284,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     preparing = false;
+     var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |x| x else undefined, .tool = srv.info.compute_tool.name };
+     const shown: ?Sink = if (request.hold_eos and sink != null) filter.sink() else sink; // built-in calls stay hidden
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false, .deadline_ns = prepared.deadline_ns, .lane_own = input.lane_own };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false, .deadline_ns = prepared.deadline_ns, .lane_own = input.lane_own, .guide = prepared.guide };
+     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index a07bff258..9eedb92ad 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -5,6 +5,7 @@ const json = @import("json");
+ const chat = @import("chat.zig");
+ const reply_text = @import("reply_text.zig");
+ const reply_owned = @import("reply_owned.zig");
++const projection = @import("runner_projection.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const tool_lfm2 = @import("tool_lfm2.zig");
+@@ -60,6 +61,10 @@ pub const Generation = struct {
+     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
+     lane_own: bool = false, // Input.lane_own: a call max_tokens cut never shows as prose, as the reply's own call
+     owned: ?reply_owned.Owned = null, // engine-owned bytes of this segment's content (reply_owned.of its cell writes)
++    guide: ?[]const u8 = null, // the runner guide text the chat got ("" none); null: the runner is off
++    cells_sent: usize = 0, // the runner records the stream sent last: a prefix the client has every landed byte of
++    cells_sig: u64 = 0, // their Mailbox.covered sig
++    base: usize = 0, // the reply's tokens before this segment's (compute_segments.zig): the runner records count them
+     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
+     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
+     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
+@@ -213,6 +218,7 @@ pub const Generation = struct {
+                 g.deadline_hit = true;
+                 g.srv.engine.cancel(g.id); // the engine ends the stream: its tokens and usage stay whole
+             };
++            if (chunk == null) if (g.sink) |sink| try g.liveCells(sink);
+             if (chunk == null and @hasDecl(Gone, "beat")) {
+                 // queueing and a long prefill send nothing: a client that times out a silent stream would leave
+                 const now = nowNs(g.srv.io);
+@@ -225,10 +231,56 @@ pub const Generation = struct {
+             }
+             const tokens = try g.skipInserted(chunk orelse continue);
+             if (g.reason == null) try g.commit(tokens);
++            if (g.sink) |sink| try g.liveCells(sink);
+             if (g.held) return;
+         }
+     }
+ 
++    /// Sends the runner records whose bytes the client has (`tensorfold.runner.cells`), so a cut stream keeps them.
++    pub fn liveCells(g: *Generation, sink: Sink) Failure!void {
++        const m = g.box;
++        var text: std.ArrayList(u8) = .empty;
++        {
++            m.mutex.lockUncancelable(m.io);
++            defer m.mutex.unlock(m.io);
++            const got = m.covered(.{ g.streamed_reasoning.text.items.len, g.streamed.text.items.len });
++            // never fewer than sent: the text may have been replaced shorter (a stop string's held prefix)
++            if (got.n < g.cells_sent or got.sig == g.cells_sig) return; // records off: n 0, sig 0, so never
++            try text.appendSlice(g.a, "{\"runner\":{\"live\":true,\"cells\":[");
++            for (m.cells.items[0..got.n], 0..) |versions, i| {
++                if (i > 0) try text.append(g.a, ',');
++                try text.appendSlice(g.a, versions.items[0].json);
++            }
++            try text.appendSlice(g.a, "]}}");
++            g.cells_sent = got.n;
++            g.cells_sig = got.sig;
++        }
++        const v = switch (try json.parse(g.a, text.items)) {
++            .ok => |v| v,
++            .err => return,
++        };
++        const delta = try json.newObject(g.a);
++        try delta.put(g.a, "tensorfold", v); // openai.zig's chunk puts it beside the choices, as the final chunk's receipt
++        try g.emit(sink, .{ .object = delta });
++    }
++
++    /// The engine-owned bytes of `content` (reply_owned.of), from the runner records the stream has had so far.
++    fn ownedOf(g: *Generation, tokens: []const u32, raw: []const u8, content: []const u8) Allocator.Error!?reply_owned.Owned {
++        if (g.srv.text.vtable.token_bytes == null) return null;
++        var records: std.ArrayList([]const u8) = .empty;
++        {
++            const m = g.box;
++            m.mutex.lockUncancelable(m.io);
++            defer m.mutex.unlock(m.io);
++            for (m.cells.items) |versions| if (versions.items.len > 0)
++                try records.append(g.a, try g.a.dupe(u8, versions.items[versions.items.len - 1].json));
++        }
++        if (records.items.len == 0) return null;
++        const pieces = try g.a.alloc([]const u8, tokens.len);
++        for (tokens, pieces) |t, *p| p.* = (try g.srv.text.tokenBytes(g.a, t)) orelse return null;
++        return reply_owned.of(g.a, records.items, g.base, pieces, raw, content, reply_text.openersOf(g.srv.markers));
++    }
++
+     /// Drops the inserted result that opens a resumed segment; a different token there fails the reply.
+     fn skipInserted(g: *Generation, tokens: []u32) Failure![]u32 {
+         const n = @min(tokens.len, g.skip.len);
+@@ -289,6 +341,7 @@ pub const Generation = struct {
+         const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else null;
+         const read: Read = if (native) |n| .{ .text = n.content, .close = "", .content = n.content, .reasoning = nonEmpty(reply_text.pyStrip(n.reasoning)) } else try g.readText(raw, content_tokens);
+         const text, const close, const content, const reasoning = .{ read.text, read.close, read.content, read.reasoning };
++        g.owned = try g.ownedOf(content_tokens, raw, content); // the runner's cell writes (none: null)
+         if (g.sink) |sink| {
+             const thought = g.streamed_reasoning.text.items;
+             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
+@@ -344,6 +397,23 @@ pub const Generation = struct {
+             if (stopped != null) try loop_field.put(a, "stopped", .{ .bool = true });
+             try runtime.put(a, "loop", .{ .object = loop_field });
+         }
++        const cells = try a.dupe(u8, m.runner);
++        var runner_raw: ?[2][]const u8 = null; // abstain anchors index these; openai.zig maps them to what it sends
++        if (cells.len > 0) switch (try json.parse(a, cells)) {
++            .ok => |v| {
++                if (v.get("abstains") != null) runner_raw = try projection.rawFields(a, g.srv.text, content_tokens, if (g.thinking) g.srv.think_close_end else null);
++                try runtime.put(a, "runner", v);
++            },
++            .err => {},
++        };
++        if (g.guide) |given| {
++            const guide = try json.newObject(a);
++            var digest: [32]u8 = undefined;
++            std.crypto.hash.sha2.Sha256.hash(given, &digest, .{});
++            try guide.put(a, "sha256", .{ .string = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) });
++            try guide.put(a, "bytes", try json.intValue(a, given.len));
++            try runtime.put(a, "runner_guide", .{ .object = guide });
++        }
+         const s = m.stats;
+         const spec = try json.newObject(a);
+         try spec.put(a, "rounds", try json.intValue(a, s.rounds));
+@@ -364,6 +434,7 @@ pub const Generation = struct {
+             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
+             .native_tool_format = native != null,
+             .native_calls = if (native) |n| n.calls else null,
++            .runner_raw = runner_raw,
+             .owned = g.owned,
+             .finish_reason = reason,
+             .prompt_tokens = prompt_len,
+diff --git a/zig/src/server/compute_segments.zig b/zig/src/server/compute_segments.zig
+index b30434662..a9a737e8e 100644
+--- a/zig/src/server/compute_segments.zig
++++ b/zig/src/server/compute_segments.zig
+@@ -80,6 +80,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
+             if (g.sink != null) filter.direct(try reportDelta(a, r)) catch return error.Cancelled;
+         }
+         g = try next(g, s, p.request.max_tokens - (used + s.len));
++        g.base = m.ids.items.len; // the runner records' token indices count every segment and result before it
+         filter.nextSegment();
+         try g.loop(gone);
+     }
+@@ -93,7 +94,7 @@ fn finish(g: *Generation, cx: *Cx, p: chat.Prepared) chat.Failure!chat.Reply {
+ /// The segment after an inserted result: the same reply, its first tokens the result's, its own text and calls.
+ fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Generation {
+     const n = try g.a.create(Generation);
+-    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
++    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .cells_sent = g.cells_sent, .cells_sig = g.cells_sig, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
+     if (g.calls != null) n.calls = try tool_stream.Streamer.init(g.a, g.tools);
+     return n;
+ }
+diff --git a/zig/src/server/compute_turns.zig b/zig/src/server/compute_turns.zig
+index 4d576e75f..89aa9d2b6 100644
+--- a/zig/src/server/compute_turns.zig
++++ b/zig/src/server/compute_turns.zig
+@@ -51,11 +51,17 @@ pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
+     return pool;
+ }
+ 
+-/// Whether thinking chats get the built-in tool, whatever they send (the compute default).
++/// Whether thinking chats get the built-in tool and the boot's guide, whatever they send (the compute default).
+ pub fn forced(srv: *const Server) bool {
+     return srv.compute != null and srv.info.compute.?.default;
+ }
+ 
++/// The request's own "runner_guide"; under the default the boot's (null) for a thinking chat, else none (""), always.
++pub fn guideAsked(srv: *const Server, fields: Value, thinking: bool) ?Value {
++    // the boot's guide was measured inside thinking; in a visible answer it writes `<expr> =` cells at the client
++    return if (!forced(srv)) fields.get("runner_guide") else if (thinking) null else .{ .string = "" };
++}
++
+ /// The default binding's max_tokens under which the default offers no built-in tool unasked (Tool.min_tokens).
+ pub const default_min_tokens = 1024;
+ 
+diff --git a/zig/src/server/mailbox.zig b/zig/src/server/mailbox.zig
+index c8507d93f..23d78a9d5 100644
+--- a/zig/src/server/mailbox.zig
++++ b/zig/src/server/mailbox.zig
+@@ -21,7 +21,12 @@ pub const Mailbox = struct {
+     widths: []u32 = &.{},
+     raised: []bool = &.{},
+     telemetry: []u8 = "",
++    runner: []u8 = "",
+     message: []u8 = "",
++    cells: std.ArrayList(std.ArrayList(Cell)) = .empty, // the runner's records by index, versions oldest first (Event.cells)
++
++    /// A runner record's version: its field, the field's bytes through its last landed byte, its JSON (gpa).
++    pub const Cell = struct { content: bool, end: u64, json: []u8 };
+ 
+     pub fn onEvent(ctx: *anyopaque, _: api.Id, event: *const api.Event) void {
+         const m: *Mailbox = @ptrCast(@alignCast(ctx));
+@@ -39,7 +44,7 @@ pub const Mailbox = struct {
+                 m.chunks.append(m.gpa, m.tokens.items.len) catch {};
+             },
+             .audio => |n| m.audio = n,
+-            .cells => {}, // runner records: the server takes them with the runner (run_cells)
++            .cells => |notes| for (notes) |n| m.note(n) catch {},
+             .finished => |f| {
+                 m.finished = true;
+                 m.reason = f.reason;
+@@ -47,13 +52,41 @@ pub const Mailbox = struct {
+                 m.widths = m.gpa.dupe(u32, f.stats.prefill_widths) catch &.{};
+                 m.raised = m.gpa.dupe(bool, f.stats.prefill_raised) catch &.{};
+                 m.telemetry = m.gpa.dupe(u8, f.stats.telemetry_json) catch "";
++                m.runner = m.gpa.dupe(u8, f.runner) catch "";
+                 m.message = m.gpa.dupe(u8, f.message) catch "";
+             },
+         }
+         m.cond.signal(m.io);
+     }
+ 
++    fn note(m: *Mailbox, n: anytype) Allocator.Error!void {
++        const json = try m.gpa.dupe(u8, n.json);
++        errdefer m.gpa.free(json);
++        while (m.cells.items.len <= n.index) try m.cells.append(m.gpa, .empty);
++        try m.cells.items[n.index].append(m.gpa, .{ .content = n.content, .end = n.end, .json = json });
++    }
++
++    /// Drops versions older than each record's newest fully `shown` one; n: records up to one with none (lock held).
++    pub fn covered(m: *Mailbox, shown: [2]usize) struct { n: usize, sig: u64 } {
++        var sig: u64 = 0;
++        for (m.cells.items, 0..) |*versions, n| {
++            var k = versions.items.len;
++            while (k > 0 and versions.items[k - 1].end > shown[@intFromBool(versions.items[k - 1].content)]) k -= 1;
++            if (k == 0) return .{ .n = n, .sig = sig };
++            for (versions.items[0 .. k - 1]) |old| m.gpa.free(old.json);
++            std.mem.copyForwards(Cell, versions.items, versions.items[k - 1 ..]);
++            versions.items.len -= k - 1;
++            sig += versions.items[0].end + 1;
++        }
++        return .{ .n = m.cells.items.len, .sig = sig };
++    }
++
+     pub fn deinit(m: *Mailbox) void {
++        for (m.cells.items) |*versions| {
++            for (versions.items) |c| m.gpa.free(c.json);
++            versions.deinit(m.gpa);
++        }
++        m.cells.deinit(m.gpa);
+         m.tokens.deinit(m.gpa);
+         m.chunks.deinit(m.gpa);
+         m.rows.deinit(m.gpa);
+@@ -61,6 +94,7 @@ pub const Mailbox = struct {
+         m.gpa.free(m.widths);
+         m.gpa.free(m.raised);
+         m.gpa.free(m.telemetry);
++        m.gpa.free(m.runner);
+         m.gpa.free(m.message);
+     }
+ };
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 2543d1ecc..35716b856 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -151,7 +151,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u8, c
+         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
+     };
+     const sampling = try json.newObject(cx.a);
+-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget", "deadline_s" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
++    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget", "runner_guide", "runner_trace", "runner_trace_format", "runner_trace_check", "runner_trace_repeat", "deadline_s" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+     try grammar.refusal(cx, body);
+     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
+@@ -270,6 +270,7 @@ const Run = struct {
+     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
+     text_offset: usize = 0, // characters a completion stream's logprob rows have covered
+     turn: ?*cortheon.Turn = null, // --cortheon's work on this request
++    sent: @import("runner_projection.zig").Sent = .{}, // the fields a stream sent, for the runner's field map
+     call_ids: ids.Calls, // the reply's tool-call ids, from this request (openai_calls.zig)
+ 
+     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
+@@ -279,6 +280,7 @@ const Run = struct {
+         try o.put(a, "object", .{ .string = if (r.is_chat) "chat.completion.chunk" else "text_completion" });
+         try o.put(a, "created", try json.intValue(a, r.created));
+         try o.put(a, "model", .{ .string = r.plan.named });
++        if (delta) |v| if (v == .object) if (v.object.fetchOrderedRemove("tensorfold")) |kv| try o.put(a, kv.key, kv.value); // live records
+         const choice = try json.newObject(a);
+         try choice.put(a, "index", .{ .int = "0" });
+         if (r.is_chat) {
+@@ -301,7 +303,7 @@ const Run = struct {
+     }
+ 
+     fn emit(r: *Run, payload: Value) error{Closed}!void {
+-        return r.out.vt.event(r.out.ctx, payload);
++        return r.out.vt.event(r.out.ctx, r.sent.seen(r.a, payload) catch return error.Closed);
+     }
+ 
+     fn usage(r: *Run, reply: *const chat.Reply) Allocator.Error!Value {
+@@ -324,7 +326,7 @@ const Run = struct {
+         try o.put(r.a, "exact_mode", .{ .string = "exact" });
+         if (reply.stop_sequence) |s| try o.put(r.a, "stop_sequence", .{ .string = s });
+         if (r.srv.config.spark_stats) try @import("spark_wire.zig").add(r.a, reply);
+-        try o.put(r.a, "tensorfold", reply.runtime);
++        try o.put(r.a, "tensorfold", try @import("runner_projection.zig").runtimeOf(r.a, reply, &r.sent, r.is_chat));
+         try o.put(r.a, "speculative", reply.speculative);
+         if (r.turn) |t| try o.put(r.a, "cortheon", try t.summary(r.a));
+     }
+@@ -445,7 +447,7 @@ const Run = struct {
+             if (!s.opened) return s.pending.append(r.a, delta) catch error.Closed;
+             if (!s.tools) {
+                 // completions stream text only, with its logprob rows when asked
+-                if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
++                if (!r.is_chat and delta != .string and (delta != .object or (delta.object.get("content") == null and delta.object.get("tensorfold") == null))) return;
+                 return r.emit(r.chunk(delta, null) catch return error.Closed);
+             }
+             @import("openai_calls.zig").streamed(r, delta) catch return error.Closed;
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index ca77cf5d5..48cdc1116 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -35,6 +35,8 @@ test {
+     _ = @import("readout_service_test.zig");
+     _ = @import("http_limits_test.zig");
+     _ = @import("done_times_test.zig");
++    _ = @import("runner_live_test.zig");
++    _ = @import("runner_projection_http_test.zig");
+     _ = @import("request_deadline_test.zig");
+     _ = @import("request_deadline_http_test.zig");
+     _ = @import("drain_test.zig");
+@@ -43,6 +45,10 @@ test {
+     _ = @import("idle_unload_test.zig");
+     _ = @import("wait_reason_test.zig");
+     _ = @import("name_priority_http_test.zig");
++    _ = @import("runner_guide.zig");
++    _ = @import("runner_commit_ask.zig");
++    _ = @import("runner_text.zig");
++    _ = @import("runner_projection.zig");
+     @import("std").testing.refAllDecls(@This());
+     _ = @import("json");
+     _ = @import("std_options.zig");
+diff --git a/zig/src/server/runner_commit_ask.zig b/zig/src/server/runner_commit_ask.zig
+new file mode 100644
+index 000000000..2ff908b07
+--- /dev/null
++++ b/zig/src/server/runner_commit_ask.zig
+@@ -0,0 +1,104 @@
++//! PREFIX_COMMIT's request settings (Request.run_commit): the think close, the task's text and the end token.
++const std = @import("std");
++const json = @import("json");
++const Value = json.Value;
++const api = @import("engine_api");
++const turns = @import("compute_turns.zig");
++const Allocator = std.mem.Allocator;
++
++/// A request's answer-commit settings; empty (it never fires) without the knob, a think close or an EOS.
++pub fn of(a: Allocator, runner: ?*api.runner.Runner, close: []const u32, msgs: Value, tools: []const Value, r: *const api.Request) Allocator.Error!@TypeOf(r.run_commit) {
++    const rn = runner orelse return .{};
++    if (!rn.cfg.commit or !r.run_cells or close.len == 0 or r.eos.len == 0 or r.structure != null) return .{};
++    return .{ .close = close, .task = try lastUser(a, msgs), .eos = r.eos[0], .max_new = r.max_tokens, .answer_max = r.answer_max, .tools = client(tools) };
++}
++
++/// A tool the client runs (not the lane's built-in, whose hold at the commit's EOS finds no call and ends the reply).
++fn client(tools: []const Value) bool {
++    for (tools) |t| if (!turns.isBuiltIn(t)) return true;
++    return false;
++}
++
++/// The last user message's text: its content string, or its text parts joined ("": none).
++fn lastUser(a: Allocator, msgs: Value) Allocator.Error![]const u8 {
++    if (msgs != .array) return "";
++    var i = msgs.array.len;
++    const m = while (i > 0) {
++        i -= 1;
++        const role = msgs.array[i].get("role") orelse continue;
++        if (role == .string and std.mem.eql(u8, role.string, "user")) break msgs.array[i];
++    } else return "";
++    const c = m.get("content") orelse return "";
++    if (c == .string) return c.string;
++    if (c != .array) return "";
++    var buf: std.ArrayList(u8) = .empty;
++    for (c.array) |part| {
++        if (part != .object) continue;
++        const kind = part.get("type") orelse continue;
++        if (kind != .string or !std.mem.eql(u8, kind.string, "text")) continue;
++        const t = part.get("text") orelse continue;
++        if (t == .string) try buf.appendSlice(a, t.string);
++    }
++    return buf.items;
++}
++
++test "runner commit ask: the knob, the last user message's text and the settings that keep it off" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const first = try json.newObject(a);
++    try first.put(a, "role", .{ .string = "user" });
++    try first.put(a, "content", .{ .string = "What is 1 + 2?" });
++    const reply = try json.newObject(a);
++    try reply.put(a, "role", .{ .string = "assistant" });
++    try reply.put(a, "content", .{ .string = "3" });
++    const part = try json.newObject(a);
++    try part.put(a, "type", .{ .string = "text" });
++    try part.put(a, "text", .{ .string = "What is 47 * 83?" });
++    var parts = [_]Value{.{ .object = part }};
++    const last = try json.newObject(a);
++    try last.put(a, "role", .{ .string = "user" });
++    try last.put(a, "content", .{ .array = &parts });
++    var chat = [_]Value{ .{ .object = first }, .{ .object = reply }, .{ .object = last } };
++    try std.testing.expectEqualStrings("What is 47 * 83?", try lastUser(a, .{ .array = &chat }));
++    try std.testing.expectEqualStrings("What is 1 + 2?", try lastUser(a, .{ .array = chat[0..2] }));
++    try std.testing.expectEqualStrings("", try lastUser(a, .{ .array = chat[1..2] }));
++    var rn: api.runner.Runner = undefined;
++    rn.cfg = .{ .commit = true };
++    const close = [_]u32{ 10, 11, 12 };
++    const eos = [_]u32{7};
++    var r: api.Request = .{ .prompt = &.{}, .max_tokens = 100, .eos = &eos, .run_cells = true };
++    const on = try of(a, &rn, &close, .{ .array = &chat }, &.{}, &r);
++    try std.testing.expectEqualSlices(u32, &close, on.close);
++    try std.testing.expectEqual(@as(?u32, 7), on.eos);
++    try std.testing.expectEqual(@as(u32, 100), on.max_new);
++    try std.testing.expectEqualStrings("What is 47 * 83?", on.task);
++    const fun = try json.newObject(a);
++    try fun.put(a, "name", .{ .string = turns.name });
++    try fun.put(a, "description", .{ .string = turns.description });
++    const builtin = try json.newObject(a);
++    try builtin.put(a, "function", .{ .object = fun });
++    const theirs = try json.newObject(a);
++    try theirs.put(a, "name", .{ .string = turns.name }); // their own `python`: another description
++    const function = try json.newObject(a);
++    try function.put(a, "function", .{ .object = theirs });
++    var only = [_]Value{.{ .object = builtin }};
++    var both = [_]Value{ .{ .object = builtin }, .{ .object = function } };
++    // the built-in tool and its lane's hold keep it on; a client's tool turns it off
++    r.hold_eos = true;
++    const lane = try of(a, &rn, &close, .{ .array = &chat }, &only, &r);
++    try std.testing.expect(lane.close.len > 0 and !lane.tools);
++    try std.testing.expect((try of(a, &rn, &close, .{ .array = &chat }, &both, &r)).tools);
++    r.hold_eos = false;
++    // each of these leaves it empty: it never fires
++    try std.testing.expectEqual(@as(usize, 0), (try of(a, null, &close, .{ .array = &chat }, &.{}, &r)).close.len);
++    try std.testing.expectEqual(@as(usize, 0), (try of(a, &rn, &.{}, .{ .array = &chat }, &.{}, &r)).close.len);
++    r.eos = &.{};
++    try std.testing.expectEqual(@as(usize, 0), (try of(a, &rn, &close, .{ .array = &chat }, &.{}, &r)).close.len);
++    r.eos = &eos;
++    r.run_cells = false;
++    try std.testing.expectEqual(@as(usize, 0), (try of(a, &rn, &close, .{ .array = &chat }, &.{}, &r)).close.len);
++    r.run_cells = true;
++    rn.cfg.commit = false;
++    try std.testing.expectEqual(@as(usize, 0), (try of(a, &rn, &close, .{ .array = &chat }, &.{}, &r)).close.len);
++}
+diff --git a/zig/src/server/runner_guide.zig b/zig/src/server/runner_guide.zig
+new file mode 100644
+index 000000000..17aafc234
+--- /dev/null
++++ b/zig/src/server/runner_guide.zig
+@@ -0,0 +1,273 @@
++//! PREFIX_GUIDE: RUNNER-GUIDE.md (T5) in a chat's system message, so the model asks for exact results early.
++const std = @import("std");
++const json = @import("json");
++const Value = json.Value;
++const TraceAsk = @import("engine_api").runner.TraceAsk;
++const validTraceFormat = @import("engine_api").runner.validTraceFormat;
++const maxTraceRepeat = @import("engine_api").runner.maxTraceRepeat;
++
++/// RUNNER-GUIDE.md without its final newline (76 tokens on DeepSeek V4.1).
++pub const text = "Exact computation is available. Write the full expression inline as `<expr> =`, or a Python fenced cell with `print(<expr>)` followed by a `Result:` header. The exact value will follow. Request the whole computation early; wait for the result instead of working digits, loops, carries or long division by hand. Unsupported requests leave your own continuation.";
++
++/// The trust guide AB3's tool-full arm sent as each request's "runner_guide" (512 bytes); the compute default's guide.
++pub const trust = "Think and compute in small chunks. As soon as a sub-computation is needed, write its complete expression as `<expr> =` and continue from the returned value. Do not finish a manual trace before requesting it. For a short integer program, use a Python fenced cell with print, then `Result:`. Unsupported cells leave your continuation. Verify the setup, program semantics and non-computational reasoning. Engine values after `=` or `Result:` are computed exactly; use as given; do not re-derive or re-check by hand.";
++
++/// The most a request's own "runner_guide" may hold.
++pub const max_request = 512;
++
++/// The server's default guide, read once at boot from PREFIX_GUIDE: "1" is `text`, any other value a file.
++pub const Set = struct {
++    default: []const u8 = "", // "": chats get no guide unless they ask
++    max_request_bytes: usize = max_request,
++
++    pub fn load(a: std.mem.Allocator, io: std.Io, knob: []const u8) !Set {
++        if (knob.len == 0) return .{};
++        if (std.mem.eql(u8, knob, "1")) return .{ .default = text };
++        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, knob, a, .limited(64 << 10));
++        return .{ .default = trim(bytes) };
++    }
++
++    pub fn refusal(s: Set, a: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
++        return std.fmt.allocPrint(a, "runner_guide must be a string of at most {d} bytes", .{s.max_request_bytes});
++    }
++
++    pub fn describe(s: Set) void {
++        @import("log.zig").line("runner guide: default {d} bytes, request limit {d} bytes", .{ s.default.len, s.max_request_bytes });
++    }
++};
++
++/// Trailing whitespace off, so a file's final newline and a request's text read alike.
++fn trim(t: []const u8) []const u8 {
++    return std.mem.trimEnd(u8, t, " \t\r\n");
++}
++
++pub const Applied = struct {
++    messages: Value,
++    guide: ?[]const u8, // the text injected ("" none); null when the runner is off
++};
++
++/// `messages` with `asked` (a request's guide) or the default; "" adds nothing, nor does a null `set` (runner off).
++pub fn apply(a: std.mem.Allocator, set: ?*const Set, asked: ?Value, messages: Value) error{ BadGuide, OutOfMemory }!Applied {
++    const s = set orelse return .{ .messages = messages, .guide = null };
++    const chosen = if (asked) |v| switch (v) {
++        .null => s.default,
++        .string => |t| if (t.len <= s.max_request_bytes) trim(t) else return error.BadGuide,
++        else => return error.BadGuide,
++    } else s.default;
++    return .{ .messages = if (chosen.len > 0) try with(a, messages, chosen) else messages, .guide = chosen };
++}
++
++/// `messages` with `guide` after the first system message's text, or in a new system message before the rest.
++pub fn with(a: std.mem.Allocator, messages: Value, guide: []const u8) std.mem.Allocator.Error!Value {
++    if (messages != .array) return messages;
++    const out = try a.alloc(Value, messages.array.len + 1);
++    if (messages.array.len > 0) if (messages.array[0].strField("role")) |role| if (std.mem.eql(u8, role, "system")) {
++        if (messages.array[0].get("content")) |content| if (content == .string) {
++            const m = try json.newObject(a);
++            var it = messages.array[0].object.iterator();
++            while (it.next()) |e| try m.put(a, e.key_ptr.*, e.value_ptr.*);
++            try m.put(a, "content", .{ .string = try std.mem.concat(a, u8, &.{ content.string, "\n\n", guide }) });
++            out[0] = .{ .object = m };
++            @memcpy(out[1..messages.array.len], messages.array[1..]);
++            return .{ .array = out[0..messages.array.len] };
++        };
++    };
++    const m = try json.newObject(a);
++    try m.put(a, "role", .{ .string = "system" });
++    try m.put(a, "content", .{ .string = guide });
++    out[0] = .{ .object = m };
++    @memcpy(out[1..], messages.array);
++    return .{ .array = out };
++}
++
++/// A chat's "runner_trace" (false: none) and "runner_trace_format", "_check", "_repeat"; null: as booted.
++pub fn traceAsk(fields: Value) error{BadTrace}!TraceAsk {
++    var ask: TraceAsk = .{};
++    if (fields.get("runner_trace")) |v| switch (v) {
++        .null => {},
++        .bool => |on| ask.off = !on,
++        else => return error.BadTrace,
++    };
++    if (fields.get("runner_trace_format")) |v| switch (v) {
++        .null => {},
++        .string => |t| ask.format = if (validTraceFormat(t)) t else return error.BadTrace,
++        else => return error.BadTrace,
++    };
++    if (fields.get("runner_trace_check")) |v| switch (v) {
++        .null => {},
++        .bool => |on| ask.check = on,
++        else => return error.BadTrace,
++    };
++    if (fields.get("runner_trace_repeat")) |v| switch (v) {
++        .null => {},
++        .int => ask.repeat = std.math.cast(u8, v.int64() orelse return error.BadTrace) orelse return error.BadTrace,
++        else => return error.BadTrace,
++    };
++    if (ask.repeat > maxTraceRepeat) return error.BadTrace;
++    return ask;
++}
++
++test "runner guide: a chat's runner_trace and runner_trace_format, and their refusals" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const f = try json.newObject(a);
++    try std.testing.expectEqualDeep(TraceAsk{}, try traceAsk(.{ .object = f }));
++    try f.put(a, "runner_trace", .{ .bool = false });
++    try f.put(a, "runner_trace_format", .{ .string = "[exact, computed by the engine: {}]" });
++    const got = try traceAsk(.{ .object = f });
++    try std.testing.expect(got.off);
++    try std.testing.expectEqualStrings("[exact, computed by the engine: {}]", got.format);
++    try f.put(a, "runner_trace", .{ .bool = true });
++    try f.put(a, "runner_trace_format", .null);
++    try std.testing.expectEqualDeep(TraceAsk{}, try traceAsk(.{ .object = f }));
++    for ([_]Value{ .{ .string = "[exact]" }, .{ .string = "[{}]\n{}" }, .{ .string = "a\n{}" }, .{ .bool = true } }) |bad| {
++        try f.put(a, "runner_trace_format", bad);
++        try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
++    }
++    try f.put(a, "runner_trace_format", .null);
++    try f.put(a, "runner_trace", .{ .string = "off" });
++    try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
++    try f.put(a, "runner_trace", .null);
++    try f.put(a, "runner_trace_check", .{ .bool = true });
++    try std.testing.expect((try traceAsk(.{ .object = f })).check);
++    try f.put(a, "runner_trace_check", .{ .string = "true" });
++    try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
++    try f.put(a, "runner_trace_check", .null);
++    try f.put(a, "runner_trace_repeat", .{ .int = "1" });
++    try std.testing.expectEqual(@as(u8, 1), (try traceAsk(.{ .object = f })).repeat);
++    for ([_]Value{ .{ .int = "4" }, .{ .int = "-1" }, .{ .int = "300" }, .{ .string = "1" }, .{ .bool = true } }) |bad| {
++        try f.put(a, "runner_trace_repeat", bad);
++        try std.testing.expectError(error.BadTrace, traceAsk(.{ .object = f }));
++    }
++}
++
++test "runner guide: T5's RUNNER-GUIDE.md bytes; joins a system message or leads the chat" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var digest: [32]u8 = undefined;
++    std.crypto.hash.sha2.Sha256.hash(text ++ "\n", &digest, .{});
++    try std.testing.expectEqualStrings("b99224b5ebf6f7e9323bfc011200073211e1fc9381968e067f1a336893a8a7bb", &std.fmt.bytesToHex(digest, .lower));
++    const user = try json.newObject(a);
++    try user.put(a, "role", .{ .string = "user" });
++    try user.put(a, "content", .{ .string = "What is 47*83?" });
++    var one = [_]Value{.{ .object = user }};
++    const led = try with(a, .{ .array = &one }, text);
++    try std.testing.expectEqual(@as(usize, 2), led.array.len);
++    try std.testing.expectEqualStrings("system", led.array[0].strField("role").?);
++    try std.testing.expectEqualStrings(text, led.array[0].get("content").?.string);
++    try std.testing.expectEqualStrings("user", led.array[1].strField("role").?);
++    const sys = try json.newObject(a);
++    try sys.put(a, "role", .{ .string = "system" });
++    try sys.put(a, "content", .{ .string = "Be brief." });
++    var two = [_]Value{ .{ .object = sys }, .{ .object = user } };
++    const joined = try with(a, .{ .array = &two }, text);
++    try std.testing.expectEqual(@as(usize, 2), joined.array.len);
++    try std.testing.expectEqualStrings("Be brief.\n\n" ++ text, joined.array[0].get("content").?.string);
++    try std.testing.expectEqualStrings("Be brief.", two[0].get("content").?.string); // the request is not changed
++}
++
++test "runner guide: the trust guide is AB3's tool-full text, byte for byte" {
++    var digest: [32]u8 = undefined;
++    std.crypto.hash.sha2.Sha256.hash(trust, &digest, .{});
++    try std.testing.expectEqualStrings("53ed328f72e2e79076aaf9e7ce2a1da1b11f3cae7ed22b76798b15c6e59add92", &std.fmt.bytesToHex(digest, .lower));
++    try std.testing.expectEqual(max_request, trust.len);
++    try std.testing.expectEqualStrings(trust, trim(trust)); // a request sending it injected these same bytes
++}
++
++test "runner guide: boot default, a request's override, an empty one and the runner off" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "RUNNER-GUIDE.md", .data = text ++ "\n" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "terse.md", .data = "Ask for exact values.\n" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "empty.md", .data = "\n" });
++    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    const builtin = try Set.load(a, io, "1");
++    try std.testing.expectEqualStrings(text, builtin.default);
++    try std.testing.expectEqualStrings(text, (try Set.load(a, io, try std.fs.path.join(a, &.{ root, "RUNNER-GUIDE.md" }))).default);
++    const terse = try Set.load(a, io, try std.fs.path.join(a, &.{ root, "terse.md" }));
++    const none = try Set.load(a, io, "");
++    try std.testing.expectEqualStrings("", (try Set.load(a, io, try std.fs.path.join(a, &.{ root, "empty.md" }))).default);
++    try std.testing.expectError(error.FileNotFound, Set.load(a, io, "/nonexistent/guide.md"));
++
++    const user = try json.newObject(a);
++    try user.put(a, "role", .{ .string = "user" });
++    try user.put(a, "content", .{ .string = "What is 47*83?" });
++    var one = [_]Value{.{ .object = user }};
++    const chat: Value = .{ .array = &one };
++    const plain = try json.stringify(a, chat, .{});
++    const Case = struct { set: ?*const Set, asked: ?Value, want: []const u8, guide: ?[]const u8 };
++    const with_text = try json.stringify(a, try with(a, chat, text), .{});
++    const with_terse = try json.stringify(a, try with(a, chat, "Ask for exact values."), .{});
++    for ([_]Case{
++        .{ .set = &builtin, .asked = null, .want = with_text, .guide = text }, // the boot default
++        .{ .set = &builtin, .asked = .{ .string = "Ask for exact values.\n" }, .want = with_terse, .guide = "Ask for exact values." }, // override
++        .{ .set = &terse, .asked = null, .want = with_terse, .guide = "Ask for exact values." }, // the same text from a boot file
++        .{ .set = &none, .asked = .{ .string = "Ask for exact values." }, .want = with_terse, .guide = "Ask for exact values." },
++        .{ .set = &builtin, .asked = .{ .string = "" }, .want = plain, .guide = "" }, // empty: no guide
++        .{ .set = &none, .asked = null, .want = plain, .guide = "" },
++        .{ .set = null, .asked = .{ .string = "Ask for exact values." }, .want = plain, .guide = null }, // runner off: ignored
++    }) |c| {
++        const got = try apply(a, c.set, c.asked, chat);
++        try std.testing.expectEqualStrings(c.want, try json.stringify(a, got.messages, .{}));
++        if (c.guide) |g| try std.testing.expectEqualStrings(g, got.guide.?) else try std.testing.expect(got.guide == null);
++    }
++    const long = try a.alloc(u8, max_request + 1);
++    @memset(long, 'x');
++    try std.testing.expectError(error.BadGuide, apply(a, &builtin, .{ .string = long }, chat));
++    _ = try apply(a, &builtin, .{ .string = long[0..max_request] }, chat);
++    try std.testing.expectError(error.BadGuide, apply(a, &builtin, .{ .bool = true }, chat));
++}
++
++test "runner guide: opt-in request byte boundaries preserve injection and off behavior" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const user = try json.newObject(a);
++    try user.put(a, "role", .{ .string = "user" });
++    try user.put(a, "content", .{ .string = "Compute 47*83." });
++    var one = [_]Value{.{ .object = user }};
++    const chat: Value = .{ .array = &one };
++    const bytes = try a.alloc(u8, 2049);
++    @memset(bytes, 'x');
++    const Case = struct { limit: usize, len: usize, accept: bool };
++    for ([_]Case{
++        .{ .limit = 512, .len = 512, .accept = true },
++        .{ .limit = 512, .len = 586, .accept = false },
++        .{ .limit = 1024, .len = 586, .accept = true },
++        .{ .limit = 2048, .len = 512, .accept = true },
++        .{ .limit = 2048, .len = 586, .accept = true },
++        .{ .limit = 2048, .len = 2048, .accept = true },
++        .{ .limit = 2048, .len = 2049, .accept = false },
++    }) |c| {
++        const set: Set = .{ .default = "Boot guide", .max_request_bytes = c.limit };
++        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "runner_guide must be a string of at most {d} bytes", .{c.limit}), try set.refusal(a));
++        const asked: Value = .{ .string = bytes[0..c.len] };
++        if (c.accept) {
++            const got = try apply(a, &set, asked, chat);
++            try std.testing.expectEqualStrings(bytes[0..c.len], got.guide.?);
++            try std.testing.expectEqualStrings(bytes[0..c.len], got.messages.array[0].strField("content").?);
++            try std.testing.expectEqualStrings("Compute 47*83.", got.messages.array[1].strField("content").?);
++        } else try std.testing.expectError(error.BadGuide, apply(a, &set, asked, chat));
++        const off = try apply(a, null, asked, chat);
++        try std.testing.expect(off.guide == null);
++        try std.testing.expectEqualStrings(try json.stringify(a, chat, .{}), try json.stringify(a, off.messages, .{}));
++        try std.testing.expectEqualStrings("Boot guide", (try apply(a, &set, .null, chat)).guide.?);
++        try std.testing.expectEqualStrings("", (try apply(a, &set, .{ .string = "" }, chat)).guide.?);
++    }
++    const capped: Set = .{ .max_request_bytes = 2048 };
++    @memset(bytes, ' ');
++    try std.testing.expectError(error.BadGuide, apply(a, &capped, .{ .string = bytes }, chat));
++    for (0..1024) |i| {
++        bytes[2 * i] = 0xc3;
++        bytes[2 * i + 1] = 0xa9;
++    }
++    bytes[2048] = 'x';
++    try std.testing.expectEqual(@as(usize, 2048), (try apply(a, &capped, .{ .string = bytes[0..2048] }, chat)).guide.?.len);
++    try std.testing.expectError(error.BadGuide, apply(a, &capped, .{ .string = bytes }, chat));
++}
+diff --git a/zig/src/server/runner_live_test.zig b/zig/src/server/runner_live_test.zig
+new file mode 100644
+index 000000000..7bfaf2e1d
+--- /dev/null
++++ b/zig/src/server/runner_live_test.zig
+@@ -0,0 +1,183 @@
++//! The runner's live records (Generation.liveCells): a stream the client leaves mid-write keeps a record per write.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json");
++const server = @import("server.zig");
++const chat = @import("chat.zig");
++const model_text = @import("model_text.zig");
++const Cx = @import("errors.zig").Cx;
++const Note = @typeInfo(@FieldType(api.Event, "cells")).pointer.child;
++
++const gpa = std.testing.allocator;
++
++/// One byte a token.
++const Bytes = struct {
++    fn text(t: *Bytes) model_text.Text {
++        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = template } };
++    }
++    fn encode(_: *anyopaque, a: std.mem.Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
++        const ids = try a.alloc(u32, input.len);
++        for (input, ids) |byte, *id| id.* = byte;
++        return ids;
++    }
++    fn decode(_: *anyopaque, a: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
++        const out = try a.alloc(u8, ids.len);
++        for (out, ids) |*v, id| v.* = @intCast(id);
++        return out;
++    }
++    fn tokenId(_: *anyopaque, _: []const u8) ?u32 {
++        return null;
++    }
++    fn tokenString(_: *anyopaque, a: std.mem.Allocator, id: u32) ![]u8 {
++        return std.fmt.allocPrint(a, "{d}", .{id});
++    }
++    fn vocab(_: *anyopaque) u32 {
++        return 256;
++    }
++    fn eos(_: *anyopaque) []const u32 {
++        return &.{};
++    }
++    fn render(_: *anyopaque, a: std.mem.Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error!model_text.Rendered {
++        return .{ .text = try a.dupe(u8, "prompt") };
++    }
++    fn template(_: *anyopaque) []const u8 {
++        return "";
++    }
++};
++
++/// What the engine gives in one round: the records as they stand, then the tokens that land them (LaneHost.send).
++const Step = struct { notes: []const Note = &.{}, tokens: []const u8 };
++
++const a0 = "{\"cell\":0,\"form\":\"inline\",\"value\":\"\",\"field\":\"content\",\"at\":9,\"ids\":2,\"landed\":0}";
++const a1 = "{\"cell\":0,\"form\":\"inline\",\"value\":\" 6\",\"field\":\"content\",\"at\":9,\"ids\":2,\"landed\":2}";
++const b0 = "{\"cell\":1,\"form\":\"inline\",\"value\":\"\",\"field\":\"content\",\"at\":22,\"ids\":3,\"landed\":0}";
++const b1 = "{\"cell\":1,\"form\":\"inline\",\"value\":\" 2\",\"field\":\"content\",\"at\":22,\"ids\":3,\"landed\":1}";
++const b2 = "{\"cell\":1,\"form\":\"inline\",\"value\":\" 2!\",\"field\":\"content\",\"at\":22,\"ids\":3,\"landed\":2}";
++
++/// `x = 2*3 = 6. y = 4*5 = 2` then a `!` the stream holds back (stop `!!`): the client leaves inside the second write.
++const steps = [_]Step{
++    .{ .notes = &.{.{ .index = 0, .content = true, .end = 9, .json = a0 }}, .tokens = "x = 2*3 =" },
++    .{ .notes = &.{.{ .index = 0, .content = true, .end = 11, .json = a1 }}, .tokens = " 6" },
++    .{ .notes = &.{.{ .index = 1, .content = true, .end = 22, .json = b0 }}, .tokens = ". y = 4*5 =" },
++    .{ .notes = &.{.{ .index = 1, .content = true, .end = 24, .json = b1 }}, .tokens = " 2" },
++    .{ .notes = &.{.{ .index = 1, .content = true, .end = 25, .json = b2 }}, .tokens = "!" },
++};
++
++/// An engine that gives a round each time the request's thread checks on its client, then sees the client leave.
++const Script = struct {
++    records: bool,
++    sink: ?api.Sink = null,
++    id: api.Id = 0,
++    next: usize = 0,
++    fn engine(s: *Script) api.Engine {
++        return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 8192 };
++    }
++    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const s: *Script = @ptrCast(@alignCast(ctx));
++        s.sink = sink;
++        s.id = id;
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        s.round();
++    }
++    fn round(s: *Script) void {
++        const step = steps[s.next];
++        s.next += 1;
++        const sink = s.sink.?;
++        if (s.records) sink.event(sink.ctx, s.id, &.{ .cells = step.notes });
++        var tokens: [16]u32 = undefined;
++        for (step.tokens, 0..) |b, i| tokens[i] = b;
++        sink.event(sink.ctx, s.id, &.{ .tokens = tokens[0..step.tokens.len] });
++    }
++    fn cancel(ctx: *anyopaque, _: api.Id) void {
++        const s: *Script = @ptrCast(@alignCast(ctx));
++        const sink = s.sink.?;
++        sink.event(sink.ctx, s.id, &.{ .finished = .{ .reason = .cancelled } });
++    }
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++const Gone = struct {
++    s: *Script,
++    checks: *usize,
++    pub fn check(g: @This()) bool {
++        if (g.s.sink == null) return false; // chat.prepare looks before the engine has the request
++        g.checks.* += 1;
++        if (g.s.next < steps.len) {
++            g.s.round();
++            return false;
++        }
++        return g.checks.* > steps.len + 1; // one more look after the last round, then the client is gone
++    }
++};
++
++/// The client: the text it has, every other delta as JSON, and the newest records with any it got ahead of its bytes.
++const Client = struct {
++    a: std.mem.Allocator,
++    text: std.ArrayList(u8) = .empty,
++    plain: std.ArrayList([]const u8) = .empty,
++    last: ?json.Value = null,
++    sent: usize = 0,
++    ahead: usize = 0,
++    fn call(ctx: *anyopaque, delta: json.Value) error{Closed}!void {
++        const c: *Client = @ptrCast(@alignCast(ctx));
++        if (delta == .object) if (delta.get("tensorfold")) |tf| {
++            const run = tf.get("runner") orelse return error.Closed;
++            for ((run.get("cells") orelse return error.Closed).array) |cell| {
++                const at: usize = @intCast(cell.get("at").?.int64().?);
++                const len = cell.strField("value").?.len;
++                if (at + len > c.text.items.len) c.ahead += 1;
++            }
++            c.last = run;
++            c.sent += 1;
++            return;
++        };
++        c.plain.append(c.a, json.stringify(c.a, delta, .{}) catch return error.Closed) catch return error.Closed;
++        if (delta == .string) c.text.appendSlice(c.a, delta.string) catch return error.Closed;
++    }
++    fn sink(c: *Client) chat.Sink {
++        return .{ .ctx = c, .call = call };
++    }
++};
++
++fn stream(a: std.mem.Allocator, records: bool) !Client {
++    var script: Script = .{ .records = records };
++    var bytes: Bytes = .{};
++    const srv = try server.Server.init(gpa, std.testing.io, script.engine(), bytes.text(), .{ .served_name = "test", .model_ids = &.{"test"}, .enable_thinking = false }, null);
++    defer srv.deinit();
++    var client: Client = .{ .a = a };
++    var checks: usize = 0;
++    var cx: Cx = .{ .a = a };
++    const fields = try json.newObject(a);
++    try fields.put(a, "stop", .{ .string = "!!" });
++    const input: chat.Input = .{ .id = "chatcmpl-live", .prompt = .{ .text = "prompt" }, .max_tokens = 100, .fields = .{ .object = fields } };
++    try std.testing.expectError(error.Cancelled, chat.run(srv, &cx, input, client.sink(), Gone{ .s = &script, .checks = &checks }));
++    try std.testing.expectEqual(steps.len, script.next);
++    return client;
++}
++
++test "runner live records: a client that leaves inside a write has a record for each write it was shown" {
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const on = try stream(a, true);
++    try std.testing.expectEqualStrings("x = 2*3 = 6. y = 4*5 = 2", on.text.items);
++    try std.testing.expectEqual(0, on.ahead); // never a record whose bytes the client did not yet have
++    try std.testing.expectEqual(4, on.sent); // a0; a1; a1 b0; a1 b1 (not b2: its `!` is held back)
++    const last = on.last.?;
++    try std.testing.expect(last.get("live").?.bool);
++    const want = try json.parse(a, "[" ++ a1 ++ "," ++ b1 ++ "]");
++    try std.testing.expectEqualStrings(try json.stringify(a, want.ok, .{}), try json.stringify(a, last.get("cells").?, .{}));
++    // records off: no records chunk, and every other delta byte for byte the same
++    const off = try stream(a, false);
++    try std.testing.expectEqual(0, off.sent);
++    try std.testing.expectEqual(on.plain.items.len, off.plain.items.len);
++    for (on.plain.items, off.plain.items) |x, y| try std.testing.expectEqualStrings(x, y);
++}
+diff --git a/zig/src/server/runner_projection.zig b/zig/src/server/runner_projection.zig
+new file mode 100644
+index 000000000..f50b621f8
+--- /dev/null
++++ b/zig/src/server/runner_projection.zig
+@@ -0,0 +1,192 @@
++//! Runner receipt anchors projected from the engine's raw field bytes into the reply's fields as the client gets them.
++const std = @import("std");
++const json = @import("json");
++const reply_text = @import("reply_text.zig");
++const tool_parse = @import("tool_parse.zig");
++const model_text = @import("model_text.zig");
++const chat = @import("chat.zig");
++const Value = json.Value;
++const Allocator = std.mem.Allocator;
++
++/// One field's map: final byte p is raw byte `lead + p`, for p in [0, kept].
++pub const Map = struct { raw: usize, lead: usize, kept: usize };
++
++/// The runner's field bytes as runner_text.zig keeps them (none for the think close); null without token bytes.
++pub fn rawFields(a: Allocator, text: model_text.Text, tokens: []const u32, think_end: ?u32) Allocator.Error!?[2][]const u8 {
++    if (text.vtable.token_bytes == null) return null;
++    var fields: [2]std.ArrayList(u8) = .{ .empty, .empty };
++    var field: usize = if (think_end == null) 1 else 0;
++    for (tokens) |t| {
++        if (field == 0 and t == think_end.?) {
++            field = 1;
++            continue;
++        }
++        try fields[field].appendSlice(a, (try text.tokenBytes(a, t)) orelse "");
++    }
++    return .{ fields[0].items, fields[1].items };
++}
++
++/// The final field as the one raw run with only blanks and whole tool envelopes outside; else null (bad UTF-8, cuts).
++pub fn mapOf(a: Allocator, raw: []const u8, final: []const u8, open: []const u8) Allocator.Error!?Map {
++    if (!std.unicode.utf8ValidateSlice(raw) or !std.unicode.utf8ValidateSlice(final)) return null;
++    const body: usize = if (open.len > 0 and std.mem.startsWith(u8, raw, open)) open.len else 0;
++    const cut = try Cut.of(a, raw, try tool_parse.envelopes(a, raw), body);
++    if (final.len == 0) return if (cut.before[raw.len]) .{ .raw = raw.len, .lead = raw.len, .kept = 0 } else null;
++    var found: ?Map = null;
++    var from = body;
++    while (std.mem.indexOfPos(u8, raw, from, final)) |lead| : (from = lead + 1) {
++        if (!cut.before[lead] or !cut.after[lead + final.len]) continue;
++        if (found != null) return null; // two runs fit: no provenance
++        found = .{ .raw = raw.len, .lead = lead, .kept = final.len };
++    }
++    return found;
++}
++
++/// Per raw byte p: raw[body..p] (`before`) and raw[p..] (`after`) are only blanks and whole envelopes, none across p.
++const Cut = struct {
++    before: []bool,
++    after: []bool,
++
++    /// One pass each way over the envelopes (sorted, apart); an unfinished one (to EOF) is no proof of deletion.
++    fn of(a: Allocator, raw: []const u8, envs: []const tool_parse.Envelope, body: usize) Allocator.Error!Cut {
++        const c: Cut = .{ .before = try a.alloc(bool, raw.len + 1), .after = try a.alloc(bool, raw.len + 1) };
++        @memset(c.before, false);
++        @memset(c.after, false);
++        var ok = true;
++        var p = body;
++        for (envs) |e| if (e.end > body) {
++            ok = if (e.start < body) false else gap(c.before, raw, p, e.start, ok, true) and e.complete;
++            p = e.end;
++        };
++        _ = gap(c.before, raw, p, raw.len, ok, true);
++        ok = true;
++        var q = raw.len;
++        var i = envs.len;
++        while (i > 0 and envs[i - 1].end > body) : (i -= 1) {
++            const e = envs[i - 1];
++            ok = gap(c.after, raw, e.end, q, ok, false) and e.complete;
++            q = e.start;
++            if (q < body) return c;
++        }
++        _ = gap(c.after, raw, body, q, ok, false);
++        return c;
++    }
++
++    /// Marks the code point starts of raw[from..to] reached from its envelope side through blanks; true when all blank.
++    fn gap(marks: []bool, raw: []const u8, from: usize, to: usize, ok: bool, head: bool) bool {
++        const g = raw[from..to];
++        const s = reply_text.pyStrip(g);
++        const lead = if (s.len == 0) g.len else @intFromPtr(s.ptr) - @intFromPtr(g.ptr);
++        const tail = if (s.len == 0) g.len else g.len - lead - s.len;
++        const lo, const hi = if (head) .{ from, from + lead + 1 } else .{ to - tail, to + 1 };
++        if (ok) for (lo..hi) |i| {
++            marks[i] = i == raw.len or raw[i] & 0xc0 != 0x80; // inside a multibyte blank: half of it is no deletion
++        };
++        return ok and s.len == 0;
++    }
++};
++
++/// The reasoning and content a stream sent, read off each chunk as the client gets it.
++pub const Sent = struct {
++    fields: [2]std.ArrayList(u8) = .{ .empty, .empty },
++    streamed: bool = false,
++
++    pub fn seen(s: *Sent, a: Allocator, payload: Value) Allocator.Error!Value {
++        s.streamed = true;
++        const choices = (payload.get("choices") orelse return payload).items() orelse return payload;
++        if (choices.len == 0) return payload;
++        const c = choices[0];
++        if (c.get("delta")) |d| {
++            try s.fields[0].appendSlice(a, json.strOr(d.get("reasoning_content")));
++            try s.fields[1].appendSlice(a, json.strOr(d.get("content")));
++        } else try s.fields[1].appendSlice(a, json.strOr(c.get("text")));
++        return payload;
++    }
++};
++
++/// The runtime with abstain anchors mapped onto the fields the client got: as sent, else after tool parsing.
++pub fn runtimeOf(a: Allocator, reply: *const chat.Reply, sent: *const Sent, is_chat: bool) Allocator.Error!Value {
++    const raw = reply.runner_raw orelse return reply.runtime;
++    const runner = reply.runtime.get("runner") orelse return reply.runtime;
++    const got: [2][]const u8 = if (sent.streamed) .{ sent.fields[0].items, sent.fields[1].items } else .{ if (is_chat) reply.reasoning orelse "" else "", reply.content };
++    try apply(a, runner, .{ try mapOf(a, raw[0], got[0], "<think>"), try mapOf(a, raw[1], got[1], "") });
++    return reply.runtime;
++}
++
++fn project(m: ?Map, raw: ?i64) ?usize {
++    const map = m orelse return null;
++    const r = std.math.cast(usize, raw orelse return null) orelse return null;
++    if (r < map.lead or r - map.lead > map.kept) return null; // in a dropped head or tail: no final byte
++    return r - map.lead;
++}
++
++fn put(a: Allocator, o: *json.Object, key: []const u8, n: ?usize) !void {
++    try o.put(a, key, if (n) |v| try json.intValue(a, v) else .null);
++}
++
++fn mapValue(a: Allocator, m: ?Map) !Value {
++    const map = m orelse return .null;
++    const o = try json.newObject(a);
++    try put(a, o, "raw_bytes", map.raw);
++    try put(a, o, "dropped_lead", map.lead);
++    try put(a, o, "final_bytes", map.kept);
++    return .{ .object = o };
++}
++
++fn fieldOf(v: Value, key: []const u8) ?usize {
++    const name = v.strField(key) orelse return null;
++    if (std.mem.eql(u8, name, "reasoning")) return 0;
++    if (std.mem.eql(u8, name, "content")) return 1;
++    return null;
++}
++
++const anchors = [_][]const u8{ "source_at", "source_end", "source_close_at", "resume_at" };
++
++/// A raw anchor that is no byte offset (negative, past the bytes rebuilt here, not an i64): that field has no map.
++fn bound(maps: *[2]?Map, i: ?usize, raw: ?Value) void {
++    const f = i orelse return;
++    const m = maps[f] orelse return;
++    const v = raw orelse return;
++    if (v == .null) return;
++    const r = v.int64() orelse return {
++        maps[f] = null;
++    };
++    if (r < 0 or r > m.raw) maps[f] = null;
++}
++
++/// With abstain records only: `field_projection`, cells' `final_at`, abstain anchors in final bytes (raw: `raw_*`).
++pub fn apply(a: Allocator, runner: Value, given: [2]?Map) !void {
++    const abstains = runner.get("abstains") orelse return;
++    const cells = if (runner.get("cells")) |c| c.items() orelse &.{} else &.{};
++    var maps = given;
++    for (cells) |c| bound(&maps, fieldOf(c, "field"), c.get("at"));
++    for (abstains.items() orelse &.{}) |x| for (anchors) |key|
++        bound(&maps, fieldOf(x, if (key[0] == 'r') "resume_field" else "source_field"), x.get(key));
++    const fields = try json.newObject(a);
++    try fields.put(a, "reasoning", try mapValue(a, maps[0]));
++    try fields.put(a, "content", try mapValue(a, maps[1]));
++    try runner.object.put(a, "field_projection", .{ .object = fields });
++    for (cells) |c| if (c == .object) {
++        const m = if (fieldOf(c, "field")) |f| maps[f] else null;
++        try put(a, c.object, "final_at", project(m, if (c.get("at")) |v| v.int64() else null));
++    };
++    for (abstains.items() orelse &.{}) |x| if (x == .object) for (anchors) |key| {
++        const raw = x.object.get(key) orelse continue;
++        const f = fieldOf(x, if (key[0] == 'r') "resume_field" else "source_field");
++        try x.object.put(a, try std.mem.concat(a, u8, &.{ "raw_", key }), raw);
++        try put(a, x.object, key, project(if (f) |i| maps[i] else null, raw.int64()));
++    };
++}
++
++test "runner projection: deletable cuts fall only between code points, never inside a multibyte blank" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_][]const u8{ "\u{a0}", "\u{3000}" }) |blank| { // two- and three-byte blanks (none takes four bytes)
++        const c = try Cut.of(a, blank, &.{}, 0);
++        for (0..blank.len + 1) |i| {
++            try std.testing.expectEqual(i == 0 or i == blank.len, c.before[i]);
++            try std.testing.expectEqual(i == 0 or i == blank.len, c.after[i]);
++        }
++    }
++}
+diff --git a/zig/src/server/runner_projection_http_test.zig b/zig/src/server/runner_projection_http_test.zig
+new file mode 100644
+index 000000000..ba6021c70
+--- /dev/null
++++ b/zig/src/server/runner_projection_http_test.zig
+@@ -0,0 +1,438 @@
++//! Abstain anchors through the OpenAI HTTP handler: raw runner bytes projected into the final fields.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json");
++const openai = @import("openai.zig");
++const projection = @import("runner_projection.zig");
++const Server = @import("server.zig").Server;
++const Conn = @import("http_conn.zig").Conn;
++const model_text = @import("model_text.zig");
++const Allocator = std.mem.Allocator;
++
++const close_id: u32 = 300;
++const eos_id: u32 = 301;
++
++/// One byte a token below 256 (255 decodes lossily to U+FFFD, its token bytes stay FF); 300 is `</think>`, 301 EOS.
++pub const Bytes = struct {
++    pub fn text(t: *Bytes) model_text.Text {
++        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = template, .token_bytes = tokenBytes } };
++    }
++    fn encode(_: *anyopaque, a: Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
++        const ids = try a.alloc(u32, input.len);
++        for (input, ids) |byte, *id| id.* = byte;
++        return ids;
++    }
++    fn decode(_: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
++        var out: std.ArrayList(u8) = .empty;
++        for (ids) |id| if (id == close_id) try out.appendSlice(a, "</think>") else if (id == 255) try out.appendSlice(a, "\u{fffd}") else if (id < 256) try out.append(a, @intCast(id));
++        return out.items;
++    }
++    fn tokenBytes(_: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 {
++        if (id == close_id) return try a.dupe(u8, "</think>");
++        return if (id < 256) try a.dupe(u8, &.{@intCast(id)}) else null;
++    }
++    fn tokenId(_: *anyopaque, piece: []const u8) ?u32 {
++        return if (std.mem.eql(u8, piece, "</think>")) close_id else null;
++    }
++    fn tokenString(_: *anyopaque, a: Allocator, id: u32) ![]u8 {
++        return std.fmt.allocPrint(a, "{d}", .{id});
++    }
++    fn vocab(_: *anyopaque) u32 {
++        return 302;
++    }
++    fn eos(_: *anyopaque) []const u32 {
++        return &.{eos_id};
++    }
++    fn render(_: *anyopaque, a: Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error!model_text.Rendered {
++        return .{ .text = try a.dupe(u8, "prompt") };
++    }
++    fn template(_: *anyopaque) []const u8 {
++        return "";
++    }
++};
++
++/// Gives its tokens in one round, then ends (stop) with its runner receipt.
++const Script = struct {
++    tokens: []const u32,
++    receipt: []const u8,
++    fn engine(s: *Script) api.Engine {
++        return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 8192 };
++    }
++    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const s: *Script = @ptrCast(@alignCast(ctx));
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        sink.event(sink.ctx, id, &.{ .tokens = s.tokens });
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop, .runner = s.receipt } });
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++const Reply = struct {
++    a: Allocator,
++    status: ?u16 = null,
++    whole: ?json.Value = null,
++    events: std.ArrayList(json.Value) = .empty,
++    fn out(r: *Reply) openai.Out {
++        return .{ .ctx = r, .vt = &.{ .open = open, .event = event, .reply = reply } };
++    }
++    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
++    fn event(ctx: *anyopaque, value: ?json.Value) error{Closed}!void {
++        const r: *Reply = @ptrCast(@alignCast(ctx));
++        if (value) |v| r.events.append(r.a, v) catch return error.Closed;
++    }
++    fn reply(ctx: *anyopaque, status_code: u16, value: json.Value) void {
++        const r: *Reply = @ptrCast(@alignCast(ctx));
++        r.status = status_code;
++        r.whole = value;
++    }
++};
++
++/// The client's fields (whole, or the stream's deltas added up), the receipt's runner block, and any tool calls.
++const Got = struct { reasoning: []const u8, content: []const u8, runner: json.Value, calls: bool = false };
++
++/// A thinking chat reply of `reasoning`, the close token and `content`, through openai.run.
++fn post(a: Allocator, reasoning: []const u8, content: []const u8, receipt: []const u8, stream: bool) !Got {
++    return postWith(a, reasoning, content, receipt, stream, "");
++}
++
++/// As `post`; `extra`: more request fields, each led by a comma (tools).
++fn postWith(a: Allocator, reasoning: []const u8, content: []const u8, receipt: []const u8, stream: bool, extra: []const u8) !Got {
++    var ids: std.ArrayList(u32) = .empty;
++    for (reasoning) |b| try ids.append(a, b);
++    try ids.append(a, close_id);
++    for (content) |b| try ids.append(a, b);
++    try ids.append(a, eos_id);
++    var s: Script = .{ .tokens = ids.items, .receipt = receipt };
++    var bytes: Bytes = .{};
++    const srv = try Server.init(std.testing.allocator, std.testing.io, s.engine(), bytes.text(), .{ .served_name = "m", .model_ids = &.{"m"}, .use_drafts = false }, null);
++    defer srv.deinit();
++    const text = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":500,\"stream\":{}{s}}}", .{ stream, extra });
++    var conn = Conn{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var response = Reply{ .a = a };
++    openai.run(srv, a, response.out(), .{ .conn = &conn }, true, (try json.parse(a, text)).ok);
++    if (!stream) {
++        const m = response.whole.?.get("choices").?.array[0].get("message").?;
++        return .{ .reasoning = json.strOr(m.get("reasoning_content")), .content = json.strOr(m.get("content")), .runner = response.whole.?.get("tensorfold").?.get("runner").?, .calls = m.get("tool_calls") != null };
++    }
++    var r: std.ArrayList(u8) = .empty;
++    var c: std.ArrayList(u8) = .empty;
++    var runner: ?json.Value = null;
++    var calls = false;
++    for (response.events.items) |v| {
++        if (v.get("tensorfold")) |t| if (t.get("runner")) |x| if (x.get("live") == null) {
++            runner = x;
++        };
++        const cs = (v.get("choices") orelse continue).array;
++        if (cs.len == 0) continue;
++        const d = cs[0].get("delta") orelse continue;
++        calls = calls or d.get("tool_calls") != null;
++        try r.appendSlice(a, json.strOr(d.get("reasoning_content")));
++        try c.appendSlice(a, json.strOr(d.get("content")));
++    }
++    return .{ .reasoning = r.items, .content = c.items, .runner = runner orelse return error.MissingReceipt, .calls = calls };
++}
++
++fn num(v: json.Value, key: []const u8) ?i64 {
++    return (v.get(key) orelse return null).int64();
++}
++
++/// Each abstain's final [source_at, source_end) holds its source in the field the client has; raw_* keeps the engine's.
++fn expectAbstain(got: Got, i: usize, source: []const u8, raw: [4]?i64, final: [4]?i64) !void {
++    const x = got.runner.get("abstains").?.array[i];
++    for ([_][]const u8{ "source_at", "source_end", "source_close_at", "resume_at" }, raw, final) |key, want_raw, want| {
++        try std.testing.expectEqual(want, num(x, key));
++        var name: [32]u8 = undefined;
++        try std.testing.expectEqual(want_raw, num(x, try std.fmt.bufPrint(&name, "raw_{s}", .{key})));
++    }
++    if (source.len == 0) return;
++    const field = if (std.mem.eql(u8, x.strField("source_field").?, "content")) got.content else got.reasoning;
++    try std.testing.expectEqualStrings(source, field[@intCast(final[0].?)..@intCast(final[1].?)]);
++}
++
++fn abstain(a: Allocator, field: []const u8, source: [3]?usize, resume_field: []const u8, resume_at: usize) ![]const u8 {
++    var o: std.ArrayList(u8) = .empty;
++    try o.print(a, "{{\"cell\":0,\"form\":\"fence\",\"source_field\":\"{s}\"", .{field});
++    for ([_][]const u8{ "source_at", "source_end", "source_close_at" }, source) |key, v|
++        if (v) |n| try o.print(a, ",\"{s}\":{d}", .{ key, n }) else try o.print(a, ",\"{s}\":null", .{key});
++    try o.print(a, ",\"resume_field\":\"{s}\",\"resume_at\":{d}}}", .{ resume_field, resume_at });
++    return o.items;
++}
++
++// T5's counterexample: the runner finds `print(undefined_total)\n` at raw content byte 12, the client at byte 10.
++const t5_content = "\n\n```python\nprint(undefined_total)\n```\nResult:\n";
++
++test "runner projection: HTTP abstain anchors after the think close's newlines are final content bytes, raw kept" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[{{\"cell\":1,\"field\":\"content\",\"at\":12}}],\"abstain_schema\":1,\"abstains\":[{s},{s}]}}", .{
++        try abstain(a, "content", .{ 12, 35, 39 }, "content", 47),
++        try abstain(a, "content", .{ null, null, null }, "content", 1), // resumed inside the dropped newlines
++    });
++    for ([_]bool{ false, true }) |stream| {
++        const got = try post(a, "plan", t5_content, receipt, stream);
++        try std.testing.expectEqualStrings("plan", got.reasoning);
++        try std.testing.expectEqualStrings(t5_content[2..], got.content);
++        try expectAbstain(got, 0, "print(undefined_total)\n", .{ 12, 35, 39, 47 }, .{ 10, 33, 37, 45 });
++        try expectAbstain(got, 1, "", .{ null, null, null, 1 }, .{ null, null, null, null });
++        try std.testing.expectEqual(10, num(got.runner.get("cells").?.array[0], "final_at"));
++        const content = got.runner.get("field_projection").?.get("content").?;
++        try std.testing.expectEqual(47, num(content, "raw_bytes"));
++        try std.testing.expectEqual(2, num(content, "dropped_lead"));
++        try std.testing.expectEqual(45, num(content, "final_bytes"));
++    }
++}
++
++test "runner projection: HTTP reasoning anchors follow the whole reply's strip, and the stream's deltas alike" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const reasoning = " \n x\n```python\nprint(4)\n```\n";
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "reasoning", .{ 15, 24, 28 }, "reasoning", 28)});
++    const whole = try post(a, reasoning, "ok", receipt, false);
++    try std.testing.expectEqualStrings(reasoning[3 .. reasoning.len - 1], whole.reasoning);
++    // the close and resume bytes sit in the stripped trailing newline: no final byte, only the raw one
++    try expectAbstain(whole, 0, "print(4)\n", .{ 15, 24, 28, 28 }, .{ 12, 21, null, null });
++    // the stream sends the reasoning stripped as the whole reply does: the map follows the bytes it sent
++    const streamed = try post(a, reasoning, "ok", receipt, true);
++    try std.testing.expectEqualStrings(reasoning[3 .. reasoning.len - 1], streamed.reasoning);
++    try expectAbstain(streamed, 0, "print(4)\n", .{ 15, 24, 28, 28 }, .{ 12, 21, null, null });
++}
++
++test "runner projection: HTTP a receipt without abstain records keeps its bytes" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const receipt = "{\"cells\":[{\"cell\":0,\"field\":\"content\",\"at\":12}]}";
++    for ([_]bool{ false, true }) |stream| {
++        const got = try post(a, "plan", t5_content, receipt, stream);
++        try std.testing.expectEqualStrings(try json.stringify(a, (try json.parse(a, receipt)).ok, .{}), try json.stringify(a, got.runner, .{}));
++    }
++}
++
++// T5's r10 fixtures (T5-ORACLE-R10-REVIEW.md): the map is taken after tool parsing, on the fields the client gets
++const tool_text = "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>\n```python\nprint(undefined_total)\n```\n";
++const tools = ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
++
++test "runner projection: HTTP a tool envelope cut from the content moves the anchors to the content sent, whole and streamed" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const source = "print(undefined_total)\n";
++    const at = std.mem.indexOf(u8, tool_text, source).?;
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ at, at + source.len, tool_text.len }, "content", tool_text.len)});
++    for ([_]bool{ false, true }) |stream| {
++        const got = try postWith(a, "plan", tool_text, receipt, stream, tools);
++        try std.testing.expect(got.calls); // the tool path ran: the envelope became a call
++        const actual = std.mem.indexOf(u8, got.content, source).?;
++        const x = got.runner.get("abstains").?.array[0];
++        try std.testing.expectEqual(@as(?i64, @as(i64, @intCast(actual))), num(x, "source_at"));
++        try std.testing.expectEqual(@as(?i64, @as(i64, @intCast(at))), num(x, "raw_source_at"));
++    }
++}
++
++test "runner projection: HTTP a lossy decode (FF as U+FFFD) publishes no map for that field, its raw anchors kept" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const text = "\xff\n```python\nprint(undefined_total)\n```\n";
++    const at = std.mem.indexOf(u8, text, "print").?;
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ at, at + 23, text.len }, "content", text.len)});
++    for ([_]bool{ false, true }) |stream| {
++        const got = try post(a, "plan", text, receipt, stream);
++        try std.testing.expect(std.mem.startsWith(u8, got.content, "\u{fffd}"));
++        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
++        try std.testing.expect(got.runner.get("field_projection").?.get("reasoning").? != .null);
++        try expectAbstain(got, 0, "", .{ @as(i64, @intCast(at)), @as(i64, @intCast(at + 23)), @as(i64, @intCast(text.len)), @as(i64, @intCast(text.len)) }, .{ null, null, null, null });
++    }
++}
++
++test "runner projection: HTTP a raw anchor past the rebuilt raw bytes leaves its field unmapped" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 12, 35, 39 }, "content", 1000)});
++    const got = try post(a, "plan", t5_content, receipt, false);
++    try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
++    try expectAbstain(got, 0, "", .{ 12, 35, 39, 1000 }, .{ null, null, null, null });
++}
++
++test "runner projection: HTTP a run found only inside a deleted tool argument is never mapped, whole and streamed" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // T5: the content is the FF's U+FFFD (raw byte 0); a literal U+FFFD in the cut argument (raw byte 42) is no origin
++    const text = "\xff<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":\"\u{fffd}\"}}</tool_call>";
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 0, 1, text.len }, "content", text.len)});
++    for ([_]bool{ false, true }) |stream| {
++        const got = try postWith(a, "plan", text, receipt, stream, tools);
++        try std.testing.expect(got.calls);
++        try std.testing.expectEqualStrings("\u{fffd}", got.content);
++        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
++    }
++}
++
++test "runner projection: HTTP content the tool parse joined across an envelope is never mapped onto the argument" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const text = "a<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":\"ab\"}}</tool_call>b"; // "ab" only in the cut
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 0, 1, text.len }, "content", text.len)});
++    for ([_]bool{ false, true }) |stream| {
++        const got = try postWith(a, "plan", text, receipt, stream, tools);
++        try std.testing.expect(got.calls);
++        if (!stream) try std.testing.expectEqualStrings("ab", got.content);
++        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
++    }
++}
++
++test "runner projection: HTTP raw invalid UTF-8 publishes no map even inside a deleted envelope, whole and streamed" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const text = "<tool_call>{\"name\":\"f\",\"arguments\":{\"x\":\"\xff\"}}</tool_call>\nok";
++    const at = std.mem.indexOf(u8, text, "ok").?;
++    const receipt = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ at, at + 2, text.len }, "content", text.len)});
++    for ([_]bool{ false, true }) |stream| {
++        const got = try postWith(a, "plan", text, receipt, stream, tools);
++        try std.testing.expect(got.calls);
++        try std.testing.expectEqualStrings("ok", got.content);
++        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
++        try std.testing.expect(got.runner.get("field_projection").?.get("reasoning").? != .null);
++    }
++}
++
++test "runner projection: HTTP a non-null raw anchor past i64 (2^63) leaves its field unmapped; a null one does not" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const big = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ 12, 35, @as(usize, 1) << 63 }, "content", 47)});
++    for ([_]bool{ false, true }) |stream| {
++        const got = try post(a, "plan", t5_content, big, stream);
++        try std.testing.expect(got.runner.get("field_projection").?.get("content").? == .null);
++    }
++    const none = try std.fmt.allocPrint(a, "{{\"cells\":[],\"abstains\":[{s}]}}", .{try abstain(a, "content", .{ null, null, null }, "content", 39)});
++    const got = try post(a, "plan", t5_content, none, false);
++    try std.testing.expect(got.runner.get("field_projection").?.get("content").? != .null);
++}
++
++test "runner projection: a run is mapped only with blanks and whole envelopes outside it, and only when one run fits" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, "xab", "ab", "")); // kept text cut
++    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, "\n\n", "\n", "")); // two runs fit
++    const env = "<tool_call>{}</tool_call>";
++    const kept = "x " ++ env ++ " y"; // an envelope the parse kept sits inside the run
++    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = kept.len + 1, .lead = 1, .kept = kept.len }), try projection.mapOf(a, "\n" ++ kept, kept, ""));
++    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = env.len + 3, .lead = env.len + 1, .kept = 2 }), try projection.mapOf(a, env ++ "\nab", "ab", ""));
++    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = 11, .lead = 9, .kept = 2 }), try projection.mapOf(a, "<think>\n\nab", "ab", "<think>"));
++    const arg = "<tool_call>{\"x\":\"ab\"}</tool_call>"; // the run again inside a cut argument is no second origin
++    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = arg.len + 2, .lead = 0, .kept = 2 }), try projection.mapOf(a, "ab" ++ arg, "ab", ""));
++}
++
++test "runner projection: an unfinished envelope (to EOF) proves no deletion, though kept whole in the run it maps" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const open = "<\u{ff5c}DSML\u{ff5c}tool_calls><\u{ff5c}DSML\u{ff5c}invoke name=\"f\"><\u{ff5c}DSML\u{ff5c}parameter name=\"x\" string=\"true\">KEEP";
++    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, open, "", "")); // T5's direct case
++    try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, "ab\n" ++ open, "ab", ""));
++    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = open.len + 1, .lead = 1, .kept = open.len }), try projection.mapOf(a, "\n" ++ open, open, ""));
++}
++
++/// Replies of `n` calls then `f`: every call holds an `f` the final `f` must not map into.
++const Many = struct {
++    raws: [2][]const u8,
++    fn run(m: *const Many, i: usize) anyerror!void {
++        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++        defer arena.deinit();
++        const got = (try projection.mapOf(arena.allocator(), m.raws[i], "f", "")).?;
++        try std.testing.expectEqual(m.raws[i].len - 1, got.lead);
++    }
++};
++
++test "runner projection: a final run among many envelopes is placed in one pass, not again per match" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const env = "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>";
++    var m: Many = .{ .raws = undefined };
++    for (&m.raws, [_]usize{ 625, 5000 }) |*raw, n| {
++        const r = try a.alloc(u8, n * env.len + 1);
++        for (0..n) |i| @memcpy(r[i * env.len ..][0..env.len], env);
++        r[r.len - 1] = 'f';
++        raw.* = r;
++    }
++    const f = try @import("linear_time.zig").fastest(5, @as(*const Many, &m), Many.run);
++    // 8x the envelopes: within 24x the work (or 20 ms), not 64x
++    try std.testing.expect(f.ns[1] <= 20 * std.time.ns_per_ms or f.work[1] <= 24 * f.work[0]);
++}
++
++test "runner projection: a final cut inside a multibyte blank or code point is never mapped, on either side" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const cases = [_][2][]const u8{ // raw, final; no blank takes four bytes: U+1F600 stands in at that width
++        .{ "\xc2\xa0", "\xa0" },               .{ "\xc2\xa0", "\xc2" }, // T5's NBSP case, and its other side
++        .{ "\u{3000}", "\x80\x80" },           .{ "\u{3000}", "\xe3\x80" },
++        .{ "\u{1f600}", "\x98\x80" },          .{ "\u{1f600}", "\xf0\x9f" },
++        .{ "\u{3000}x\u{3000}", "\x80x\xe3" }, .{ "x\u{a0}", "x\xc2" },
++        .{ "\u{a0}x", "\xa0x" },
++    };
++    for (cases) |c| try std.testing.expectEqual(@as(?projection.Map, null), try projection.mapOf(a, c[0], c[1], ""));
++    try std.testing.expectEqual(@as(?projection.Map, .{ .raw = 7, .lead = 3, .kept = 1 }), try projection.mapOf(a, "\u{3000}x\u{3000}", "x", ""));
++}
++
++/// T5's slice-based reference (T5-PROJECTION-R4-REVIEW.md): each candidate's prefix and suffix checked afresh.
++fn refDeleted(raw: []const u8, envs: []const @import("tool_parse.zig").Envelope, from: usize, to: usize) bool {
++    var p = from;
++    for (envs) |e| {
++        if (e.end <= p or e.start >= to) continue;
++        if (e.start < p or e.end > to or !e.complete) return false;
++        if (@import("reply_text.zig").pyStrip(raw[p..e.start]).len > 0) return false;
++        p = e.end;
++    }
++    return @import("reply_text.zig").pyStrip(raw[p..to]).len == 0;
++}
++
++fn refMap(a: Allocator, raw: []const u8, final: []const u8, open: []const u8) !?projection.Map {
++    if (!std.unicode.utf8ValidateSlice(raw)) return null;
++    const body = if (open.len > 0 and std.mem.startsWith(u8, raw, open)) open.len else 0;
++    const envs = try @import("tool_parse.zig").envelopes(a, raw);
++    if (final.len == 0) return if (refDeleted(raw, envs, body, raw.len)) .{ .raw = raw.len, .lead = raw.len, .kept = 0 } else null;
++    var found: ?projection.Map = null;
++    var from = body;
++    while (std.mem.indexOfPos(u8, raw, from, final)) |lead| : (from = lead + 1) {
++        if (!refDeleted(raw, envs, body, lead) or !refDeleted(raw, envs, lead + final.len, raw.len)) continue;
++        if (found != null) return null;
++        found = .{ .raw = raw.len, .lead = lead, .kept = final.len };
++    }
++    return found;
++}
++
++test "runner projection: the one-pass map equals the slice reference over blanks, envelopes and split code points" {
++    const pieces = [_][]const u8{ " ", "x", "y", "<think>", "<tool_call>f</tool_call>", "<\u{ff5c}DSML\u{ff5c}tool_calls>", "\u{2003}", "\u{a0}", "\u{3000}", "\u{1f600}" };
++    var checked: usize = 0;
++    for (pieces) |x| for (pieces) |y| for (pieces) |z| {
++        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++        defer arena.deinit();
++        const a = arena.allocator();
++        const raw = try std.mem.concat(a, u8, &.{ x, y, z });
++        const finals = [_][]const u8{ "", raw, @import("reply_text.zig").pyStrip(raw), "x", "y", "f", x, y, z, raw[x.len..], raw[1..], raw[0 .. raw.len - 1] };
++        for (finals) |final| for ([_][]const u8{ "", "<think>" }) |open| {
++            try std.testing.expectEqualDeep(try refMap(a, raw, final, open), try projection.mapOf(a, raw, final, open));
++            checked += 1;
++        };
++    };
++    try std.testing.expectEqual(10 * 10 * 10 * 12 * 2, checked);
++}
+diff --git a/zig/src/server/runner_text.zig b/zig/src/server/runner_text.zig
+new file mode 100644
+index 000000000..a35a9bf20
+--- /dev/null
++++ b/zig/src/server/runner_text.zig
+@@ -0,0 +1,31 @@
++//! The in-model runner's tokenizer: every token's bytes once at start, and plain encoding of owned result text.
++const std = @import("std");
++const api = @import("engine_api");
++const model_text = @import("model_text.zig");
++const Allocator = std.mem.Allocator;
++
++const Table = struct { text: model_text.Text, bytes: [][]const u8 };
++
++/// Gives `r` the server's tokenizer (allocated from `arena`); without token bytes the runner stays off.
++pub fn attach(arena: Allocator, text: model_text.Text, r: *api.runner.Runner) !void {
++    if (text.vtable.token_bytes == null) return std.log.warn("in-model runner off: this tokenizer cannot give token bytes", .{});
++    const t = try arena.create(Table);
++    t.* = .{ .text = text, .bytes = try arena.alloc([]const u8, text.vocabSize()) };
++    // a token with no bytes of its own (an added token) is never part of a cell's code
++    for (t.bytes, 0..) |*b, i| b.* = (try text.tokenBytes(arena, @intCast(i))) orelse "";
++    r.text = .{ .ctx = t, .bytes = bytes, .encode = encode };
++}
++
++fn bytes(ctx: ?*anyopaque, token: u32) []const u8 {
++    const t: *const Table = @ptrCast(@alignCast(ctx.?));
++    return if (token < t.bytes.len) t.bytes[token] else "";
++}
++
++/// Plain text: a result spelling a special token stays text, never the token.
++fn encode(ctx: ?*anyopaque, a: Allocator, text: []const u8) Allocator.Error![]u32 {
++    const t: *const Table = @ptrCast(@alignCast(ctx.?));
++    return t.text.encodePlain(a, text) catch |e| switch (e) {
++        error.OutOfMemory => error.OutOfMemory,
++        else => error.OutOfMemory, // the reply fails rather than owning text it could not encode
++    };
++}
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index ebc1cefae..971b39a59 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -136,6 +136,7 @@ pub const Server = struct {
+     text: model_text.Text,
+     config: Config,
+     voices: []const @import("drama_voice.zig").Voice = &.{},
++    guides: @import("runner_guide.zig").Set = .{},
+     keys: ?*auth.Store,
+     late_system: []const u8 = "system",
+     needs_user_after_tool: bool = false,
+@@ -211,6 +212,14 @@ pub const Server = struct {
+             return srv;
+         }
+         if (srv.info.compute) |c| srv.compute = try @import("compute_turns.zig").open(srv, c);
++        if (srv.info.runner) |r| {
++            try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
++            srv.guides = try @import("runner_guide.zig").Set.load(srv.arena.allocator(), io, r.cfg.guide);
++            srv.guides.max_request_bytes = r.cfg.guide_max_bytes;
++            // the compute default (PREFIX_DEFAULT): AB3's trust guide unless the boot names one
++            if (srv.compute != null and srv.info.compute.?.default and srv.guides.default.len == 0) srv.guides.default = @import("runner_guide.zig").trust;
++            srv.guides.describe();
++        }
+         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
+         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
+             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index dcbfa7dab..218d792db 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -19,7 +19,7 @@ pub const wrapCalls = tool_streaming.wrapCalls;
+ 
+ const Error = tool_dsml.Error;
+ const Call = tool_dsml.Call;
+-const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
++pub const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
+ 
+ pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0, owned: ?reply_owned.Owned = null };
+ 
+@@ -45,7 +45,7 @@ fn allSpace(s: []const u8) bool {
+ }
+ 
+ /// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it.
+-fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
++pub fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+     var found: std.ArrayList(Envelope) = .empty;
+     var pos: usize = 0;
+     var dsml = tool_dsml.findOpen(text, 0); // the DSML opener at or after `pos`, searched again only once `pos` passes it

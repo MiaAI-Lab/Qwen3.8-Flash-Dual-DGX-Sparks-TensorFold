@@ -382,7 +382,7 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `SERVED_NAME` / `PORT` / `HOST` | `Qwen3.8-Flash-Next` / `8888` / `0.0.0.0` | the model id in `/v1/models` and replies; where the API listens |
 | `PREPARE` / `PULL` | `auto` / `1` | `start.sh` runs `scripts/prepare.sh` when needed (`1` always, `0` never); `prepare.sh` tries the prebuilt image first (`0`: always build locally) |
 | `WAIT_TIMEOUT` / `STOP_TIMEOUT` | `1800` / `30` | seconds `start.sh` waits for the server, and `stop.sh` gives it to shut down |
-| `ENGINE` | `patches` | `lanes`: the opt-in compute lanes image (needs `VISION=0`; [Compute lanes](#compute-lanes-opt-in)); with `LANES_REPO`, `LANES_REF` (the lane engine's commit), `LANES_IMAGE` |
+| `ENGINE` | `patches` | `lanes`: the opt-in compute lanes image (needs `VISION=0`; [Compute lanes](#compute-lanes-opt-in)); with `LANES_REPO` and `LANES_REF` (upstream TensorFold and the commit `lanes/` applies to), `LANES_IMAGE` |
 | `LOG_DIR` / `LOG_KEEP` | `~/.cache/tensorfold-qwen38fn/logs` / `10` | where `stop.sh` saves rank 0's log before it removes the container (rank 1's to the same folder on the worker), and how many of each rank's to keep ([Logs of earlier runs](#quick-start)); `0`: none |
 
 Any `TENSORFOLD_*`, `TF_FLASHNEXT_*`, `TF_TP_*`, `TF_CUDA_*`, `TF_RUNNER*` or `TF_COMPUTE_LANE*` variable is passed to both ranks (export it in
@@ -479,13 +479,15 @@ VISION=0
 `scripts/prepare.sh` then builds the lane image on the head, on top of the default image, and copies it to the worker
 (`scripts/lanes.sh`). The lane image:
 
-- replaces only `tensorfold-native`, built from the lane engine at `LANES_REF`;
+- replaces only `tensorfold-native`, built from the lane engine: upstream TensorFold at `LANES_REF` plus the patches
+  in `lanes/` (the build checks the patched tree against `lanes/series`);
 - keeps everything else of the default image, including the kernel set;
 - adds the runner's frontend and assets. The assets are fetched at a pinned sha256, every file is checked, and the
   build fails unless the runner computes its probe cells.
 
-The lane engine is TensorFold's Zig engine with this recipe's patches 0001-0008 and 0010-0012 ported in as
-MiaAI-Lab's own commits (0007's tool_choice call gate too, ported), served as `TF_FLASHNEXT_ENGINE=mia`. The lane keys
+The lane engine is upstream TensorFold's Zig engine ([ashhart/TensorFold](https://github.com/ashhart/TensorFold) at
+`LANES_REF`, unmodified) plus the 76 patches in `lanes/`. Patches 0002-0012 there are this recipe's patches 0001-0008
+and 0010-0012 ported, as MiaAI-Lab's own commits (0007's tool_choice call gate too, ported), served as `TF_FLASHNEXT_ENGINE=mia`. The lane keys
 are in `scripts/config.sh` and every one can be overridden.
 
 Limits:
@@ -498,7 +500,7 @@ Limits:
 - **Long inline values.** An inline `<expr> =` gets its exact value spliced in with ` @engine` after it
   (`TF_RUNNER_INLINE_MARK=1`, the default). Unmarked (`0`), a spliced big integer was sometimes extended by the model
   (7^222: 1,600 to 29,700 invented digits) until the reply ran out of tokens, and once the model replaced the engine's
-  right value with its own wrong arithmetic; the mark ended both. The lane engine at `LANES_REF` also replaces a digit
+  right value with its own wrong arithmetic; the mark ended both. The lane engine also replaces a digit
   drawn right after an unmarked owned value, and stops a digit run in the reasoning at 1,024 digits, with a newline
   (`TF_RUNNER_DIGIT_STOP`, `TF_RUNNER_DIGIT_RUN_MAX`; 0 turns each off) (Compute lanes, "Inline values", below).
 - Structured outputs (`response_format`, `guided_*`) get HTTP 400, as on this recipe's image. The lane image does not
@@ -534,11 +536,11 @@ grader reads the reply's final JSON and compares it with the stored answer. A re
 JSON shape or a wrong value counts as wrong. The same harness reproduced earlier baselines exactly.
 
 Both rows are lane engine `f9f75544a` on two Sparks, the same build and keys as here, with the 20 lane keys removed for
-lanes off. `220e5a068` is `f9f75544a` plus two scheduling commits. The pinned `LANES_REF` `52f6936c0` is
-`220e5a068` plus two startup commits (kept lane costs, a load-stage log line). The pinned `LANES_REF` `9c6c3d04c` is
+lanes off. `220e5a068` is `f9f75544a` plus two scheduling commits. The earlier pin `52f6936c0` is
+`220e5a068` plus two startup commits (kept lane costs, a load-stage log line). `9c6c3d04c` is
 `52f6936c0` plus patch 0007's call gate, a thinking-budget fix (a budget cut inside a compute result no longer fails
-the reply) and the digit stop. These are the published commits on
-`jayleaton/TensorFold` branch `flashnext-mia-lanes`. The runs below were measured on a private twin of each, which
+the reply) and the digit stop. These are commits of the lane engine's development history; `lanes/` applied to upstream `LANES_REF` gives exactly
+`9c6c3d04c`'s tree. The runs below were measured on a private twin of each, which
 differs only in 9 comment lines (8 files) and some commit message wording, so the built engine is the same code. The
 published `52f6936c0` itself was then built by `scripts/prepare.sh` and started twice by `start.sh` (Startup, above).
 

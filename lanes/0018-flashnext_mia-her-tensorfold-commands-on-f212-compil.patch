@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:47:50 +0700
+Subject: [PATCH 18/79] flashnext_mia: her tensorfold commands on f212,
+ compiled by check-flashnext-mia-cli
+
+Her CLI reads her Media type from flashnext_mia.media. check-flashnext-mia-cli compiles the tensorfold
+CUDA CLI without kernels (host test imports plus dory and cluster, which main reaches), so her
+commands are checked; test-flashnext-mia-host depends on it.
+---
+ zig/build/cuda.zig             |  1 +
+ zig/build/flashnext_mia.zig    | 10 ++++++++++
+ zig/src/cli/flashnext_cuda.zig |  4 ++--
+ 3 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 15f1a1976..a33d4aa5e 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -392,6 +392,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     cli.addImport("flashnext_mia", native_modules.engines.import_table.get("flashnext_mia").?);
+     cli.addOptions("build_options", build_options);
+     cli.addImport("checkpoint_cli", checkpointCli(b, host, .debug, false, native_modules.engines, mods.core));
++    @import("flashnext_mia.zig").cliCheck(b, cli, native_modules.engines.import_table.get("dory").?, @import("cluster_cuda.zig").module(b, host, .debug, mods.lanes, mods.core, native_modules.canon, native_modules.verbs));
+     const memory_cli = checkpointCli(b, host, .debug, false, native_modules.engines, mods.core);
+     memory_cli.root_source_file = b.path("zig/src/cli/tests.zig");
+     b.step("test-cli-memory-host", "Actual checkpoint info memory tests without device or shader producers").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = memory_cli, .filters = &.{ "info prints family", "issue 934:", "plan" } })).step);
+diff --git a/zig/build/flashnext_mia.zig b/zig/build/flashnext_mia.zig
+index 634e33fe2..eca1c3b28 100644
+--- a/zig/build/flashnext_mia.zig
++++ b/zig/build/flashnext_mia.zig
+@@ -31,3 +31,13 @@ pub fn hostTests(b: *std.Build, cuda: *std.Build.Module, mia: *std.Build.Module,
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"flashnext_mia family:"} })).step);
+     all.dependOn(step);
+ }
++
++/// check-flashnext-mia-cli: the tensorfold CLI with her commands compiled (no kernels); in test-flashnext-mia-host.
++pub fn cliCheck(b: *std.Build, cli: *std.Build.Module, dory: *std.Build.Module, cluster: *std.Build.Module) void {
++    cli.addImport("dory", dory); // what `main` reaches past the host tests' imports, as the installed CLI has them
++    cli.addImport("cluster", cluster);
++    const obj = b.addExecutable(.{ .name = "tensorfold-cli-check", .root_module = cli }); // an executable: `main` is analyzed
++    const step = b.step("check-flashnext-mia-cli", "Compile the tensorfold CUDA CLI with MiaAI-Lab's commands, no kernels");
++    step.dependOn(&obj.step);
++    b.top_level_steps.get("test-flashnext-mia-host").?.step.dependOn(step);
++}
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index f91a26a44..072ee3218 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -386,7 +386,7 @@ pub fn generate(gpa: Allocator, io: std.Io, e: *Engine, prompt: []const u32, max
+ }
+ 
+ /// `generate` for a prompt with images or video frames (`media`: its rows, rotary positions and features).
+-pub fn generateMedia(gpa: Allocator, io: std.Io, e: *Engine, prompt: []const u32, max_tokens: usize, sampling: ?lanes.Sampling, drafts: bool, stop_eos: bool, media: ?*const lanes.Media) !Generated {
++pub fn generateMedia(gpa: Allocator, io: std.Io, e: *Engine, prompt: []const u32, max_tokens: usize, sampling: ?lanes.Sampling, drafts: bool, stop_eos: bool, media: ?*const flashnext.media.Media) !Generated {
+     const room = @as(i64, @intCast(e.max_len)) - @as(i64, @intCast(prompt.len)) - @as(i64, @intCast(e.depth)) - 1;
+     if (room < 1) return error.PromptPastWindow;
+     const count = @max(1, @min(max_tokens, @as(usize, @intCast(room))));
+@@ -794,7 +794,7 @@ fn gate(gpa: Allocator, io: std.Io, e: *Engine, capture: []const u8, o: Options)
+ const MediaCase = struct {
+     name: []const u8,
+     tokens: []u32,
+-    media: lanes.Media,
++    media: flashnext.media.Media,
+     blobs: [2][]align(16) u8,
+     rows: []u32,
+     expected: ?std.json.Value,

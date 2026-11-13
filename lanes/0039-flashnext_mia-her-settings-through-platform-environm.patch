@@ -1,0 +1,872 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:09:45 +0700
+Subject: [PATCH 39/79] flashnext_mia: her settings through
+ platform/environment.zig
+
+Every setting her engine reads (57 names, TF_FLASHNEXT_* plus
+TF_TP_TIMEOUT_S and TENSORFOLD_MEMORY_RESERVE_GIB) has a row in a new
+flashnext_mia scope, checked when her engine opens (cuda_env.startup), as
+the DeepSeek rows are. Her readers keep interpreting the text, so every
+accepted value keeps its meaning; the rows refuse only text they misread.
+The table gains a list kind (comma-separated words or whole numbers) and
+off words for a real row (TF_FLASHNEXT_YARN's). Names and meanings are
+unchanged; CONFIDENCE and KEEP_LATE keep hers under TF_FLASHNEXT_ENGINE=mia.
+docs/environment.md lists them. TF_FLASHNEXT_ENGINE joins the environment
+test's covered rows.
+---
+ docs/environment.md                           | 63 +++++++++++++
+ zig/src/families/flashnext_mia/cuda_comm.zig  | 11 +--
+ .../families/flashnext_mia/cuda_engine.zig    | 93 +++++++++----------
+ zig/src/families/flashnext_mia/cuda_env.zig   | 27 ++++++
+ .../families/flashnext_mia/cuda_forward.zig   |  5 +-
+ zig/src/families/flashnext_mia/cuda_int4.zig  |  5 +-
+ .../families/flashnext_mia/cuda_kernels.zig   |  3 +-
+ zig/src/families/flashnext_mia/cuda_lanes.zig |  7 +-
+ .../families/flashnext_mia/cuda_mirror.zig    |  3 +-
+ .../flashnext_mia/cuda_moe_prompt.zig         | 15 +--
+ .../families/flashnext_mia/cuda_native.zig    | 21 ++---
+ .../families/flashnext_mia/cuda_prompt.zig    |  3 +-
+ zig/src/platform/environment.zig              | 85 ++++++++++++++++-
+ zig/src/platform/environment_test.zig         | 30 +++++-
+ 14 files changed, 280 insertions(+), 91 deletions(-)
+ create mode 100644 zig/src/families/flashnext_mia/cuda_env.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 1d7ccd8d8..08e4d6843 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -60,6 +60,69 @@ Backend-specific settings are checked when that backend starts; slide settings r
+ Common server settings are checked before checkpoint resolution, including when no request would use them yet.
+ Direct family readers also refuse malformed values when called without the server.
+ 
++## MiaAI-Lab's Flash Next engine
++
++These settings are read only with `TF_FLASHNEXT_ENGINE=mia`. Each has a `flashnext_mia` row in `platform/environment.zig`.
++Every row is checked when her engine opens, before it loads anything; a malformed value is refused with the usual message.
++An accepted value keeps her engine's meaning: her readers still interpret the text, so the table only refuses text they would misread.
++`TF_FLASHNEXT_CONFIDENCE` and `TF_FLASHNEXT_KEEP_LATE` are also read by the upstream Flash Next engine, with its own meaning.
++
++| Variable | Accepted explicit value | Meaning (default) |
++| --- | --- | --- |
++| `TF_FLASHNEXT_DEPTH` | Whole count | Drafts a window, 1 through the lane core's most (15: 16-row windows) |
++| `TF_FLASHNEXT_YARN` | Factor above 1, or `0`, `off`, `no`, `false`, `none`, `default` (any case) | YaRN factor; `4` gives a 1,048,576 window (the checkpoint's rope scaling) |
++| `TF_FLASHNEXT_YARN_RAMP_POSITIONS` | Whole count | YaRN ramp positions (0) |
++| `TF_FLASHNEXT_ROCE` | `0` or `1` | `0` turns off the one-shot RoCE all-gather between two ranks (on) |
++| `TF_FLASHNEXT_L2PF` | `0` or `1` | `0` turns off the L2 weight prefetch (on) |
++| `TF_FLASHNEXT_ROCE_MAX` | Whole byte count | Largest all-gather sent over RoCE (524288) |
++| `TF_FLASHNEXT_L2PF_BYTES` | Whole byte count | Bytes of a weight to prefetch (8388608) |
++| `TF_FLASHNEXT_FILL` | `0` or `1` | `1` fills prompts in layer slices between rounds (off) |
++| `TF_FLASHNEXT_FILL_LAYERS` | Whole count | Layers a fill step, at least 1 (8) |
++| `TF_FLASHNEXT_OVERCOMMIT` | `0` or `1` | `1` admits a stream against memory free now instead of its window's reserved caches (off) |
++| `TF_FLASHNEXT_CONFIDENCE` | Finite number | Draft stop rule from -1 through 1: c > 0 per draft, c < 0 running product (-0.4); others keep the default |
++| `TF_FLASHNEXT_PRODUCT_STREAMS` | Whole count | Live streams up to which the running-product rule applies (2) |
++| `TF_FLASHNEXT_KEEP_LATE` | `0` or `1` | `0` turns off pending DeltaNet rows for partly kept windows (on) |
++| `TF_FLASHNEXT_MTP_TOPK` | Whole count | MTP layer's routed experts a row; only 10 is used besides the checkpoint's (0: the checkpoint's) |
++| `TF_FLASHNEXT_MTP_Q4` | `0`, `1`, `all`, or a comma list of `fc`, `attn`, `hc`, `mixer` | MTP head matrices quantized to 4 bits for drafts (off) |
++| `TF_FLASHNEXT_MTP_Q4_MSE` | `0` or `1` | `1` picks the 4-bit scales by least squared error (off) |
++| `TF_FLASHNEXT_PREFILL_ROWS` | Whole count, 16 through 16384 | Prompt chunk rows (4096 on two ranks, 2048 on one) |
++| `TF_FLASHNEXT_PREFILL_TAIL` | Whole count, a multiple of 16 | Rows a last chunk may take instead of its own chunk (512) |
++| `TF_FLASHNEXT_INT4AR_FAST` | `0`, `off`, `1` or `on` | `1` loads INT4-AutoRound's lossy `fast-fp8/` overlay (off) |
++| `TF_FLASHNEXT_PROMPT_MM` | `0`, `off`, `1` or `on` | Prompt matmuls without split-K partials when the kernel set has them (on) |
++| `TF_FLASHNEXT_DRAW_ONCE` | `0`, `off`, `1` or `on` | Two ranks draw a round's tokens once from gathered candidates when they fit (on) |
++| `TF_FLASHNEXT_SHARED_SIDE` | `0`, `off`, `1` or `on` | Shared expert on a second stream beside the routed experts (on) |
++| `TF_FLASHNEXT_FP8_LD` | `0`, `off`, `1` or `on` | INT4-AutoRound block-FP8 columns stored in place (on) |
++| `TF_FLASHNEXT_FP4_SERIAL` | `0`, `off`, `1` or `on` | Shared expert's single-slice gate/up on the K-serial kernel (on) |
++| `TF_FLASHNEXT_PROMPT_EXPERTS` | `0`, `off`, `1` or `on` | Prompt experts on 128-pair items (on) |
++| `TF_FLASHNEXT_GLUE_SPLIT` | `0`, `off`, `1` or `on` | Two ranks split the prompt glue by rows (on) |
++| `TF_FLASHNEXT_DROP_PAGES` | `0`, `off`, `1` or `on` | Drop the checkpoint's pages from the page cache once loaded (on) |
++| `TF_FLASHNEXT_GLUE_FUSE` | `0`, `off`, `1` or `on` | Fused up-mix glue when the kernel set has it (on) |
++| `TF_FLASHNEXT_WB_NORM` | `0`, `off`, `1` or `on` | Fused write-back norm when the kernel set has it (on) |
++| `TF_FLASHNEXT_QSA_FAST` | `0`, `off`, `1` or `on` | Fast indexer score kernel (on) |
++| `TF_FLASHNEXT_QSA_RT` | Whole count | Indexer score row tile (0: the default path) |
++| `TF_FLASHNEXT_QSA_TILES_FROM` | Whole count | Key blocks from which indexer scores run in tiles (8192) |
++| `TF_FLASHNEXT_QSA_SPLIT_KEYS` | Whole count | Keys a split of the indexer scores (65536) |
++| `TF_FLASHNEXT_QSA_TILE` | Whole count | Indexer score tile choice, above 3 read as 3 (0) |
++| `TF_FLASHNEXT_OVERLAP` | Whole number 0 through 255 | With split glue, its exchanges on their own stream in this mode (0: in line) |
++| `TF_FLASHNEXT_COMM_PRIORITY` | Whole number | That exchange stream's CUDA priority (0) |
++| `TF_FLASHNEXT_EXPERT_SMS_FREE` | Whole count | SMs the persistent expert kernels leave free for NCCL with overlap (0) |
++| `TF_FLASHNEXT_EXPERT_SHAPE` | Whole count | Expert units up to which gate/up takes the NT shape (230) |
++| `TF_FLASHNEXT_INT4_TILE` | Whole count | INT4 expert tile (the planned tile) |
++| `TF_FLASHNEXT_INT4_PROMPT_DOWN` | `0` or `1` | `0` turns off the INT4 prompt down-projection kernel (on) |
++| `TF_FLASHNEXT_PROMPT_EXPERTS_OCC` | `0` or `1` | `1` runs gate/up on the occupancy prompt-expert kernels; `0` also takes the down projection off them (gate/up off, down on) |
++| `TF_FLASHNEXT_PROMPT_EXPERTS_GU2` | `0` or `1` | `1` splits the prompt experts' gate and up (off) |
++| `TF_FLASHNEXT_PROMPT_EXPERTS_CFG` | Comma-separated whole numbers | Prompt-expert tile, gate/up and down threads (32,2,2) |
++| `TF_FLASHNEXT_PROMPT_EXPERTS_ROWS` | Comma-separated whole numbers | Prompt-expert gate/up and down rows (4096,2048) |
++| `TF_FLASHNEXT_MULTI_GRAPHS` | Whole count | Shared-round widths captured as graphs (4) |
++| `TF_FLASHNEXT_ATTN_MULTI` | Whole count | Streams from which attention runs in one launch (graph widths + 1; 0: never) |
++| `TF_FLASHNEXT_MEDIA_GRAPHS` | `0` or `1` | `0` runs media prompts without graphs (on) |
++| `TF_FLASHNEXT_COUNT_EXPERTS` | `0` or `1` | `1` counts routed experts while profiling (off) |
++| `TF_FLASHNEXT_PROFILE` | `0` or `1` | `1` profiles the forward (off) |
++| `TF_FLASHNEXT_GRAPH_FAIL` | Whole count | Test hook: a graph launch fails every this many (0: never) |
++| `TF_FLASHNEXT_GRAPH_LOG`, `TF_FLASHNEXT_PREFILL_DIGEST`, `TF_FLASHNEXT_POISON_PADS`, `TF_FLASHNEXT_PASS_TIMES`, `TF_FLASHNEXT_BURST_LOG` | `0` or `1` | Diagnostics, on whenever set, `0` included (off) |
++| `TF_TP_TIMEOUT_S` | Whole seconds | How long a rank waits for the other (300) |
++| `TENSORFOLD_MEMORY_RESERVE_GIB` | Finite GiB amount of at least 0 | GiB her engine keeps free, as in the server's admission |
++
+ ## Existing lenient switches
+ 
+ These settings retain their existing boolean policies rather than gaining new aliases or refusals:
+diff --git a/zig/src/families/flashnext_mia/cuda_comm.zig b/zig/src/families/flashnext_mia/cuda_comm.zig
+index 45eacd150..376714663 100644
+--- a/zig/src/families/flashnext_mia/cuda_comm.zig
++++ b/zig/src/families/flashnext_mia/cuda_comm.zig
+@@ -1,5 +1,6 @@
+ //! The two ranks' NCCL communicator: fp32 partials added in rank order, same bits on both; opt RoCE, L2 prefetch.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const link_mod = @import("cuda_link.zig");
+ const Link = link_mod.Link;
+@@ -15,10 +16,6 @@ const roce_tag: link_mod.Tag = @enumFromInt(0x524f4345);
+ /// The RoCE all-gather, the L2 prefetch and the driver they were opened with (heap: Comm is copied by value).
+ const Extra = struct { driver: cuda.Driver, r: ?roce.Roce = null, l2: ?roce.L2 = null, prefetch: bool = false };
+ 
+-fn envIs(name: [:0]const u8, value: []const u8) bool {
+-    return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), value) else false;
+-}
+-
+ pub const Comm = struct {
+     lib: nccl.Library,
+     comm: nccl.Comm,
+@@ -50,8 +47,8 @@ pub const Comm = struct {
+         errdefer _ = lib.api.ncclCommDestroy(comm);
+         errdefer if (c.extra) |x| freeExtra(x);
+         // on by default (decode D1, D2); "0" turns either off
+-        const want_roce = !envIs("TF_FLASHNEXT_ROCE", "0");
+-        const want_pf = !envIs("TF_FLASHNEXT_L2PF", "0");
++        const want_roce = !envs.is("TF_FLASHNEXT_ROCE", "0");
++        const want_pf = !envs.is("TF_FLASHNEXT_L2PF", "0");
+         var driver: ?cuda.Driver = null;
+         if (want_roce or want_pf) driver = cuda.Driver.open() catch |e| blk: {
+             std.log.warn("RoCE / L2 prefetch: no CUDA driver handle ({t}); NCCL alone", .{e});
+@@ -129,7 +126,7 @@ pub const Comm = struct {
+         };
+         const gid: c_int = if (std.c.getenv("NCCL_IB_GID_INDEX")) |g| std.fmt.parseInt(c_int, std.mem.span(g), 10) catch 3 else 3;
+         // TF_FLASHNEXT_ROCE_MAX: the largest shard a rank RoCE takes (default 512 KiB; a multiple of 4096)
+-        const max: u64 = if (std.c.getenv("TF_FLASHNEXT_ROCE_MAX")) |m| std.fmt.parseInt(u64, std.mem.span(m), 10) catch (512 << 10) else (512 << 10);
++        const max: u64 = if (envs.get("TF_FLASHNEXT_ROCE_MAX")) |m| std.fmt.parseInt(u64, m, 10) catch (512 << 10) else (512 << 10);
+         return roce.Roce.open(d, rank, .{ .ports = ports, .gid_index = gid, .slot_bytes = max }) catch |e| {
+             std.log.warn("RoCE: {t}", .{e});
+             return null;
+diff --git a/zig/src/families/flashnext_mia/cuda_engine.zig b/zig/src/families/flashnext_mia/cuda_engine.zig
+index b957e255d..9a143c1b4 100644
+--- a/zig/src/families/flashnext_mia/cuda_engine.zig
++++ b/zig/src/families/flashnext_mia/cuda_engine.zig
+@@ -1,5 +1,6 @@
+ //! Flash Next CUDA engine from TensorFold qwen4_exp/cuda decode.py + engine.py (Ash Hart, vcruz305); ranks in step.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const media_mod = @import("cuda_media.zig");
+@@ -37,13 +38,13 @@ pub const product_streams_default = 2;
+ pub const wide_confidence = 0.5;
+ 
+ pub fn productStreams() usize {
+-    const v = std.c.getenv("TF_FLASHNEXT_PRODUCT_STREAMS") orelse return product_streams_default;
+-    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch product_streams_default;
++    const v = envs.get("TF_FLASHNEXT_PRODUCT_STREAMS") orelse return product_streams_default;
++    return std.fmt.parseInt(usize, v, 10) catch product_streams_default;
+ }
+ 
+ pub fn confidenceSetting() f64 {
+-    const v = std.c.getenv("TF_FLASHNEXT_CONFIDENCE") orelse return served_confidence;
+-    const x = std.fmt.parseFloat(f64, std.mem.span(v)) catch return served_confidence;
++    const v = envs.get("TF_FLASHNEXT_CONFIDENCE") orelse return served_confidence;
++    const x = std.fmt.parseFloat(f64, v) catch return served_confidence;
+     return if (x >= -1 and x <= 1) x else served_confidence;
+ }
+ /// The most candidates a main-head draw reads back (top_k + MARGIN); larger top_k values are refused.
+@@ -126,7 +127,7 @@ fn yarnConfig(y: rope.Yarn) cfgs.Yarn {
+ 
+ /// TF_FLASHNEXT_MTP_TOPK: the MTP layer's routed experts a row (drafts only; 0 or unset: the config's top_k).
+ fn mtpTopK(top_k: u32) usize {
+-    const v = envGet("TF_FLASHNEXT_MTP_TOPK") orelse return 0;
++    const v = envs.get("TF_FLASHNEXT_MTP_TOPK") orelse return 0;
+     const n = std.fmt.parseInt(usize, v, 10) catch return 0;
+     // the kernel set routes the checkpoints' own values (10, INT4-AutoRound's 5); 10 is the only other one accepted
+     if (n != 10 or n == top_k) {
+@@ -229,20 +230,11 @@ fn streamWithPriority(d: *const cuda.Driver, priority: c_int) !cuda.Stream {
+     return .{ .d = d, .handle = s };
+ }
+ 
+-fn envGet(name: [:0]const u8) ?[]const u8 {
+-    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
+-}
+-
+-fn envOff(name: [:0]const u8) bool {
+-    const v = envGet(name) orelse return false;
+-    return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off");
+-}
+-
+ /// Two ranks' prompt chunk rows (TF_FLASHNEXT_PREFILL_ROWS overrides; any chunking gives the same bits); one GPU: 2048.
+ pub const tp2_prefill_rows: usize = 4096;
+ 
+ fn promptRows(default: usize) !usize {
+-    const v = envGet("TF_FLASHNEXT_PREFILL_ROWS") orelse return default;
++    const v = envs.get("TF_FLASHNEXT_PREFILL_ROWS") orelse return default;
+     const n = std.fmt.parseInt(usize, v, 10) catch return error.BadPrefillRows;
+     if (n < 16 or n > 16384) return error.BadPrefillRows;
+     return n;
+@@ -345,6 +337,7 @@ pub const Engine = struct {
+     qsa_fast: ?prompt_mm.QsaScores = null,
+ 
+     pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels_dir: []const u8, o: Options) !*Engine {
++        try envs.startup();
+         const t0 = std.Io.Clock.awake.now(io);
+         if (o.world < 1 or o.world > 2 or o.rank >= o.world) return error.BadRank;
+         if (o.world > 1 and o.comm == null) return error.TwoRanksNeedComm;
+@@ -365,7 +358,7 @@ pub const Engine = struct {
+         errdefer e.set.deinit();
+         // TF_FLASHNEXT_INT4AR_FAST=1: INT4-AutoRound's lossy fast-fp8/ variant over the checkpoint (opt-in)
+         var overlay_buf: [1024]u8 = undefined;
+-        const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
++        const overlay: ?[]const u8 = if (e.c.int4ar() and envs.get("TF_FLASHNEXT_INT4AR_FAST") != null and !envs.off("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
+         e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
+         errdefer e.w.deinit();
+         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
+@@ -384,7 +377,7 @@ pub const Engine = struct {
+         errdefer if (e.mbuf) |*m| m.deinit();
+         // default 512: a last chunk takes up to 512 more rows instead of its own chunk (exact: chunk invariance)
+         if (e.prefill_rows + 512 <= 16384) e.prefill_tail = 512;
+-        if (envGet("TF_FLASHNEXT_PREFILL_TAIL")) |v| {
++        if (envs.get("TF_FLASHNEXT_PREFILL_TAIL")) |v| {
+             e.prefill_tail = std.fmt.parseInt(usize, v, 10) catch return error.BadPrefillTail;
+             if (e.prefill_tail % 16 != 0 or e.prefill_rows + e.prefill_tail > 16384) return error.BadPrefillTail;
+         }
+@@ -408,35 +401,35 @@ pub const Engine = struct {
+         errdefer if (e.k8) |*q| q.deinit();
+         errdefer if (e.k4) |*q| q.deinit();
+         // prompt matmuls without split-K partials when the kernel set has them (TF_FLASHNEXT_PROMPT_MM=0: off)
+-        e.f.prompt_mm = !envOff(prompt_mm.env) and prompt_mm.available(&e.set);
+-        e.draw_once = !envOff("TF_FLASHNEXT_DRAW_ONCE");
++        e.f.prompt_mm = !envs.off(prompt_mm.env) and prompt_mm.available(&e.set);
++        e.draw_once = !envs.off("TF_FLASHNEXT_DRAW_ONCE");
+         // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line)
+-        if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
++        if (!envs.off("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
+         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
+-        e.f.fp8_ld = !envOff("TF_FLASHNEXT_FP8_LD");
++        e.f.fp8_ld = !envs.off("TF_FLASHNEXT_FP8_LD");
+         // shared expert's single-slice gate/up on the K-serial kernel (same bits); TF_FLASHNEXT_FP4_SERIAL=0 off
+-        e.f.fp4_serial = !envOff("TF_FLASHNEXT_FP4_SERIAL");
+-        e.graph_log = envGet("TF_FLASHNEXT_GRAPH_LOG") != null;
+-        if (envGet("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
+-        if (envGet("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
++        e.f.fp4_serial = !envs.off("TF_FLASHNEXT_FP4_SERIAL");
++        e.graph_log = envs.get("TF_FLASHNEXT_GRAPH_LOG") != null;
++        if (envs.get("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
++        if (envs.get("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
+         // shared rounds past captured widths run attention in one launch: TF_FLASHNEXT_ATTN_MULTI=N from N streams
+         if (tri.Tri.multiAvailable(&e.set)) {
+-            const want: usize = if (envGet("TF_FLASHNEXT_ATTN_MULTI")) |v| (std.fmt.parseInt(usize, v, 10) catch 0) else e.multi_graphs + 1;
++            const want: usize = if (envs.get("TF_FLASHNEXT_ATTN_MULTI")) |v| (std.fmt.parseInt(usize, v, 10) catch 0) else e.multi_graphs + 1;
+             if (want > 0) e.f.attn_multi = @max(want, e.multi_graphs + 1, 2);
+             // the kernel set's attn_multi kernels read bf16 caches: an FP8 cache keeps the one-stream kernels
+             if (e.g.kv != .bf16) e.f.attn_multi = 0;
+         }
+-        if (envGet("TF_FLASHNEXT_MEDIA_GRAPHS")) |v| e.media_graphs = !std.mem.eql(u8, v, "0");
+-        e.f.count_experts = if (envGet("TF_FLASHNEXT_COUNT_EXPERTS")) |v| std.mem.eql(u8, v, "1") else false;
+-        if (!envOff(moep.env)) {
++        if (envs.get("TF_FLASHNEXT_MEDIA_GRAPHS")) |v| e.media_graphs = !std.mem.eql(u8, v, "0");
++        e.f.count_experts = if (envs.get("TF_FLASHNEXT_COUNT_EXPERTS")) |v| std.mem.eql(u8, v, "1") else false;
++        if (!envs.off(moep.env)) {
+             e.px = try moep.Prompt4.init(ctx);
+             if (e.px.?.gu2) try e.px.?.reserveGate(d, (e.prefill_rows + e.prefill_tail) * e.g.slots(), e.g.moe_width);
+             e.f.px = &e.px.?;
+         }
+         errdefer if (e.px) |*q| q.deinit();
+         // two ranks: prompt glue split by rows (TF_FLASHNEXT_GLUE_SPLIT=0: every rank runs every row)
+-        e.f.glue_split = o.world == 2 and !envOff("TF_FLASHNEXT_GLUE_SPLIT");
+-        e.digest = envGet("TF_FLASHNEXT_PREFILL_DIGEST") != null;
++        e.f.glue_split = o.world == 2 and !envs.off("TF_FLASHNEXT_GLUE_SPLIT");
++        e.digest = envs.get("TF_FLASHNEXT_PREFILL_DIGEST") != null;
+         // NCCL connects point-to-point channels on first use, so one prompt-sized exchange runs now on both ranks
+         if (e.f.glue_split) if (o.comm) |cm| {
+             const n = @min(e.prefill_rows / 2, 2048) * e.g.hidden;
+@@ -445,34 +438,34 @@ pub const Engine = struct {
+             try e.stream.synchronize();
+         };
+         // both ranks loaded: drop the checkpoint's pages from the page cache (TF_FLASHNEXT_DROP_PAGES=0 keeps them)
+-        if (!envOff("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
+-        e.poison = envGet("TF_FLASHNEXT_POISON_PADS") != null;
+-        e.pass_times = envGet("TF_FLASHNEXT_PASS_TIMES") != null;
+-        e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
+-        e.f.wb_norm = !envOff("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
++        if (!envs.off("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
++        e.poison = envs.get("TF_FLASHNEXT_POISON_PADS") != null;
++        e.pass_times = envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
++        e.f.up_mix = !envs.off("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
++        e.f.wb_norm = !envs.off("TF_FLASHNEXT_WB_NORM") and prompt_mm.wbNormAvailable(&e.set);
+         // the split glue's exchanges on their own stream beside the other rows' work (TF_FLASHNEXT_OVERLAP=0: in line)
+-        if (!envOff("TF_FLASHNEXT_QSA_FAST")) {
++        if (!envs.off("TF_FLASHNEXT_QSA_FAST")) {
+             e.qsa_fast = try prompt_mm.QsaScores.init(d);
+             e.f.qsa_fast = &e.qsa_fast.?;
+         }
+         errdefer if (e.qsa_fast) |*q| q.deinit();
+-        if (envGet("TF_FLASHNEXT_QSA_RT")) |v| {
++        if (envs.get("TF_FLASHNEXT_QSA_RT")) |v| {
+             e.f.qsa_rt = std.fmt.parseInt(usize, v, 10) catch 0;
+         }
+-        if (envGet("TF_FLASHNEXT_QSA_TILES_FROM")) |v| {
++        if (envs.get("TF_FLASHNEXT_QSA_TILES_FROM")) |v| {
+             e.f.qsa_tiles_from = std.fmt.parseInt(usize, v, 10) catch std.math.maxInt(usize);
+         }
+-        if (envGet("TF_FLASHNEXT_QSA_SPLIT_KEYS")) |v| {
++        if (envs.get("TF_FLASHNEXT_QSA_SPLIT_KEYS")) |v| {
+             e.f.qsa_split_keys = std.fmt.parseInt(usize, v, 10) catch 0;
+         }
+         // measured ~1% (research/R2-measured.md): off unless asked
+-        if (e.f.glue_split and envGet("TF_FLASHNEXT_OVERLAP") != null and !envOff("TF_FLASHNEXT_OVERLAP")) {
+-            if (envGet("TF_FLASHNEXT_OVERLAP")) |v| e.f.overlap = std.fmt.parseInt(u8, v, 10) catch 1;
+-            const prio: c_int = if (envGet("TF_FLASHNEXT_COMM_PRIORITY")) |v| (std.fmt.parseInt(c_int, v, 10) catch 0) else 0;
++        if (e.f.glue_split and envs.get("TF_FLASHNEXT_OVERLAP") != null and !envs.off("TF_FLASHNEXT_OVERLAP")) {
++            if (envs.get("TF_FLASHNEXT_OVERLAP")) |v| e.f.overlap = std.fmt.parseInt(u8, v, 10) catch 1;
++            const prio: c_int = if (envs.get("TF_FLASHNEXT_COMM_PRIORITY")) |v| (std.fmt.parseInt(c_int, v, 10) catch 0) else 0;
+             e.f.cs = try streamWithPriority(d, prio);
+             for (&e.f.cs_ev) |*ev| ev.* = try cuda.Event.init(d, false);
+             // CTAs the persistent expert kernels leave free for NCCL's (the grids loop over units: same bits)
+-            if (envGet("TF_FLASHNEXT_EXPERT_SMS_FREE")) |v| {
++            if (envs.get("TF_FLASHNEXT_EXPERT_SMS_FREE")) |v| {
+                 const free = std.fmt.parseInt(usize, v, 10) catch 0;
+                 const sms: usize = @intCast(e.k.sms);
+                 for (&e.k.nvfp4_blocks) |*n| n.* = n.* / sms * (sms - @min(free, sms - 1));
+@@ -483,14 +476,14 @@ pub const Engine = struct {
+             cs.deinit();
+             for (&e.f.cs_ev) |*ev| ev.deinit();
+         };
+-        if (profs.wanted(envGet(profs.env))) {
++        if (profs.wanted(envs.get(profs.env))) {
+             e.prof = try profs.Prof.init(gpa, d, 16384);
+         }
+         errdefer if (e.prof) |p| p.deinit(gpa);
+         if (o.rank == 0) std.debug.print("prompt path: {d}-row chunks (the last up to {d} more), glue {s}{s}, matmul K slices {s}, experts {s}{s}\n", .{ e.prefill_rows, e.prefill_tail, if (e.f.glue_split) "split by rows" else "on every row", if (e.f.cs != null) " (exchanges overlapped)" else "", if (e.f.prompt_mm) "in one program (_b16mm_ks/_fp4mm_ks)" else "split with _reduce", if (e.px != null) "on 128-pair items (fn_experts_prompt)" else "on 16-pair items", if (e.prof != null) ", profiled" else "" });
+-        if (e.w.mtp != null) if (std.c.getenv("TF_FLASHNEXT_MTP_Q4")) |v| if (!std.mem.eql(u8, std.mem.span(v), "0")) {
+-            const mse = if (std.c.getenv("TF_FLASHNEXT_MTP_Q4_MSE")) |x| std.mem.eql(u8, std.mem.span(x), "1") else false;
+-            e.mtpq = try @import("cuda_mtp_q4.zig").Table.build(gpa, d, &e.w, std.mem.span(v), mse);
++        if (e.w.mtp != null) if (envs.get("TF_FLASHNEXT_MTP_Q4")) |v| if (!std.mem.eql(u8, v, "0")) {
++            const mse = envs.is("TF_FLASHNEXT_MTP_Q4_MSE", "1");
++            e.mtpq = try @import("cuda_mtp_q4.zig").Table.build(gpa, d, &e.w, v, mse);
+             e.f.mtp_q4 = &e.mtpq.?;
+             std.log.info("MTP head in 4-bit for the drafts: {d} matrices, {d:.1} -> {d:.1} MB", .{ e.mtpq.?.n, @as(f64, @floatFromInt(e.mtpq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.mtpq.?.bytes_q4)) / 1e6 });
+         };
+@@ -528,7 +521,7 @@ pub const Engine = struct {
+         try e.stream.synchronize();
+         // the floor the server and the recipe set (TENSORFOLD_MEMORY_RESERVE_GIB) wins over the option
+         var reserve_gib = o.reserve_gib;
+-        if (std.c.getenv("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| reserve_gib = std.fmt.parseFloat(f64, std.mem.span(v)) catch return error.BadMemoryReserve;
++        if (envs.get("TENSORFOLD_MEMORY_RESERVE_GIB")) |v| reserve_gib = std.fmt.parseFloat(f64, v) catch return error.BadMemoryReserve;
+         const reserve: usize = @intFromFloat(reserve_gib * (1 << 30));
+         // MemAvailable counts the mapped n-gram table's reclaimable pages; the device's free count leaves them out
+         const free = memAvailable(io) orelse (try ctx.memInfo()).free;
+@@ -976,7 +969,7 @@ pub const Engine = struct {
+         const pb = &e.pbuf;
+         const Wd = e.g.wide();
+         const use_mtp = e.absorbing and e.w.mtp != null;
+-        if (e.rank == 0 and envGet("TF_FLASHNEXT_BURST_LOG") != null) {
++        if (e.rank == 0 and envs.get("TF_FLASHNEXT_BURST_LOG") != null) {
+             var rows: usize = 0;
+             for (prompts) |p| rows += p.prompt.len;
+             std.debug.print("burst prefill: {d} prompts, {d} rows in one pass\n", .{ n, rows });
+diff --git a/zig/src/families/flashnext_mia/cuda_env.zig b/zig/src/families/flashnext_mia/cuda_env.zig
+new file mode 100644
+index 000000000..3d16def09
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_env.zig
+@@ -0,0 +1,27 @@
++//! Her settings through platform/environment.zig's flashnext_mia rows; each reader keeps its own reading of the text.
++const std = @import("std");
++const environment = @import("sys").environment;
++
++/// Refuses the first malformed setting of her rows, before the engine opens anything.
++pub fn startup() !void {
++    try environment.checkScope(.flashnext_mia, environment.Process{});
++}
++
++/// A setting's text as set (null when unset) once its row accepts it; `startup` has refused a malformed one.
++pub fn get(comptime name: [:0]const u8) ?[]const u8 {
++    comptime environment.registered(name);
++    const raw = (environment.Process{}).get(name);
++    environment.check(name, raw) catch return null;
++    return raw;
++}
++
++/// A switch set to 0 or off (unset is not off).
++pub fn off(comptime name: [:0]const u8) bool {
++    const v = get(name) orelse return false;
++    return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off");
++}
++
++/// A switch set to exactly `value`.
++pub fn is(comptime name: [:0]const u8, value: []const u8) bool {
++    return if (get(name)) |v| std.mem.eql(u8, v, value) else false;
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_forward.zig b/zig/src/families/flashnext_mia/cuda_forward.zig
+index 0f9bfcc2d..7c3d85178 100644
+--- a/zig/src/families/flashnext_mia/cuda_forward.zig
++++ b/zig/src/families/flashnext_mia/cuda_forward.zig
+@@ -1,5 +1,6 @@
+ //! Flash Next CUDA forward, Python forward.py/mtp.py by Ash Hart (ashhart) and vcruz305 (TensorFold), same launches.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const kern = @import("cuda_kernels.zig");
+ const tri = @import("cuda_triton.zig");
+@@ -1162,14 +1163,14 @@ pub const Forward = struct {
+ 
+     /// A weight's first bytes to prefetch: all of it up to TF_FLASHNEXT_L2PF_BYTES (default 8 MiB).
+     pub fn prefetchOf(r: W.Rows) comms.Prefetch {
+-        const cap: usize = if (std.c.getenv("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch (8 << 20) else (8 << 20);
++        const cap: usize = if (envs.get("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, v, 10) catch (8 << 20) else (8 << 20);
+         return .{ .ptr = r.weight, .bytes = @min(@as(usize, r.n) * r.k * 2, cap) };
+     }
+ 
+     /// A read-out's down projection to prefetch: its block-FP8 bytes (fast-fp8), else its bf16 rows.
+     pub fn prefetchHc(h: *const W.Hc) comms.Prefetch {
+         const d8 = h.down8 orelse return prefetchOf(h.down);
+-        const cap: usize = if (std.c.getenv("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch (8 << 20) else (8 << 20);
++        const cap: usize = if (envs.get("TF_FLASHNEXT_L2PF_BYTES")) |v| std.fmt.parseInt(usize, v, 10) catch (8 << 20) else (8 << 20);
+         return .{ .ptr = d8.w8, .bytes = @min(@as(usize, d8.npad) * d8.k, cap) };
+     }
+ 
+diff --git a/zig/src/families/flashnext_mia/cuda_int4.zig b/zig/src/families/flashnext_mia/cuda_int4.zig
+index b86d02300..482880bae 100644
+--- a/zig/src/families/flashnext_mia/cuda_int4.zig
++++ b/zig/src/families/flashnext_mia/cuda_int4.zig
+@@ -1,5 +1,6 @@
+ //! GPTQ int4 experts and lm_head (INT4-AutoRound, zero point 8, fp16 scale per 128): layouts, launches, reference.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const kern = @import("cuda_kernels.zig");
+ 
+@@ -130,7 +131,7 @@ pub const prompt_pairs: usize = 2048;
+ 
+ /// Every call takes 16-pair items (64-pair ones are slower); TF_FLASHNEXT_INT4_TILE=64 takes the prompt tile.
+ pub fn tileFor(pairs: usize) usize {
+-    const want = if (std.c.getenv("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch kern.plan_tile else kern.plan_tile;
++    const want = if (envs.get("TF_FLASHNEXT_INT4_TILE")) |v| std.fmt.parseInt(usize, v, 10) catch kern.plan_tile else kern.plan_tile;
+     return if (want == prompt_tile and pairs >= prompt_pairs) prompt_tile else kern.plan_tile;
+ }
+ 
+@@ -302,7 +303,7 @@ pub fn downPrompt(k: *const Kernels, s: cuda.Stream, act: u64, act_stride: usize
+ 
+ /// Whether a prompt call of `pairs` routed pairs takes `downPrompt` (TF_FLASHNEXT_INT4_PROMPT_DOWN=0: never).
+ pub fn promptDown(pairs: usize) bool {
+-    if (std.c.getenv("TF_FLASHNEXT_INT4_PROMPT_DOWN")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return false;
++    if (envs.is("TF_FLASHNEXT_INT4_PROMPT_DOWN", "0")) return false;
+     return pairs >= prompt_pairs;
+ }
+ 
+diff --git a/zig/src/families/flashnext_mia/cuda_kernels.zig b/zig/src/families/flashnext_mia/cuda_kernels.zig
+index 5e17870a2..bbe4f67a9 100644
+--- a/zig/src/families/flashnext_mia/cuda_kernels.zig
++++ b/zig/src/families/flashnext_mia/cuda_kernels.zig
+@@ -1,6 +1,7 @@
+ //! Flash Next's CUDA extension kernels: fn_* fatbins (SASS-equal copies by ashhart, TensorFold) with Python's launches.
+ 
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ 
+ /// Mangled names of every entry point resolved here (cuobjdump -symbols of each fatbin).
+@@ -260,7 +261,7 @@ pub const Kernels = struct {
+         // nvfp4/experts.cu launch: cudaOccupancyMaxActiveBlocksPerMultiprocessor(128 threads, 0 bytes), at least 1
+         for (k.nvfp4, &k.nvfp4_blocks) |f, *n| n.* = @as(usize, @max(1, try f.occupancy(128, 0))) * @as(usize, @intCast(k.sms));
+         k.nvfp4_nt_blocks = @as(usize, @max(1, try k.nvfp4_nt.occupancy(32, 0))) * @as(usize, @intCast(k.sms));
+-        k.nt_units = ntUnits(if (std.c.getenv("TF_FLASHNEXT_EXPERT_SHAPE")) |v| std.mem.span(v) else null);
++        k.nt_units = ntUnits(envs.get("TF_FLASHNEXT_EXPERT_SHAPE"));
+         return k;
+     }
+ 
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes.zig b/zig/src/families/flashnext_mia/cuda_lanes.zig
+index c254ba95e..b8e50d8e1 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes.zig
+@@ -1,5 +1,6 @@
+ //! Flash Next CUDA lane backend: stream windows share one forward; tokens equal serial decoding's; generic over `E`.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const lanes = @import("lanes");
+ const media_mod = @import("cuda_media.zig");
+ const decode = @import("cuda_decode.zig");
+@@ -141,7 +142,7 @@ pub fn Lanes(comptime E: type) type {
+         mtp_ms: f64 = 0,
+ 
+         pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
+-            const late = if (std.c.getenv("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
++            const late = if (envs.get("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, v, "0") else true;
+             return .{ .gpa = gpa, .e = e, .drafting = drafting, .context = context, .window = @max(1, @min(window, max_rows)), .late_keep = late };
+         }
+ 
+@@ -485,7 +486,7 @@ pub fn Lanes(comptime E: type) type {
+             self.dropTentative();
+             // TF_FLASHNEXT_PASS_TIMES=1: each part's wall time (the stream drained at each edge), in the log
+             const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
+-            const times = timed and std.c.getenv("TF_FLASHNEXT_PASS_TIMES") != null;
++            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
+             var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
+             var parts: [3]f64 = @splat(0); // to the marks, keeping, the rest
+             for (s.reuse.marks) |m| {
+@@ -534,7 +535,7 @@ pub fn Lanes(comptime E: type) type {
+                 return k;
+             }
+             const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
+-            const times = timed and std.c.getenv("TF_FLASHNEXT_PASS_TIMES") != null;
++            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
+             var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
+             const keeper = try e.newSeq(at + 1);
+             errdefer e.freeSeq(keeper);
+diff --git a/zig/src/families/flashnext_mia/cuda_mirror.zig b/zig/src/families/flashnext_mia/cuda_mirror.zig
+index 6da12133b..c4aff0ca9 100644
+--- a/zig/src/families/flashnext_mia/cuda_mirror.zig
++++ b/zig/src/families/flashnext_mia/cuda_mirror.zig
+@@ -1,5 +1,6 @@
+ //! Two ranks behind one lane backend: rank 0's Leader records each engine call, rank 1's Follower replays it.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const lanes = @import("lanes");
+ const media_mod = @import("cuda_media.zig");
+ const cuda = @import("cuda");
+@@ -716,7 +717,7 @@ pub const Watch = struct {
+ 
+     pub fn start(w: *Watch) !void {
+         keepalive(w.fd);
+-        if (std.c.getenv("TF_TP_TIMEOUT_S")) |v| w.base_s = std.fmt.parseInt(u64, std.mem.span(v), 10) catch w.base_s;
++        if (envs.get("TF_TP_TIMEOUT_S")) |v| w.base_s = std.fmt.parseInt(u64, v, 10) catch w.base_s;
+         w.thread = try std.Thread.spawn(.{}, run, .{w});
+     }
+ 
+diff --git a/zig/src/families/flashnext_mia/cuda_moe_prompt.zig b/zig/src/families/flashnext_mia/cuda_moe_prompt.zig
+index 2635e15a9..ebd3ccb5a 100644
+--- a/zig/src/families/flashnext_mia/cuda_moe_prompt.zig
++++ b/zig/src/families/flashnext_mia/cuda_moe_prompt.zig
+@@ -1,5 +1,6 @@
+ //! Routed NVFP4 experts of a prompt chunk: T row tiles a warp, nvfp4_expert_kernel's bits; PROMPT_EXPERTS=0 off.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const kern = @import("cuda_kernels.zig");
+ 
+@@ -45,20 +46,20 @@ pub const Prompt4 = struct {
+         p.f32 = .{ try p.fnOf("fn_prompt4_f32_t2"), try p.fnOf("fn_prompt4_f32_t4") };
+         p.b16 = .{ try p.fnOf("fn_prompt4_b16_t2"), try p.fnOf("fn_prompt4_b16_t4") };
+         p.occ = .{ try p.fnOf("fn_prompt4_gu_t2o"), try p.fnOf("fn_prompt4_f32_t2o"), try p.fnOf("fn_prompt4_b16_t2o") };
+-        p.use_occ = if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| v[0] == '1' else false;
+-        if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| p.occ_down = v[0] != '0';
++        p.use_occ = if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| v.len > 0 and v[0] == '1' else false;
++        if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_OCC")) |v| p.occ_down = v.len == 0 or v[0] != '0';
+         p.gate2 = try p.fnOf("fn_prompt4_gate_t2o");
+         p.up2 = try p.fnOf("fn_prompt4_up_t2o");
+-        p.gu2 = if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_GU2")) |v| v[0] == '1' else false;
++        p.gu2 = if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_GU2")) |v| v.len > 0 and v[0] == '1' else false;
+         p.sms = @intCast(try ctx.attribute(.multiprocessor_count));
+-        if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_CFG")) |v| {
+-            var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
++        if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_CFG")) |v| {
++            var it = std.mem.tokenizeScalar(u8, v, ',');
+             if (it.next()) |x| p.tile = std.fmt.parseInt(usize, x, 10) catch default_tile;
+             if (it.next()) |x| p.t_gu = std.fmt.parseInt(usize, x, 10) catch 2;
+             if (it.next()) |x| p.t_down = std.fmt.parseInt(usize, x, 10) catch 2;
+         }
+-        if (std.c.getenv("TF_FLASHNEXT_PROMPT_EXPERTS_ROWS")) |v| {
+-            var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
++        if (envs.get("TF_FLASHNEXT_PROMPT_EXPERTS_ROWS")) |v| {
++            var it = std.mem.tokenizeScalar(u8, v, ',');
+             if (it.next()) |x| p.gu_rows = std.fmt.parseInt(usize, x, 10) catch 4096;
+             if (it.next()) |x| p.down_rows = std.fmt.parseInt(usize, x, 10) catch 2048;
+         }
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index d90182570..6de00691c 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -1,5 +1,6 @@
+ //! Flash Next for the native server on CUDA: engine, MTP head, lane backend; at TP=2 rank 0 mirrors calls to rank 1.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const core = @import("core");
+@@ -106,6 +107,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+ /// `open` over the engine module `M` (cuda_engine.zig: M.Engine, M.Options as PLAN.md's Engine API contract).
+ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
+     const Own = Owned(M);
++    try envs.startup();
+     if (o.tp != 1 and o.tp != 2) return error.UnsupportedTp;
+     if (o.rank >= o.tp) return error.BadRank;
+     const own = try gpa.create(Own);
+@@ -114,7 +116,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+     errdefer own.closeLink();
+     const yarn = try yarnFor(gpa, io, dir, o.context);
+     // the window: 15 drafts (16 rows) unless TF_FLASHNEXT_DEPTH says (Python's 6)
+-    const depth: usize = if (getenv("TF_FLASHNEXT_DEPTH")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else 15;
++    const depth: usize = if (envs.get("TF_FLASHNEXT_DEPTH")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadDepth else 15;
+     if (depth < 1 or depth > lane_backend.max_drafts) return error.BadDepth;
+     if (o.tp == 2) {
+         // a rank stops on SIGTERM / SIGINT while loading or following (PID 1 ignores them); then rank 0's server does
+@@ -161,10 +163,10 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+     own.lanes.confidence = @import("cuda_engine.zig").confidenceSetting();
+     own.lanes.product_streams = @import("cuda_engine.zig").productStreams();
+     own.lanes.wide_confidence = @import("cuda_engine.zig").wide_confidence;
+-    own.lanes.overcommit = if (getenv("TF_FLASHNEXT_OVERCOMMIT")) |v| std.mem.eql(u8, v, "1") else false;
++    own.lanes.overcommit = if (envs.get("TF_FLASHNEXT_OVERCOMMIT")) |v| std.mem.eql(u8, v, "1") else false;
+     // prompts fill in layer slices between rounds: opt-in until verified exact on GPUs; both ranks agree on it
+-    own.lanes.sliced = if (getenv("TF_FLASHNEXT_FILL")) |v| std.mem.eql(u8, v, "1") else false;
+-    if (getenv("TF_FLASHNEXT_FILL_LAYERS")) |v| own.lanes.fill_layers = @max(1, std.fmt.parseInt(usize, v, 10) catch 8);
++    own.lanes.sliced = if (envs.get("TF_FLASHNEXT_FILL")) |v| std.mem.eql(u8, v, "1") else false;
++    if (envs.get("TF_FLASHNEXT_FILL_LAYERS")) |v| own.lanes.fill_layers = @max(1, std.fmt.parseInt(usize, v, 10) catch 8);
+     errdefer own.lanes.deinit();
+     if (o.drafts) {
+         const ids = try costText(gpa, io, dir);
+@@ -320,7 +322,7 @@ pub fn modelWindow(a: std.mem.Allocator, io: std.Io, dir: []const u8) i64 {
+     defer a.free(path);
+     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24)) catch return 0;
+     defer a.free(text);
+-    return windowOf(a, text, getenv(rope.env_factor), getenv(rope.env_ramp)) catch 0;
++    return windowOf(a, text, envs.get(rope.env_factor), envs.get(rope.env_ramp)) catch 0;
+ }
+ 
+ fn windowOf(a: std.mem.Allocator, config_text: []const u8, factor_env: ?[]const u8, ramp_env: ?[]const u8) !i64 {
+@@ -339,12 +341,9 @@ fn yarnFor(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize)
+     defer gpa.free(path);
+     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+     defer gpa.free(text);
+-    return yarnOf(gpa, text, context, getenv(rope.env_factor), getenv(rope.env_ramp));
++    return yarnOf(gpa, text, context, envs.get(rope.env_factor), envs.get(rope.env_ramp));
+ }
+ 
+-fn getenv(name: [:0]const u8) ?[]const u8 {
+-    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
+-}
+ 
+ fn yarnOf(gpa: std.mem.Allocator, config_text: []const u8, context: usize, factor_env: ?[]const u8, ramp_env: ?[]const u8) !?rope.Yarn {
+     const doc = try std.json.parseFromSlice(std.json.Value, gpa, config_text, .{});
+@@ -391,8 +390,8 @@ fn hashFile(gpa: std.mem.Allocator, io: std.Io, h: *std.crypto.hash.sha2.Sha256,
+ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kernel_set: [32]u8, o: Options, depth: usize, yarn: ?rope.Yarn) ![]u8 {
+     var y: [96]u8 = undefined;
+     const yt = if (yarn) |v| try std.fmt.bufPrint(&y, "{d}x{d}/ramp{d}/att{d}", .{ v.factor, v.original, v.ramp_positions, v.attention() }) else "off";
+-    const fill = getenv("TF_FLASHNEXT_FILL") orelse "0";
+-    const fill_layers = getenv("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
++    const fill = envs.get("TF_FLASHNEXT_FILL") orelse "0";
++    const fill_layers = envs.get("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
+     return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} confidence={d}/{d} yarn={s} fill={s}/{s} kv={s} kernels={x}", .{
+         o.tp, base, snapshot, o.context, o.lanes, o.drafts, depth, @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, if (o.kv8) "fp8" else "bf16", kernel_set,
+     });
+diff --git a/zig/src/families/flashnext_mia/cuda_prompt.zig b/zig/src/families/flashnext_mia/cuda_prompt.zig
+index 03026d400..6e9e1c2e9 100644
+--- a/zig/src/families/flashnext_mia/cuda_prompt.zig
++++ b/zig/src/families/flashnext_mia/cuda_prompt.zig
+@@ -1,5 +1,6 @@
+ //! Prompt matmuls without split-K partials (`_b16mm_ks`, `_fp4mm_ks`): slice totals in order, `_reduce`'s bits.
+ const std = @import("std");
++const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const aot = cuda.aot;
+ const tri = @import("cuda_triton.zig");
+@@ -380,7 +381,7 @@ pub const QsaScores = struct {
+             f.* = try m.function(n);
+             try f.allowDynamicShared(@intCast(shared(i)));
+         }
+-        if (std.c.getenv("TF_FLASHNEXT_QSA_TILE")) |v| q.pick = @min(3, std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0);
++        if (envs.get("TF_FLASHNEXT_QSA_TILE")) |v| q.pick = @min(3, std.fmt.parseInt(usize, v, 10) catch 0);
+         return q;
+     }
+ 
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 3d1dbaa45..d5c13cf48 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -3,8 +3,8 @@ const std = @import("std");
+ const sys = @import("sys.zig");
+ 
+ pub const Error = error{InvalidEnvironment};
+-pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3 };
+-pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
++pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, flashnext_mia };
++pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, list };
+ pub const Rule = struct {
+     name: [:0]const u8,
+     scope: Scope,
+@@ -17,7 +17,7 @@ pub const Rule = struct {
+     max: u64 = std.math.maxInt(u64),
+     /// When nonempty, the only whole numbers accepted.
+     only: []const u64 = &.{},
+-    /// A `.word` setting's accepted texts; the parsed value is the matching index.
++    /// A `.word` row's texts (value: the index), a `.list` row's tokens, or a real row's off forms (any case, value 0).
+     words: []const []const u8 = &.{},
+     /// A legacy name that is ignored, and so never refused, while its canonical name is set.
+     alias_of: ?[:0]const u8 = null,
+@@ -48,6 +48,63 @@ pub const rules = [_]Rule{
+     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_ROCE_GID_INDEX", .scope = .cuda, .kind = .u32, .forms = "a whole GID index from 0 to 2147483647" },
+     .{ .name = "TF_FLASHNEXT_ENGINE", .scope = .cuda, .kind = .word, .trim = " ", .words = &.{ "upstream", "mia" }, .forms = "upstream or mia" },
++    .{ .name = "TF_FLASHNEXT_DEPTH", .scope = .flashnext_mia, .kind = .size, .forms = "a whole draft count from 1 to the lane core's most (default 15)" },
++    .{ .name = "TF_FLASHNEXT_FILL", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_FILL_LAYERS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole layer count a fill step (default 8; 0 reads as 1)" },
++    .{ .name = "TF_FLASHNEXT_OVERCOMMIT", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_PRODUCT_STREAMS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole stream count (default 2)" },
++    .{ .name = "TF_FLASHNEXT_CONFIDENCE", .scope = .flashnext_mia, .kind = .signed_real, .forms = "a finite number; -1 to 1 sets the draft stop rule, others keep -0.4" },
++    .{ .name = "TF_FLASHNEXT_KEEP_LATE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_YARN", .scope = .flashnext_mia, .kind = .positive_real, .trim = " \t\r\n", .words = &.{ "0", "off", "no", "false", "none", "default" }, .forms = "a YaRN factor above 1, or 0, off, no, false, none or default (any case) for none" },
++    .{ .name = "TF_FLASHNEXT_YARN_RAMP_POSITIONS", .scope = .flashnext_mia, .kind = .u64, .trim = " \t\r\n", .forms = "a whole position count" },
++    .{ .name = "TF_FLASHNEXT_ROCE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_L2PF", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_ROCE_MAX", .scope = .flashnext_mia, .kind = .u64, .forms = "a whole byte count (default 524288)" },
++    .{ .name = "TF_FLASHNEXT_L2PF_BYTES", .scope = .flashnext_mia, .kind = .size, .forms = "a whole byte count (default 8388608)" },
++    .{ .name = "TF_FLASHNEXT_MTP_TOPK", .scope = .flashnext_mia, .kind = .size, .forms = "a whole routed-expert count (0: the checkpoint's; 10 is the other routed one)" },
++    .{ .name = "TF_FLASHNEXT_MTP_Q4", .scope = .flashnext_mia, .kind = .list, .words = &.{ "0", "1", "all", "fc", "attn", "hc", "mixer" }, .forms = "0 (off), 1 or all, or a comma list of fc, attn, hc and mixer" },
++    .{ .name = "TF_FLASHNEXT_MTP_Q4_MSE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_PREFILL_ROWS", .scope = .flashnext_mia, .kind = .size, .forms = "whole prompt chunk rows from 16 to 16384" },
++    .{ .name = "TF_FLASHNEXT_PREFILL_TAIL", .scope = .flashnext_mia, .kind = .size, .forms = "whole rows, a multiple of 16, with the chunk at most 16384" },
++    .{ .name = "TF_FLASHNEXT_INT4AR_FAST", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_PROMPT_MM", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_DRAW_ONCE", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_SHARED_SIDE", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_FP8_LD", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_FP4_SERIAL", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_GLUE_SPLIT", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_DROP_PAGES", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_GLUE_FUSE", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_WB_NORM", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_QSA_FAST", .scope = .flashnext_mia, .kind = .word, .words = &.{ "0", "off", "1", "on" }, .forms = "0 or off, 1 or on" },
++    .{ .name = "TF_FLASHNEXT_GRAPH_LOG", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
++    .{ .name = "TF_FLASHNEXT_PREFILL_DIGEST", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
++    .{ .name = "TF_FLASHNEXT_POISON_PADS", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
++    .{ .name = "TF_FLASHNEXT_PASS_TIMES", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
++    .{ .name = "TF_FLASHNEXT_BURST_LOG", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1 (set at all, it is on)" },
++    .{ .name = "TF_FLASHNEXT_GRAPH_FAIL", .scope = .flashnext_mia, .kind = .u64, .forms = "a whole graph-launch count between injected failures (0: none)" },
++    .{ .name = "TF_FLASHNEXT_MULTI_GRAPHS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole stream count of captured shared-round widths" },
++    .{ .name = "TF_FLASHNEXT_ATTN_MULTI", .scope = .flashnext_mia, .kind = .size, .forms = "a whole stream count from which attention runs in one launch (0: never)" },
++    .{ .name = "TF_FLASHNEXT_MEDIA_GRAPHS", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_COUNT_EXPERTS", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_PROFILE", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_QSA_RT", .scope = .flashnext_mia, .kind = .size, .forms = "a whole row-tile count (0: the kernel's own)" },
++    .{ .name = "TF_FLASHNEXT_QSA_TILES_FROM", .scope = .flashnext_mia, .kind = .size, .forms = "a whole key count from which scores run in tiles" },
++    .{ .name = "TF_FLASHNEXT_QSA_SPLIT_KEYS", .scope = .flashnext_mia, .kind = .size, .forms = "a whole key count a split (0: none)" },
++    .{ .name = "TF_FLASHNEXT_QSA_TILE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole tile choice (above 3 reads as 3)" },
++    .{ .name = "TF_FLASHNEXT_OVERLAP", .scope = .flashnext_mia, .kind = .u32, .max = 255, .forms = "a whole overlap mode from 0 (off) to 255" },
++    .{ .name = "TF_FLASHNEXT_COMM_PRIORITY", .scope = .flashnext_mia, .kind = .signed_real, .forms = "a whole CUDA stream priority, negative for higher (other numbers read as 0)" },
++    .{ .name = "TF_FLASHNEXT_EXPERT_SMS_FREE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole SM count the expert kernels leave free" },
++    .{ .name = "TF_FLASHNEXT_EXPERT_SHAPE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole expert unit count (default 230)" },
++    .{ .name = "TF_FLASHNEXT_INT4_TILE", .scope = .flashnext_mia, .kind = .size, .forms = "a whole INT4 tile choice (default: the planned one)" },
++    .{ .name = "TF_FLASHNEXT_INT4_PROMPT_DOWN", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_OCC", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_GU2", .scope = .flashnext_mia, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_CFG", .scope = .flashnext_mia, .kind = .list, .forms = "comma-separated whole numbers: tile, gate/up threads, down threads" },
++    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_ROWS", .scope = .flashnext_mia, .kind = .list, .forms = "comma-separated whole numbers: gate/up rows, down rows" },
++    .{ .name = "TF_TP_TIMEOUT_S", .scope = .flashnext_mia, .kind = .u64, .forms = "whole seconds a rank waits for the other" },
++    .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .scope = .flashnext_mia, .kind = .real, .forms = "a finite GiB amount of at least 0" },
+     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .scope = .gemma4, .kind = .size, .forms = "a solo prompt pass's rows, a multiple of 512 up to 4096" },
+     .{ .name = "TF_DRAMA_PREFILL_ROWS", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "whole prompt rows a chunk, 1 through 1024 (checked when a Drama 3 checkpoint opens)" },
+     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "kept reference states, 0 (off) through 16 (checked when a Drama 3 checkpoint opens)" },
+@@ -172,7 +229,23 @@ pub fn parse(name: []const u8, raw: ?[]const u8) Error!?u64 {
+         if (ch < 0x20 or ch == 0x7f) break true;
+     } else false) error.InvalidEnvironment else 0;
+     // a real travels as its f64 bits and a range as lo above hi; `value` and `range` decode them
+-    if (isReal(r.kind)) return @bitCast(try real(r, text));
++    if (isReal(r.kind)) {
++        // a real row's words (any case) are its off forms, which travel as 0
++        for (r.words) |w| if (std.ascii.eqlIgnoreCase(text, w)) return 0;
++        return @bitCast(try real(r, text));
++    }
++    // a list travels as 0, its text read by its reader: the row's words, or whole numbers, between commas
++    if (r.kind == .list) {
++        var it = std.mem.tokenizeScalar(u8, text, ',');
++        while (it.next()) |x| {
++            if (r.words.len == 0) {
++                _ = std.fmt.parseInt(u64, x, 10) catch return error.InvalidEnvironment;
++            } else if (for (r.words) |w| {
++                if (std.mem.eql(u8, x, w)) break false;
++            } else true) return error.InvalidEnvironment;
++        }
++        return 0;
++    }
+     if (r.kind == .range) {
+         var it = std.mem.splitScalar(u8, text, '-');
+         const lo = std.fmt.parseInt(u32, it.next().?, 10) catch return error.InvalidEnvironment;
+@@ -243,7 +316,7 @@ pub fn check(name: [:0]const u8, raw: ?[]const u8) Error!void {
+ 
+ /// One setting in its reader's type: a switch as bool, a real as a float, any other kind as its whole number.
+ pub fn value(comptime T: type, name: [:0]const u8, raw: ?[]const u8, default: T) Error!T {
+-    std.debug.assert(isReal(rule(name).kind) == (@typeInfo(Plain(T)) == .float) and rule(name).kind != .range and rule(name).kind != .path);
++    std.debug.assert(isReal(rule(name).kind) == (@typeInfo(Plain(T)) == .float) and rule(name).kind != .range and rule(name).kind != .path and rule(name).kind != .list);
+     return decode(T, (try checked(name, raw)) orelse return default);
+ }
+ 
+@@ -303,6 +376,7 @@ pub const Flags = struct {
+     dsv41: bool = false,
+     gemma4: bool = false,
+     drama3: bool = false,
++    flashnext_mia: bool = false,
+     device: ?u32 = null,
+     segments: ?u32 = null,
+     carveout: bool = false,
+@@ -318,6 +392,7 @@ pub const Flags = struct {
+             .dsv41 => f.dsv41,
+             .gemma4 => f.gemma4,
+             .drama3 => f.drama3,
++            .flashnext_mia => f.flashnext_mia,
+         };
+     }
+ };
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 50d31c66f..5f4b36c59 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -3,7 +3,7 @@ const std = @import("std");
+ const e = @import("environment.zig");
+ const t = std.testing;
+ const a = t.allocator;
+-const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true };
++const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true, .flashnext_mia = true };
+ const Env = struct {
+     name: []const u8,
+     raw: ?[]const u8,
+@@ -62,6 +62,7 @@ const valid = [_]Case{
+     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "0", .n = 0 },
+     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "1", .n = 1 },
+     .{ .name = "TF_ROCE_GID_INDEX", .raw = "2147483647", .n = 2147483647 },
++    .{ .name = "TF_FLASHNEXT_ENGINE", .raw = "mia", .n = 1 },
+     .{ .name = "TF_DRAMA_PREFILL_ROWS", .raw = " 128 ", .n = 128 },
+     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .raw = "0", .n = 0 },
+     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .raw = "2048", .n = 2048 },
+@@ -99,6 +100,8 @@ test "environment: valid forms remain raw numbers before existing consumer clamp
+         for ([_][]const u8{ "", " ", "\t \n" }) |raw| try t.expectEqual(@as(?u64, null), try e.parse(r.name, raw));
+         // the DeepSeek rows are each covered, with every kept form, by deepseek_v41/env_validate_test.zig
+         if (r.scope == .dsv41) continue;
++        // MiaAI-Lab's engine's rows are covered by the flashnext_mia test below
++        if (r.scope == .flashnext_mia) continue;
+         var covered = false;
+         for (valid) |c| if (std.mem.eql(u8, r.name, c.name)) {
+             covered = true;
+@@ -265,3 +268,28 @@ test "environment: a legacy alias is checked only while its canonical name is un
+     for ([_][]const u8{ "", "0", "1" }) |canonical| try t.expect((try e.refusal(a, Alias{ .canonical = canonical }, .{ .dsv41 = true })) == null);
+     try t.expect((try e.refusal(a, Alias{ .canonical = null }, .{})) == null);
+ }
++
++test "environment: MiaAI-Lab's engine's rows take 0 and her readers' own forms, and refuse what they misread" {
++    for (e.rules) |r| if (r.scope == .flashnext_mia) {
++        try t.expectEqual(@as(?u64, 0), try e.parse(r.name, "0"));
++        const why = try e.refusal(a, Env{ .name = r.name, .raw = "0" }, all);
++        try t.expect(why == null);
++    };
++    for ([_]Case{
++        .{ .name = "TF_FLASHNEXT_DEPTH", .raw = "15", .n = 15 },
++        .{ .name = "TF_FLASHNEXT_DROP_PAGES", .raw = "off", .n = 1 },
++        .{ .name = "TF_FLASHNEXT_DROP_PAGES", .raw = "on", .n = 3 },
++        .{ .name = "TF_FLASHNEXT_YARN", .raw = " 4 ", .n = @bitCast(@as(f64, 4)) },
++        .{ .name = "TF_FLASHNEXT_YARN", .raw = "OFF", .n = 0 },
++        .{ .name = "TF_FLASHNEXT_CONFIDENCE", .raw = "-0.4", .n = @bitCast(@as(f64, -0.4)) },
++        .{ .name = "TF_FLASHNEXT_MTP_Q4", .raw = "fc,attn", .n = 0 },
++        .{ .name = "TF_FLASHNEXT_PROMPT_EXPERTS_CFG", .raw = "64,2,2", .n = 0 },
++        .{ .name = "TF_FLASHNEXT_OVERLAP", .raw = "255", .n = 255 },
++        .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .raw = "10", .n = @bitCast(@as(f64, 10)) },
++    }) |c| try t.expectEqual(@as(?u64, c.n), try e.parse(c.name, c.raw));
++    for ([_][2][]const u8{
++        .{ "TF_FLASHNEXT_ROCE", "off" },         .{ "TF_FLASHNEXT_DROP_PAGES", "false" },
++        .{ "TF_FLASHNEXT_YARN", "1x" },          .{ "TF_FLASHNEXT_MTP_Q4", "fc,typo" },
++        .{ "TF_FLASHNEXT_PROMPT_EXPERTS_ROWS", "4096,x" }, .{ "TF_FLASHNEXT_OVERLAP", "256" },
++    }) |c| try t.expectError(error.InvalidEnvironment, e.parse(c[0], c[1]));
++}

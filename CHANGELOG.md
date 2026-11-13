@@ -13,7 +13,8 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
   - What it does: the model can run a Python cell or an inline `<expr> =` while it thinks, and gets the exact result
     back in its reasoning. The keys default to the thinking-only setting (`TF_RUNNER_SPANS=reasoning`).
   - `scripts/lanes.sh` builds a lane image on top of the default image: `tensorfold-native` from the lane engine
-    (`LANES_REPO` @ `LANES_REF`, this recipe's patches ported into TensorFold's Zig engine), plus the runner's frontend
+    (upstream TensorFold, `LANES_REPO` @ `LANES_REF`, plus the patches in `lanes/`: this recipe's patches ported into
+    TensorFold's Zig engine), plus the runner's frontend
     and its pinned assets.
   - `start.sh` passes `TF_RUNNER*` / `TF_COMPUTE_LANE*` to both ranks, and uses `--kv-cache` with this engine.
   - Text only (`VISION=0`).
@@ -22,8 +23,8 @@ published for these patches (the v1.1 digest in `scripts/config.sh` does not app
     the first 200, README "Compute lanes"). The lane engine is built for the Spark's own CPU, as this recipe's is.
   - `tool_choice` `"required"`, a named function and Anthropic `any` force a tool call with `ENGINE=lanes` too: patch
     0007's call gate is ported into the lane engine (`capabilities.call_gates: true` in `/v1/models`).
-  - `LANES_REF` is `9c6c3d04c` (published on `jayleaton/TensorFold` `flashnext-mia-lanes`): that call gate, a
-    thinking-budget fix, and a digit stop. On this model the stop keeps a big inline value from being extended by
+  - The lane engine is upstream TensorFold `f212eeabd` plus `lanes/` (76 patches; the same tree as `9c6c3d04c`):
+    that call gate, a thinking-budget fix, and a digit stop. On this model the stop keeps a big inline value from being extended by
     thousands of invented digits. `TF_RUNNER_INLINE_MARK=1` (` @engine` after each owned value, now
     the default) also stopped the model overriding a right value (README "Compute lanes", "Long inline values").
   - The default (`ENGINE=patches`), its image and its hash are unchanged.

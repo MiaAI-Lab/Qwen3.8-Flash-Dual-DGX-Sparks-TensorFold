@@ -101,8 +101,9 @@ prebuilt_image() {
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-fn-tf}"           # the same name on both Sparks
 
 # Compute lanes, opt-in (README "Compute lanes"). ENGINE=patches (the default) serves the image above, unchanged.
-# ENGINE=lanes serves the lane image: the image above with tensorfold-native from the lane engine (LANES_REPO at
-# LANES_REF, which serves this recipe's engine as TF_FLASHNEXT_ENGINE=mia) and the in-model runner's files
+# ENGINE=lanes serves the lane image: the image above with tensorfold-native from the lane engine (upstream TensorFold,
+# LANES_REPO at LANES_REF, plus the patches in lanes/; it serves this recipe's engine as TF_FLASHNEXT_ENGINE=mia) and
+# the in-model runner's files
 # (scripts/lanes.sh). Text only (VISION=0). The model can then run exact computation while it thinks: a Python cell,
 # or an inline `<expr> =`, is run by the engine and its result goes back into the reasoning.
 ENGINE="${ENGINE:-patches}"
@@ -110,8 +111,10 @@ case "$ENGINE" in
   patches|lanes) ;;
   *) printf '[%s] ERROR: ENGINE is patches or lanes, not %s\n' "$(basename "$0")" "$ENGINE" >&2; exit 1 ;;
 esac
-LANES_REPO="${LANES_REPO:-https://github.com/jayleaton/TensorFold.git}"
-LANES_REF="${LANES_REF:-9c6c3d04ce34243d8ae86754a03d6c02d74fc17e}"   # the lane engine's commit (40 hex digits)
+LANES_REPO="${LANES_REPO:-https://github.com/ashhart/TensorFold.git}"   # upstream TensorFold, unmodified
+LANES_REF="${LANES_REF:-f212eeabde0fc2ac3234ca947a69cc7714abaca2}"   # the commit lanes/ applies to (40 hex digits)
+# the tree lanes/series pins: the patched lane engine's tree, checked at build time
+LANES_TREE=$(awk '$1 == "tree" {print $2}' "$_cfg_root/lanes/series" 2>/dev/null)
 # the runner's circuit and graph bank: one archive at its sha256 (the engine's packaging/runner/assets.release)
 RUNNER_ASSETS_URL="${RUNNER_ASSETS_URL:-https://github.com/jayleaton/deepseek-v41-tensorfold-spark/releases/download/runner-assets-20261107/runner-assets-20261107.tar.gz}"
 RUNNER_ASSETS_SHA256="${RUNNER_ASSETS_SHA256:-b5c40d32bcab0fa896795d08aaa651d55d0574e500f3624e61db23058cdd800f}"
@@ -119,7 +122,7 @@ RUNNER_ASSETS_SHA256="${RUNNER_ASSETS_SHA256:-b5c40d32bcab0fa896795d08aaa651d55d
 MIA_IMAGE="$IMAGE"            # the default image; the lane image is built on it
 _vision=1
 if [[ "$ENGINE" == lanes ]]; then
-  IMAGE="${LANES_IMAGE:-tensorfold-qwen38fn-lanes:${TF_TAG}-${LANES_REF:0:9}}"
+  IMAGE="${LANES_IMAGE:-tensorfold-qwen38fn-lanes:${TF_TAG}-${LANES_TREE:0:9}}"
   _vision=0
   # the engine: this recipe's Flash Next engine (patches 0001-0012, ported), not upstream's
   export TF_FLASHNEXT_ENGINE="${TF_FLASHNEXT_ENGINE:-mia}"

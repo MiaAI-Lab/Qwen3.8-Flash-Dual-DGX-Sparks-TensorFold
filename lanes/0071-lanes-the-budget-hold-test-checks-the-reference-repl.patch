@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:28:41 +0700
+Subject: [PATCH 71/79] lanes: the budget-hold test checks the reference reply
+ after the close is the model's own draws
+
+---
+ zig/src/core/lanes/budget_hold_test.zig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/zig/src/core/lanes/budget_hold_test.zig b/zig/src/core/lanes/budget_hold_test.zig
+index c485cdcc2..da90467e0 100644
+--- a/zig/src/core/lanes/budget_hold_test.zig
++++ b/zig/src/core/lanes/budget_hold_test.zig
+@@ -121,6 +121,7 @@ test "budget hold: a lane call right after the forced close lands its result who
+     const ref = try run(.{ .budget = budget, .max_new = 60 });
+     defer gpa.free(ref.tokens);
+     try std.testing.expectEqualSlices(u32, &close, ref.tokens[budget - 1 ..][0..close.len]);
++    try expectDecoded(&shared.p1, ref.tokens, budget - 1 + close.len); // after the close: the model's own draws
+     // an EOS the reply first draws after its close
+     var at: ?usize = null;
+     for (ref.tokens, 0..) |t, i| if (i >= budget - 1 + close.len and std.mem.indexOfScalar(u32, ref.tokens[0..i], t) == null and t != 96) {

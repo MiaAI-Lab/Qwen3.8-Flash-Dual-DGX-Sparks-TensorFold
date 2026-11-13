@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:43:59 +0700
+Subject: [PATCH 75/79] lanes: the budget-hold harness ends a reply's later
+ hold, as the server does with no result to give
+
+---
+ zig/src/core/lanes/budget_hold_test.zig | 21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/core/lanes/budget_hold_test.zig b/zig/src/core/lanes/budget_hold_test.zig
+index bdac2939a..a0a74f6b8 100644
+--- a/zig/src/core/lanes/budget_hold_test.zig
++++ b/zig/src/core/lanes/budget_hold_test.zig
+@@ -59,9 +59,9 @@ const Spec = struct {
+     resume_think: bool = true,
+ };
+ 
+-const Out = struct { tokens: []u32, held_at: ?usize, reason: sm.Reason };
++const Out = struct { tokens: []u32, held_at: ?usize, holds: usize, reason: sm.Reason };
+ 
+-/// One stream on the fake target, stepped until it finishes; a hold at its EOS resumes once with `result`.
++/// One stream on the fake target, stepped until it finishes: its first hold resumes with `result`, a later one ends.
+ fn run(spec: Spec) !Out {
+     var cfg = try shared.modelWith(spec.mtp);
+     defer cfg.deinit(gpa);
+@@ -75,17 +75,24 @@ fn run(spec: Spec) !Out {
+     defer s.deinit(gpa);
+     try engine.addStream(&s);
+     var held_at: ?usize = null;
++    var holds: usize = 0;
+     var steps: usize = 0;
+     while (!s.finished and steps < 600) : (steps += 1) {
+-        if (s.held and held_at == null) {
+-            held_at = s.emitted().len - 1;
+-            const result = resultWith(spec.eos);
+-            try std.testing.expectEqual(hold.Outcome.resumed, try hold.resumeHeld(&s, gpa, &result, spec.resume_think));
++        if (s.held) {
++            holds += 1;
++            if (held_at == null) {
++                held_at = s.emitted().len - 1;
++                const result = resultWith(spec.eos);
++                try std.testing.expectEqual(hold.Outcome.resumed, try hold.resumeHeld(&s, gpa, &result, spec.resume_think));
++            } else {
++                try std.testing.expectEqual(hold.Outcome.ended, try hold.resumeHeld(&s, gpa, &.{}, false));
++                break;
++            }
+         }
+         try engine.step();
+     }
+     try std.testing.expect(s.finished);
+-    return .{ .tokens = try gpa.dupe(u32, s.emitted()), .held_at = held_at, .reason = s.reason };
++    return .{ .tokens = try gpa.dupe(u32, s.emitted()), .held_at = held_at, .holds = holds, .reason = s.reason };
+ }
+ 
+ test "budget hold: a cut that would land inside a held result waits: every result row lands, then the close" {

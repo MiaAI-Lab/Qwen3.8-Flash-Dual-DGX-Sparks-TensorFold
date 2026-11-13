@@ -1,0 +1,2339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:31:34 +0700
+Subject: [PATCH 47/79] flashnext_mia: cuda_triton (launch) and cuda_prompt
+ (check, glue) split
+
+Pure code motion under 600 lines: declarations moved whole, moved methods aliased in their struct, pub where another file now calls them.
+---
+ .../families/flashnext_mia/cuda_prompt.zig    | 570 +-----------------
+ .../flashnext_mia/cuda_prompt_check.zig       | 379 ++++++++++++
+ .../flashnext_mia/cuda_prompt_glue.zig        | 205 +++++++
+ .../families/flashnext_mia/cuda_triton.zig    | 556 +----------------
+ .../flashnext_mia/cuda_triton_launch.zig      | 546 +++++++++++++++++
+ 5 files changed, 1153 insertions(+), 1103 deletions(-)
+ create mode 100644 zig/src/families/flashnext_mia/cuda_prompt_check.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda_prompt_glue.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda_triton_launch.zig
+
+diff --git a/zig/src/families/flashnext_mia/cuda_prompt.zig b/zig/src/families/flashnext_mia/cuda_prompt.zig
+index 6e9e1c2e9..92b95ee5a 100644
+--- a/zig/src/families/flashnext_mia/cuda_prompt.zig
++++ b/zig/src/families/flashnext_mia/cuda_prompt.zig
+@@ -4,6 +4,8 @@ const envs = @import("cuda_env.zig");
+ const cuda = @import("cuda");
+ const aot = cuda.aot;
+ const tri = @import("cuda_triton.zig");
++const mm_check = @import("cuda_prompt_check.zig");
++const glue = @import("cuda_prompt_glue.zig");
+ 
+ pub const env = "TF_FLASHNEXT_PROMPT_MM";
+ 
+@@ -83,242 +85,13 @@ pub fn reduce(t: tri.Tri, part: u64, out: u64, fp32: bool, total: usize, sk: usi
+     try run(t, "_reduce", .{ cdiv(total, 1024), 1, 1 }, &.{ aot.ptr("PART", f32p, part), aot.ptr("OUT", if (fp32) f32p else bf16, out), int("total", total) }, &.{ ci("SK", sk), ci("BLOCK", 1024), cb("F32", fp32) });
+ }
+ 
+-// -- the check: both paths on the same inputs, bytes compared --------------------------------------------------
+-
+-const Case = struct { n: usize, k: usize, fp32: bool, fp4: bool, tp: u32 };
+-
+-/// Every prompt matmul with split K at TP=1 and TP=2 (kernels.json's 128-row `_b16mm` / `_fp4mm` entries with SK > 1).
+-pub const cases = [_]Case{
+-    .{ .n = 324, .k = 10240, .fp32 = true, .fp4 = false, .tp = 3 }, // HC down + inject
+-    .{ .n = 320, .k = 10240, .fp32 = true, .fp4 = false, .tp = 3 }, // mixer down
+-    .{ .n = 2560, .k = 2560, .fp32 = false, .fp4 = false, .tp = 3 }, // PLE key/value, MTP fc_e / fc_h
+-    .{ .n = 2560, .k = 6144, .fp32 = false, .fp4 = false, .tp = 1 }, // TP=1 out_proj / o_proj
+-    .{ .n = 2560, .k = 3072, .fp32 = true, .fp4 = false, .tp = 2 }, // TP=2 out_proj / o_proj partials
+-    .{ .n = 8240, .k = 2560, .fp32 = false, .fp4 = false, .tp = 2 }, // TP=2 GDN in_proj
+-    .{ .n = 7296, .k = 2560, .fp32 = false, .fp4 = false, .tp = 2 }, // TP=2 attention proj
+-    .{ .n = 2560, .k = 640, .fp32 = false, .fp4 = true, .tp = 1 }, // TP=1 shared down
+-    .{ .n = 2560, .k = 640, .fp32 = true, .fp4 = true, .tp = 1 },
+-    .{ .n = 2560, .k = 320, .fp32 = false, .fp4 = true, .tp = 2 }, // TP=2 shared down
+-    .{ .n = 2560, .k = 320, .fp32 = true, .fp4 = true, .tp = 2 },
+-};
+-
+-const Fill = enum { normal, wide, cancel, edge, special, slices };
+-
+-fn bf16Bits(x: f32) u16 {
+-    const b: u32 = @bitCast(x);
+-    if (std.math.isNan(x)) return 0x7FC0;
+-    const r = b + 0x7FFF + ((b >> 16) & 1);
+-    return @intCast(r >> 16);
+-}
+-
+-/// A bf16 value for `fill` (`edge`: zeros of both signs, subnormals, the largest finite values, a few inf).
+-fn sample(r: std.Random, fill: Fill, i: usize) u16 {
+-    return switch (fill) {
+-        .normal => bf16Bits(r.floatNorm(f32)),
+-        .wide => blk: {
+-            // sign, exponent across 2^-30 .. 2^30, random mantissa: sums that round at every step
+-            const e: i32 = r.intRangeAtMost(i32, -30, 30);
+-            const m: f32 = 1.0 + r.float(f32);
+-            const v = std.math.ldexp(m, e);
+-            break :blk bf16Bits(if (r.boolean()) -v else v);
+-        },
+-        .cancel => blk: {
+-            // pairs +a, -a (a few bits off) so sums cancel and the low bits decide
+-            const a = std.math.ldexp(1.0 + r.float(f32), r.intRangeAtMost(i32, -4, 8));
+-            const off: f32 = if (r.uintLessThan(u32, 8) == 0) std.math.ldexp(@as(f32, 1.0), r.intRangeAtMost(i32, -12, -2)) else 0;
+-            break :blk bf16Bits(if (i % 2 == 0) a else -a + off);
+-        },
+-        // infinities, quiet and signaling NaNs with payloads, among normal values
+-        .special => switch (r.uintLessThan(u32, 64)) {
+-            0 => 0x7F80,
+-            1 => 0xFF80,
+-            2 => 0x7FC0 | @as(u16, r.intRangeAtMost(u16, 0, 0x3F)),
+-            3 => 0xFF81 + @as(u16, r.intRangeAtMost(u16, 0, 0x3E)),
+-            else => bf16Bits(r.floatNorm(f32)),
+-        },
+-        .slices => 0, // filled by slicesFill
+-        .edge => switch (r.uintLessThan(u32, 16)) {
+-            0 => 0x0000,
+-            1 => 0x8000,
+-            2 => @intCast(r.intRangeAtMost(u16, 1, 0x7F)), // subnormals
+-            3 => @as(u16, @intCast(r.intRangeAtMost(u16, 1, 0x7F))) | 0x8000,
+-            4 => 0x7F7F, // the largest finite
+-            5 => 0xFF7F,
+-            else => bf16Bits(r.floatNorm(f32) * 1e-3),
+-        },
+-    };
+-}
+-
+-fn fillBuf(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
+-    const h = try gpa.alloc(u16, count);
+-    defer gpa.free(h);
+-    for (h, 0..) |*v, i| v.* = sample(r, fill, i);
+-    try buf.upload(0, std.mem.sliceAsBytes(h));
+-}
+-
+-/// Directed slice totals: rows of 2^24, 1, -2^24 across K slices, so only slice-order fp32 association gives 0.
+-fn slicesFill(gpa: std.mem.Allocator, x: cuda.DeviceBuffer, w: cuda.DeviceBuffer, rows: usize, stride: usize, n: usize, k: usize, sk: usize, r: std.Random) !void {
+-    const hx = try gpa.alloc(u16, rows * stride);
+-    defer gpa.free(hx);
+-    @memset(hx, 0);
+-    const ks = k / sk;
+-    for (0..rows) |i| {
+-        const row = hx[i * stride ..][0..k];
+-        const a = (i * 7) % ks;
+-        const b = (i * 13 + 5) % ks;
+-        const c = (i * 29 + 11) % ks;
+-        row[a] = 0x4B80; // 2^24
+-        if (sk >= 3) {
+-            row[ks + b] = 0x3F80;
+-            row[2 * ks + c] = 0xCB80;
+-        } else {
+-            row[ks + b] = 0x3F80;
+-            row[ks + (b + 1 + c % (ks - 1)) % ks] = 0xCB80;
+-        }
+-        // inside one slice too: the same three values in one K block of the last slice
+-        const base = (sk - 1) * ks + (i % (ks / 64)) * 64;
+-        row[base + 2] = 0x4B80;
+-        row[base + 3] = 0x3F80;
+-        row[base + 4] = 0xCB80;
+-    }
+-    try x.upload(0, std.mem.sliceAsBytes(hx));
+-    const hw = try gpa.alloc(u16, n * k);
+-    defer gpa.free(hw);
+-    const vals = [_]u16{ 0x3F80, 0xBF80, 0x4000, 0x3F00 };
+-    for (0..n) |j| {
+-        const v = vals[r.uintLessThan(usize, vals.len)];
+-        @memset(hw[j * k ..][0..k], v);
+-    }
+-    try w.upload(0, std.mem.sliceAsBytes(hw));
+-}
+-
+-/// Both paths of every case at TP `tp` over `rows`, each input kind; true when every output byte is equal.
+-pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, tp: u32, rows: []const usize) !bool {
+-    var prng = std.Random.DefaultPrng.init(0x5eed_9f1);
+-    const r = prng.random();
+-    var all = true;
+-    var max_rows: usize = 0;
+-    for (rows) |m| max_rows = @max(max_rows, m);
+-    for (cases) |c| {
+-        if (c.tp & tp == 0) continue;
+-        const stride_extra: usize = 64;
+-        const xs_stride = c.k + stride_extra;
+-        const sk = if (c.fp4) tri.fp4SplitK(c.n, c.k) else tri.b16SplitK(c.n, c.k);
+-        var x = try cuda.DeviceBuffer.alloc(d, max_rows * xs_stride * 2);
+-        defer x.free();
+-        var w = try cuda.DeviceBuffer.alloc(d, c.n * c.k * 2);
+-        defer w.free();
+-        const es: usize = if (c.fp32) 4 else 2;
+-        var o1 = try cuda.DeviceBuffer.alloc(d, max_rows * c.n * es);
+-        defer o1.free();
+-        var o2 = try cuda.DeviceBuffer.alloc(d, max_rows * c.n * es);
+-        defer o2.free();
+-        var part = try cuda.DeviceBuffer.alloc(d, sk * max_rows * c.n * 4);
+-        defer part.free();
+-        var sc = try cuda.DeviceBuffer.alloc(d, (c.k / 16) * c.n * 4 + 256);
+-        defer sc.free();
+-        var s2 = try cuda.DeviceBuffer.alloc(d, c.n * 4 + 256);
+-        defer s2.free();
+-        try s2.fill32(@bitCast(@as(f32, 1.0)), t.s.handle);
+-        const h1 = try gpa.alloc(u8, max_rows * c.n * es);
+-        defer gpa.free(h1);
+-        const h2 = try gpa.alloc(u8, max_rows * c.n * es);
+-        defer gpa.free(h2);
+-        for ([_]Fill{ .normal, .wide, .cancel, .edge, .special, .slices }) |fill| {
+-            if (fill == .slices) {
+-                try slicesFill(gpa, x, w, max_rows, xs_stride, c.n, c.k, sk, r);
+-            } else {
+-                try fillBuf(gpa, x, max_rows * xs_stride, r, fill);
+-                // the other operand: random signs against `cancel`'s pairs, edge values against edge values
+-                try fillBuf(gpa, w, c.n * c.k, r, switch (fill) {
+-                    .cancel => .wide,
+-                    .special => .normal,
+-                    else => fill,
+-                });
+-            }
+-            if (c.fp4) {
+-                // the shared expert's scales are 1.0; other values check the scale step too
+-                const hs = try gpa.alloc(f32, (c.k / 16) * c.n);
+-                defer gpa.free(hs);
+-                for (hs) |*v| v.* = if (fill == .normal) 1.0 else std.math.ldexp(1.0 + r.float(f32), r.intRangeAtMost(i32, -3, 3));
+-                try sc.upload(0, std.mem.sliceAsBytes(hs));
+-            }
+-            for (rows) |m| {
+-                const strides = [_]usize{ c.k, xs_stride };
+-                for (strides) |stride| {
+-                    if (m * stride > max_rows * xs_stride) continue;
+-                    try o1.fill8(0xA5, t.s.handle);
+-                    try o2.fill8(0x5A, t.s.handle);
+-                    if (c.fp4) {
+-                        const fp: tri.Fp4 = .{ .weight = w.ptr, .scale = sc.ptr, .scale2 = s2.ptr };
+-                        try t.fp4mm(x.ptr, stride, fp, o1.ptr, c.fp32, part.ptr, m, c.n, c.k);
+-                        try fp4(t, x.ptr, stride, fp, o2.ptr, c.fp32, m, c.n, c.k);
+-                    } else {
+-                        try t.b16mm(x.ptr, stride, w.ptr, o1.ptr, c.fp32, part.ptr, m, c.n, c.k);
+-                        try b16(t, x.ptr, stride, w.ptr, o2.ptr, c.fp32, m, c.n, c.k);
+-                    }
+-                    try t.s.synchronize();
+-                    const bytes = m * c.n * es;
+-                    try o1.download(0, h1[0..bytes]);
+-                    try o2.download(0, h2[0..bytes]);
+-                    var differ: usize = 0;
+-                    var first: ?usize = null;
+-                    var i: usize = 0;
+-                    while (i < bytes) : (i += es) {
+-                        if (!std.mem.eql(u8, h1[i .. i + es], h2[i .. i + es])) {
+-                            differ += 1;
+-                            if (first == null) first = i / es;
+-                        }
+-                    }
+-                    const ok = differ == 0;
+-                    if (!ok) all = false;
+-                    std.debug.print("{s} {s} N {d} K {d} SK {d} {s} M {d} stride {d} {s}: {s}", .{ if (ok) "EQUAL" else "DIFFER", if (c.fp4) "_fp4mm_ks" else "_b16mm_ks", c.n, c.k, sk, if (c.fp32) "fp32" else "bf16", m, stride, @tagName(fill), if (ok) "" else "" });
+-                    if (first) |f0| std.debug.print("{d} of {d} values differ, first at row {d} col {d}", .{ differ, bytes / es, f0 / c.n, f0 % c.n });
+-                    std.debug.print("\n", .{});
+-                }
+-            }
+-        }
+-    }
+-    return all;
+-}
+-
+-/// Time `reps` launches of each path for one case (ms a call), the speed side of the check.
+-pub fn bench(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, c: Case, m: usize, reps: usize) !void {
+-    _ = gpa;
+-    const sk = if (c.fp4) tri.fp4SplitK(c.n, c.k) else tri.b16SplitK(c.n, c.k);
+-    var x = try cuda.DeviceBuffer.alloc(d, m * c.k * 2);
+-    defer x.free();
+-    try x.fill8(0x3c, t.s.handle);
+-    var w = try cuda.DeviceBuffer.alloc(d, c.n * c.k * 2);
+-    defer w.free();
+-    try w.fill8(0x3b, t.s.handle);
+-    var o = try cuda.DeviceBuffer.alloc(d, m * c.n * 4);
+-    defer o.free();
+-    var part = try cuda.DeviceBuffer.alloc(d, sk * m * c.n * 4);
+-    defer part.free();
+-    var sc = try cuda.DeviceBuffer.alloc(d, (c.k / 16) * c.n * 4 + 256);
+-    defer sc.free();
+-    try sc.fill32(@bitCast(@as(f32, 1.0)), t.s.handle);
+-    const fp: tri.Fp4 = .{ .weight = w.ptr, .scale = sc.ptr, .scale2 = sc.ptr };
+-    var e0 = try cuda.Event.init(d, true);
+-    defer e0.deinit();
+-    var e1 = try cuda.Event.init(d, true);
+-    defer e1.deinit();
+-    var e2 = try cuda.Event.init(d, true);
+-    defer e2.deinit();
+-    for (0..2) |_| {
+-        try e0.record(t.s);
+-        for (0..reps) |_| if (c.fp4) try t.fp4mm(x.ptr, c.k, fp, o.ptr, c.fp32, part.ptr, m, c.n, c.k) else try t.b16mm(x.ptr, c.k, w.ptr, o.ptr, c.fp32, part.ptr, m, c.n, c.k);
+-        try e1.record(t.s);
+-        for (0..reps) |_| if (c.fp4) try fp4(t, x.ptr, c.k, fp, o.ptr, c.fp32, m, c.n, c.k) else try b16(t, x.ptr, c.k, w.ptr, o.ptr, c.fp32, m, c.n, c.k);
+-        try e2.record(t.s);
+-        try e2.synchronize();
+-    }
+-    const a = try cuda.Event.elapsedMs(e0, e1) / @as(f32, @floatFromInt(reps));
+-    const b = try cuda.Event.elapsedMs(e1, e2) / @as(f32, @floatFromInt(reps));
+-    const flop = 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(c.n)) * @as(f64, @floatFromInt(c.k));
+-    std.debug.print("bench {s} N {d} K {d} SK {d} M {d}: split + _reduce {d:.3} ms ({d:.1} TFLOPS), in-program {d:.3} ms ({d:.1} TFLOPS), {d:.2}x\n", .{ if (c.fp4) "fp4" else "b16", c.n, c.k, sk, m, a, flop / a / 1e9, b, flop / b / 1e9, a / b });
+-}
++pub const cases = mm_check.cases;
++pub const check = mm_check.check;
++pub const bench = mm_check.bench;
++pub const qsaCheck = mm_check.qsaCheck;
++pub const qsaBench = mm_check.qsaBench;
++pub const glueCheck = glue.glueCheck;
++pub const wbNormCheck = glue.wbNormCheck;
+ 
+ // -- the indexer's scoring and selection of a prompt block, by rows ---------------------------------------------
+ 
+@@ -405,136 +178,6 @@ pub fn qsaSelectTiles(t: tri.Tri, pos0: u64, sc: tri.AttnScratch, rows: usize, g
+     try run(t, "_select_tiles", .{ rows, 1, 1 }, &lists, &.{ ci("RATIO", g.ratio), ci("TOP", g.budget / g.ratio), ci("IDW", g.idw), ci("TB", if (rows >= 64) 4096 else 8192) });
+ }
+ 
+-/// `qsa-check`: `_scores_rows` vs `_scores`, `_select_tiles` vs `_select` on random and tie-heavy keys; true if equal.
+-pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast: ?*const QsaScores) !bool {
+-    const capacity: usize = 262144 + 8;
+-    const g = tri.AttnGeometry.init(capacity, 2048, 4);
+-    const dims: tri.Dims = .{};
+-    const DI = dims.index_dim;
+-    const HI = dims.index_heads;
+-    const rows: usize = 256;
+-    var prng = std.Random.DefaultPrng.init(0x95a_0001);
+-    const r = prng.random();
+-    const hp = try gpa.alloc(u16, g.nb * DI);
+-    defer gpa.free(hp);
+-    const hq = try gpa.alloc(u16, rows * HI * DI);
+-    defer gpa.free(hq);
+-    var pooled = try cuda.DeviceBuffer.alloc(d, hp.len * 2);
+-    defer pooled.free();
+-    var iq = try cuda.DeviceBuffer.alloc(d, hq.len * 2);
+-    defer iq.free();
+-    var pos = try cuda.DeviceBuffer.alloc(d, 256);
+-    defer pos.free();
+-    var bufs: [2][4]cuda.DeviceBuffer = undefined;
+-    const sz = [4]usize{ rows * g.nb * 4, rows * g.idw * 4, rows * 4, rows * 4 };
+-    for (&bufs) |*set| for (set, sz) |*b, n| {
+-        b.* = try cuda.DeviceBuffer.alloc(d, n + 256);
+-    };
+-    defer for (&bufs) |*set| for (set) |*b| b.free();
+-    const host1 = try gpa.alloc(u8, sz[0]);
+-    defer gpa.free(host1);
+-    const host2 = try gpa.alloc(u8, sz[0]);
+-    defer gpa.free(host2);
+-    var all = true;
+-    // 16 B-aligned start positions: dense rows, register select, near and past the tiled switch (131,072 keys)
+-    const positions = [_]usize{ 1000, 2040, 20000, 70000, 129000, 131000, 200000, 261000 };
+-    for ([_]u8{ 0, 1, 2 }) |kind| {
+-        const ties = kind == 1;
+-        // kind 2: NaN, subnormal, -0 and inf codes among the keys and queries (Grok review P1-grok-1a #3)
+-        for (hp, 0..) |*v, i| v.* = if (ties) (if (i % 7 == 0) 0x3f80 else 0) else if (kind == 2) sample(r, .special, i) | (if (i % 97 == 3) @as(u16, 0x0001) else 0) else bf16Bits(r.floatNorm(f32));
+-        for (hq, 0..) |*v, i| v.* = if (kind == 2 and i % 89 == 5) @as(u16, if (i % 2 == 0) 0x8000 else 0x0003) else bf16Bits(r.floatNorm(f32));
+-        try pooled.upload(0, std.mem.sliceAsBytes(hp));
+-        try iq.upload(0, std.mem.sliceAsBytes(hq));
+-        for (positions) |p0| {
+-            const n = if (p0 + rows > capacity) capacity - p0 else rows;
+-            try pos.fill32(@intCast(p0), t.s.handle);
+-            const ends = p0 + n;
+-            var scs: [2]tri.AttnScratch = undefined;
+-            for (&scs, bufs) |*sc, set| {
+-                for (set) |b| try b.fill8(0xA7, t.s.handle);
+-                sc.* = .{ .po = 0, .pm = 0, .pl = 0, .ids = set[1].ptr, .nk = set[2].ptr, .sparse = set[3].ptr, .scores = set[0].ptr };
+-            }
+-            try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, scs[0], n, g, ends, dims);
+-            try qsaSelect(t, pos.ptr, scs[0], n, g, ends);
+-            for ([_]usize{ 8, 16, 0, 1, 2, 3 }) |rt| {
+-                try bufs[1][0].fill8(0xA7, t.s.handle);
+-                if (rt < 4) {
+-                    const q = fast orelse continue;
+-                    var qq = q.*;
+-                    qq.pick = rt;
+-                    try qq.run(t.s, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, ends);
+-                } else try qsaScoresRows(t, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, ends, dims, rt);
+-                try t.s.synchronize();
+-                try bufs[0][0].download(0, host1[0 .. n * g.nb * 4]);
+-                try bufs[1][0].download(0, host2[0 .. n * g.nb * 4]);
+-                const ok = std.mem.eql(u8, host1[0 .. n * g.nb * 4], host2[0 .. n * g.nb * 4]);
+-                if (!ok) all = false;
+-                std.debug.print("{s} {s} RT {d} position {d} rows {d}{s}: score bytes\n", .{ if (ok) "EQUAL" else "DIFFER", if (rt < 4) "fn_qsa_scores tile" else "_scores_rows", rt, p0, n, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
+-            }
+-            // the lists from the same scores by the tiled select
+-            try qsaSelectTiles(t, pos.ptr, scs[1], n, g);
+-            try t.s.synchronize();
+-            var ok = true;
+-            for (1..4) |k| {
+-                const bytes = if (k == 1) n * g.idw * 4 else n * 4;
+-                try bufs[0][k].download(0, host1[0..bytes]);
+-                try bufs[1][k].download(0, host2[0..bytes]);
+-                ok = ok and std.mem.eql(u8, host1[0..bytes], host2[0..bytes]);
+-            }
+-            if (!ok) all = false;
+-            std.debug.print("{s} _select_tiles = _select position {d} rows {d}{s}: key lists, lengths, flags\n", .{ if (ok) "EQUAL" else "DIFFER", p0, n, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
+-        }
+-    }
+-    return all;
+-}
+-
+-/// Scoring time of 256 rows: `_scores` against fn_qsa_scores at several key counts (keys are random).
+-pub fn qsaBench(d: *const cuda.Driver, t: tri.Tri, fast: *const QsaScores) !void {
+-    const capacity: usize = 1048576 + 8;
+-    const g = tri.AttnGeometry.init(capacity, 2048, 4);
+-    const dims: tri.Dims = .{};
+-    const rows: usize = 256;
+-    var pooled = try cuda.DeviceBuffer.alloc(d, g.nb * dims.index_dim * 2);
+-    defer pooled.free();
+-    try pooled.fill8(0x3c, t.s.handle);
+-    var iq = try cuda.DeviceBuffer.alloc(d, rows * dims.index_heads * dims.index_dim * 2);
+-    defer iq.free();
+-    try iq.fill8(0x3b, t.s.handle);
+-    var pos = try cuda.DeviceBuffer.alloc(d, 256);
+-    defer pos.free();
+-    var scores = try cuda.DeviceBuffer.alloc(d, rows * g.nb * 4);
+-    defer scores.free();
+-    const sc: tri.AttnScratch = .{ .po = 0, .pm = 0, .pl = 0, .ids = 0, .nk = 0, .sparse = 0, .scores = scores.ptr };
+-    var e0 = try cuda.Event.init(d, true);
+-    defer e0.deinit();
+-    var e1 = try cuda.Event.init(d, true);
+-    defer e1.deinit();
+-    var e2 = try cuda.Event.init(d, true);
+-    defer e2.deinit();
+-    for ([_]usize{ 32768, 131072, 524288, 1048000 }) |p0| {
+-        try pos.fill32(@intCast(p0), t.s.handle);
+-        const ends = p0 + rows;
+-        for (0..2) |_| {
+-            try e0.record(t.s);
+-            for (0..5) |_| try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, sc, rows, g, ends, dims);
+-            try e1.record(t.s);
+-            try e2.record(t.s);
+-            try e2.synchronize();
+-        }
+-        const a = try cuda.Event.elapsedMs(e0, e1) / 5;
+-        for (0..4) |pk| {
+-            var qq = fast.*;
+-            qq.pick = pk;
+-            try e1.record(t.s);
+-            for (0..5) |_| try qq.run(t.s, iq.ptr, pooled.ptr, pos.ptr, sc, rows, g, ends);
+-            try e2.record(t.s);
+-            try e2.synchronize();
+-            const b = try cuda.Event.elapsedMs(e1, e2) / 5;
+-            std.debug.print("bench scores {d} keys, 256 rows: _scores {d:.3} ms, fn_qsa_scores tile {d} {d:.3} ms ({d:.2}x)\n", .{ ends, a, pk, b, a / b });
+-        }
+-    }
+-}
+-
+ // -- the hyper-connection read-out's up projection and mix in one pass ---------------------------------------------
+ 
+ pub fn upMixAvailable(set: *const aot.Set) bool {
+@@ -550,198 +193,3 @@ pub fn wbNormAvailable(set: *const aot.Set) bool {
+ pub fn upMix(t: tri.Tri, act: u64, w: u64, normed: u64, mixed: u64, m: usize, d: usize, streams: usize, k: usize, bm: usize) !void {
+     try run(t, "_hc_up_mix", .{ cdiv(m, bm), d / 64, 1 }, &.{ aot.ptr("ACT", bf16, act), aot.ptr("W", bf16, w), aot.ptr("NORMED", bf16, normed), aot.ptr("MIXED", bf16, mixed), int("M", m) }, &.{ ci("D", d), ci("S", streams), ci("K", k), ci("BM", bm), ci("BD", 64), ci("BK", 64) });
+ }
+-
+-/// `glue-check`: `_hc_up_mix` against `_b16mm` + `_hc_mix` (mixed bytes) on random and edge inputs, timed.
+-pub fn glueCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
+-    const D: usize = 2560;
+-    const S: usize = 4;
+-    const K: usize = 320;
+-    const max_m: usize = 4096;
+-    var prng = std.Random.DefaultPrng.init(0x61_7e);
+-    const r = prng.random();
+-    var act = try cuda.DeviceBuffer.alloc(d, max_m * K * 2);
+-    defer act.free();
+-    var w = try cuda.DeviceBuffer.alloc(d, S * D * K * 2);
+-    defer w.free();
+-    var normed = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
+-    defer normed.free();
+-    var up = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
+-    defer up.free();
+-    var m1 = try cuda.DeviceBuffer.alloc(d, max_m * D * 2);
+-    defer m1.free();
+-    var m2 = try cuda.DeviceBuffer.alloc(d, max_m * D * 2);
+-    defer m2.free();
+-    var xs = try cuda.DeviceBuffer.alloc(d, max_m * (D / 32) * 4);
+-    defer xs.free();
+-    const h1 = try gpa.alloc(u8, max_m * D * 2);
+-    defer gpa.free(h1);
+-    const h2 = try gpa.alloc(u8, max_m * D * 2);
+-    defer gpa.free(h2);
+-    var all = true;
+-    for ([_]Fill{ .normal, .wide, .edge, .special }) |fill| {
+-        try fillBuf(gpa, act, max_m * K, r, if (fill == .wide) .normal else fill);
+-        try fillBuf(gpa, w, S * D * K, r, if (fill == .special) .normal else fill);
+-        try fillBuf(gpa, normed, max_m * S * D, r, if (fill == .special) .normal else fill);
+-        for ([_]usize{ 16, 17, 129, 1024, 2048, 4096 }) |m| {
+-            for ([_]usize{ 64, 32 }) |bm| {
+-                try m1.fill8(0xA5, t.s.handle);
+-                try m2.fill8(0x5A, t.s.handle);
+-                try t.b16mm(act.ptr, K, w.ptr, up.ptr, false, 0, m, S * D, K);
+-                try t.hcMix(up.ptr, normed.ptr, m1.ptr, xs.ptr, m, D, S);
+-                try upMix(t, act.ptr, w.ptr, normed.ptr, m2.ptr, m, D, S, K, bm);
+-                try t.s.synchronize();
+-                try m1.download(0, h1[0 .. m * D * 2]);
+-                try m2.download(0, h2[0 .. m * D * 2]);
+-                const ok = std.mem.eql(u8, h1[0 .. m * D * 2], h2[0 .. m * D * 2]);
+-                if (!ok) all = false;
+-                std.debug.print("{s} _hc_up_mix BM {d} rows {d} {s}: mixed bytes\n", .{ if (ok) "EQUAL" else "DIFFER", bm, m, @tagName(fill) });
+-            }
+-        }
+-    }
+-    // speed at 2048 rows
+-    var e0 = try cuda.Event.init(d, true);
+-    defer e0.deinit();
+-    var e1 = try cuda.Event.init(d, true);
+-    defer e1.deinit();
+-    var e2 = try cuda.Event.init(d, true);
+-    defer e2.deinit();
+-    for (0..2) |_| {
+-        try e0.record(t.s);
+-        for (0..10) |_| {
+-            try t.b16mm(act.ptr, K, w.ptr, up.ptr, false, 0, 2048, S * D, K);
+-            try t.hcMix(up.ptr, normed.ptr, m1.ptr, xs.ptr, 2048, D, S);
+-        }
+-        try e1.record(t.s);
+-        for (0..10) |_| try upMix(t, act.ptr, w.ptr, normed.ptr, m2.ptr, 2048, D, S, K, 64);
+-        try e2.record(t.s);
+-        try e2.synchronize();
+-    }
+-    const a = try cuda.Event.elapsedMs(e0, e1) / 10;
+-    const b = try cuda.Event.elapsedMs(e1, e2) / 10;
+-    std.debug.print("bench up+mix 2048 rows: _b16mm + _hc_mix {d:.3} ms, _hc_up_mix {d:.3} ms ({d:.2}x)\n", .{ a, b, a / b });
+-    return all;
+-}
+-
+-/// bf16 samples as the fp32 values they stand for (the fp32 branch inputs).
+-fn fillF32(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
+-    const h = try gpa.alloc(u32, count);
+-    defer gpa.free(h);
+-    for (h, 0..) |*v, i| v.* = @as(u32, sample(r, fill, i)) << 16;
+-    try buf.upload(0, std.mem.sliceAsBytes(h));
+-}
+-
+-/// `glue-check`'s second part: `_hc_wb_norm` against `_hc_writeback` + `_hc_normed`, bytes, every branch kind.
+-pub fn wbNormCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
+-    const D: usize = 2560;
+-    const S: usize = 4;
+-    const NC: usize = D / 256;
+-    const slots: usize = 11;
+-    const max_m: usize = 2048;
+-    const eps: f32 = 1e-6;
+-    var prng = std.Random.DefaultPrng.init(0x7b_0a);
+-    const r = prng.random();
+-    var h0 = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
+-    defer h0.free();
+-    var ha = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
+-    defer ha.free();
+-    var hb = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
+-    defer hb.free();
+-    var pa = try cuda.DeviceBuffer.alloc(d, max_m * NC * S * 4);
+-    defer pa.free();
+-    var pb = try cuda.DeviceBuffer.alloc(d, max_m * NC * S * 4);
+-    defer pb.free();
+-    var na = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
+-    defer na.free();
+-    var nb = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
+-    defer nb.free();
+-    var xs = try cuda.DeviceBuffer.alloc(d, max_m * S * D / 32 * 4);
+-    defer xs.free();
+-    var scale = try cuda.DeviceBuffer.alloc(d, S * D * 4);
+-    defer scale.free();
+-    var inj = try cuda.DeviceBuffer.alloc(d, max_m * S * 2);
+-    defer inj.free();
+-    var br16 = try cuda.DeviceBuffer.alloc(d, max_m * D * 2);
+-    defer br16.free();
+-    var yb = try cuda.DeviceBuffer.alloc(d, max_m * slots * D * 2);
+-    defer yb.free();
+-    var yf = try cuda.DeviceBuffer.alloc(d, max_m * slots * D * 4);
+-    defer yf.free();
+-    var wts = try cuda.DeviceBuffer.alloc(d, max_m * slots * 4);
+-    defer wts.free();
+-    var part = try cuda.DeviceBuffer.alloc(d, 2 * max_m * D * 4);
+-    defer part.free();
+-    const bytes = try gpa.alloc(u8, max_m * S * D * 2);
+-    defer gpa.free(bytes);
+-    const bytes2 = try gpa.alloc(u8, max_m * S * D * 2);
+-    defer gpa.free(bytes2);
+-    var all = true;
+-    for ([_]Fill{ .normal, .wide, .edge, .special }) |fill| {
+-        const calm: Fill = if (fill == .special) .normal else fill;
+-        try fillBuf(gpa, h0, max_m * S * D, r, fill);
+-        try fillF32(gpa, scale, S * D, r, if (fill == .wide) .normal else calm);
+-        try fillBuf(gpa, inj, max_m * S, r, calm);
+-        try fillBuf(gpa, br16, max_m * D, r, calm);
+-        try fillBuf(gpa, yb, max_m * slots * D, r, calm);
+-        try fillF32(gpa, yf, max_m * slots * D, r, calm);
+-        try fillF32(gpa, wts, max_m * slots, r, calm);
+-        try fillF32(gpa, part, 2 * max_m * D, r, calm);
+-        const kinds = [_]struct { name: []const u8, br: tri.Branch }{
+-            .{ .name = "none", .br = .none },
+-            .{ .name = "bf16", .br = .{ .bf16 = br16.ptr } },
+-            .{ .name = "moe bf16", .br = .{ .moe = .{ .y = yb.ptr, .y_f32 = false, .wts = wts.ptr, .slots = slots } } },
+-            .{ .name = "moe fp32", .br = .{ .moe = .{ .y = yf.ptr, .y_f32 = true, .wts = wts.ptr, .slots = slots } } },
+-            .{ .name = "ranks", .br = .{ .ranks = .{ .part = part.ptr, .world = 2 } } },
+-        };
+-        for ([_]usize{ 1, 16, 129, 1000, 2048 }) |m| {
+-            for (kinds) |kd| {
+-                const inject: ?u64 = if (kd.br == .none) null else inj.ptr;
+-                try ha.copyFrom(0, h0.ptr, m * S * D * 2, t.s.handle);
+-                try hb.copyFrom(0, h0.ptr, m * S * D * 2, t.s.handle);
+-                try pa.fill8(0xA5, t.s.handle);
+-                try pb.fill8(0x5A, t.s.handle);
+-                try na.fill8(0xA5, t.s.handle);
+-                try nb.fill8(0x5A, t.s.handle);
+-                try t.hcWriteback(ha.ptr, ha.ptr, pa.ptr, inject, kd.br, m, D, S);
+-                try t.hcNormed(ha.ptr, pa.ptr, scale.ptr, na.ptr, xs.ptr, m, D, S, eps);
+-                try t.hcWritebackNorm(hb.ptr, hb.ptr, pb.ptr, inject, kd.br, m, D, S, .{ .scale = scale.ptr, .normed = nb.ptr, .eps = eps });
+-                try t.s.synchronize();
+-                var ok = true;
+-                const parts = [_]struct { a: cuda.DeviceBuffer, b: cuda.DeviceBuffer, n: usize }{
+-                    .{ .a = ha, .b = hb, .n = m * S * D * 2 },
+-                    .{ .a = pa, .b = pb, .n = m * NC * S * 4 },
+-                    .{ .a = na, .b = nb, .n = m * S * D * 2 },
+-                };
+-                for (parts) |pt| {
+-                    try pt.a.download(0, bytes[0..pt.n]);
+-                    try pt.b.download(0, bytes2[0..pt.n]);
+-                    if (!std.mem.eql(u8, bytes[0..pt.n], bytes2[0..pt.n])) ok = false;
+-                }
+-                if (!ok) all = false;
+-                std.debug.print("{s} _hc_wb_norm {s} rows {d} {s}: streams, squared sums, normed bytes\n", .{ if (ok) "EQUAL" else "DIFFER", kd.name, m, @tagName(fill) });
+-            }
+-        }
+-    }
+-    // speed at 2048 rows (MoE bf16 branch)
+-    var e0 = try cuda.Event.init(d, true);
+-    defer e0.deinit();
+-    var e1 = try cuda.Event.init(d, true);
+-    defer e1.deinit();
+-    var e2 = try cuda.Event.init(d, true);
+-    defer e2.deinit();
+-    const moe: tri.Branch = .{ .moe = .{ .y = yb.ptr, .y_f32 = false, .wts = wts.ptr, .slots = slots } };
+-    for (0..2) |_| {
+-        try e0.record(t.s);
+-        for (0..10) |_| {
+-            try t.hcWriteback(ha.ptr, ha.ptr, pa.ptr, inj.ptr, moe, 2048, D, S);
+-            try t.hcNormed(ha.ptr, pa.ptr, scale.ptr, na.ptr, xs.ptr, 2048, D, S, eps);
+-        }
+-        try e1.record(t.s);
+-        for (0..10) |_| try t.hcWritebackNorm(hb.ptr, hb.ptr, pb.ptr, inj.ptr, moe, 2048, D, S, .{ .scale = scale.ptr, .normed = nb.ptr, .eps = eps });
+-        try e2.record(t.s);
+-        try e2.synchronize();
+-    }
+-    const a = try cuda.Event.elapsedMs(e0, e1) / 10;
+-    const b = try cuda.Event.elapsedMs(e1, e2) / 10;
+-    std.debug.print("bench write-back + norm 2048 rows (moe bf16): _hc_writeback + _hc_normed {d:.3} ms, _hc_wb_norm {d:.3} ms ({d:.2}x)\n", .{ a, b, a / b });
+-    return all;
+-}
+diff --git a/zig/src/families/flashnext_mia/cuda_prompt_check.zig b/zig/src/families/flashnext_mia/cuda_prompt_check.zig
+new file mode 100644
+index 000000000..c3558c1fc
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_prompt_check.zig
+@@ -0,0 +1,379 @@
++//! Prompt matmul and indexer checks: both paths on the same inputs, bytes compared, and their timings.
++const std = @import("std");
++const cuda = @import("cuda");
++const tri = @import("cuda_triton.zig");
++const prompt = @import("cuda_prompt.zig");
++const b16 = prompt.b16;
++const fp4 = prompt.fp4;
++const QsaScores = prompt.QsaScores;
++const qsaScores = prompt.qsaScores;
++const qsaSelect = prompt.qsaSelect;
++const qsaScoresRows = prompt.qsaScoresRows;
++const qsaSelectTiles = prompt.qsaSelectTiles;
++
++// -- the check: both paths on the same inputs, bytes compared --------------------------------------------------
++
++const Case = struct { n: usize, k: usize, fp32: bool, fp4: bool, tp: u32 };
++
++/// Every prompt matmul with split K at TP=1 and TP=2 (kernels.json's 128-row `_b16mm` / `_fp4mm` entries with SK > 1).
++pub const cases = [_]Case{
++    .{ .n = 324, .k = 10240, .fp32 = true, .fp4 = false, .tp = 3 }, // HC down + inject
++    .{ .n = 320, .k = 10240, .fp32 = true, .fp4 = false, .tp = 3 }, // mixer down
++    .{ .n = 2560, .k = 2560, .fp32 = false, .fp4 = false, .tp = 3 }, // PLE key/value, MTP fc_e / fc_h
++    .{ .n = 2560, .k = 6144, .fp32 = false, .fp4 = false, .tp = 1 }, // TP=1 out_proj / o_proj
++    .{ .n = 2560, .k = 3072, .fp32 = true, .fp4 = false, .tp = 2 }, // TP=2 out_proj / o_proj partials
++    .{ .n = 8240, .k = 2560, .fp32 = false, .fp4 = false, .tp = 2 }, // TP=2 GDN in_proj
++    .{ .n = 7296, .k = 2560, .fp32 = false, .fp4 = false, .tp = 2 }, // TP=2 attention proj
++    .{ .n = 2560, .k = 640, .fp32 = false, .fp4 = true, .tp = 1 }, // TP=1 shared down
++    .{ .n = 2560, .k = 640, .fp32 = true, .fp4 = true, .tp = 1 },
++    .{ .n = 2560, .k = 320, .fp32 = false, .fp4 = true, .tp = 2 }, // TP=2 shared down
++    .{ .n = 2560, .k = 320, .fp32 = true, .fp4 = true, .tp = 2 },
++};
++
++pub const Fill = enum { normal, wide, cancel, edge, special, slices };
++
++fn bf16Bits(x: f32) u16 {
++    const b: u32 = @bitCast(x);
++    if (std.math.isNan(x)) return 0x7FC0;
++    const r = b + 0x7FFF + ((b >> 16) & 1);
++    return @intCast(r >> 16);
++}
++
++/// A bf16 value for `fill` (`edge`: zeros of both signs, subnormals, the largest finite values, a few inf).
++pub fn sample(r: std.Random, fill: Fill, i: usize) u16 {
++    return switch (fill) {
++        .normal => bf16Bits(r.floatNorm(f32)),
++        .wide => blk: {
++            // sign, exponent across 2^-30 .. 2^30, random mantissa: sums that round at every step
++            const e: i32 = r.intRangeAtMost(i32, -30, 30);
++            const m: f32 = 1.0 + r.float(f32);
++            const v = std.math.ldexp(m, e);
++            break :blk bf16Bits(if (r.boolean()) -v else v);
++        },
++        .cancel => blk: {
++            // pairs +a, -a (a few bits off) so sums cancel and the low bits decide
++            const a = std.math.ldexp(1.0 + r.float(f32), r.intRangeAtMost(i32, -4, 8));
++            const off: f32 = if (r.uintLessThan(u32, 8) == 0) std.math.ldexp(@as(f32, 1.0), r.intRangeAtMost(i32, -12, -2)) else 0;
++            break :blk bf16Bits(if (i % 2 == 0) a else -a + off);
++        },
++        // infinities, quiet and signaling NaNs with payloads, among normal values
++        .special => switch (r.uintLessThan(u32, 64)) {
++            0 => 0x7F80,
++            1 => 0xFF80,
++            2 => 0x7FC0 | @as(u16, r.intRangeAtMost(u16, 0, 0x3F)),
++            3 => 0xFF81 + @as(u16, r.intRangeAtMost(u16, 0, 0x3E)),
++            else => bf16Bits(r.floatNorm(f32)),
++        },
++        .slices => 0, // filled by slicesFill
++        .edge => switch (r.uintLessThan(u32, 16)) {
++            0 => 0x0000,
++            1 => 0x8000,
++            2 => @intCast(r.intRangeAtMost(u16, 1, 0x7F)), // subnormals
++            3 => @as(u16, @intCast(r.intRangeAtMost(u16, 1, 0x7F))) | 0x8000,
++            4 => 0x7F7F, // the largest finite
++            5 => 0xFF7F,
++            else => bf16Bits(r.floatNorm(f32) * 1e-3),
++        },
++    };
++}
++
++pub fn fillBuf(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
++    const h = try gpa.alloc(u16, count);
++    defer gpa.free(h);
++    for (h, 0..) |*v, i| v.* = sample(r, fill, i);
++    try buf.upload(0, std.mem.sliceAsBytes(h));
++}
++
++/// Directed slice totals: rows of 2^24, 1, -2^24 across K slices, so only slice-order fp32 association gives 0.
++fn slicesFill(gpa: std.mem.Allocator, x: cuda.DeviceBuffer, w: cuda.DeviceBuffer, rows: usize, stride: usize, n: usize, k: usize, sk: usize, r: std.Random) !void {
++    const hx = try gpa.alloc(u16, rows * stride);
++    defer gpa.free(hx);
++    @memset(hx, 0);
++    const ks = k / sk;
++    for (0..rows) |i| {
++        const row = hx[i * stride ..][0..k];
++        const a = (i * 7) % ks;
++        const b = (i * 13 + 5) % ks;
++        const c = (i * 29 + 11) % ks;
++        row[a] = 0x4B80; // 2^24
++        if (sk >= 3) {
++            row[ks + b] = 0x3F80;
++            row[2 * ks + c] = 0xCB80;
++        } else {
++            row[ks + b] = 0x3F80;
++            row[ks + (b + 1 + c % (ks - 1)) % ks] = 0xCB80;
++        }
++        // inside one slice too: the same three values in one K block of the last slice
++        const base = (sk - 1) * ks + (i % (ks / 64)) * 64;
++        row[base + 2] = 0x4B80;
++        row[base + 3] = 0x3F80;
++        row[base + 4] = 0xCB80;
++    }
++    try x.upload(0, std.mem.sliceAsBytes(hx));
++    const hw = try gpa.alloc(u16, n * k);
++    defer gpa.free(hw);
++    const vals = [_]u16{ 0x3F80, 0xBF80, 0x4000, 0x3F00 };
++    for (0..n) |j| {
++        const v = vals[r.uintLessThan(usize, vals.len)];
++        @memset(hw[j * k ..][0..k], v);
++    }
++    try w.upload(0, std.mem.sliceAsBytes(hw));
++}
++
++/// Both paths of every case at TP `tp` over `rows`, each input kind; true when every output byte is equal.
++pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, tp: u32, rows: []const usize) !bool {
++    var prng = std.Random.DefaultPrng.init(0x5eed_9f1);
++    const r = prng.random();
++    var all = true;
++    var max_rows: usize = 0;
++    for (rows) |m| max_rows = @max(max_rows, m);
++    for (cases) |c| {
++        if (c.tp & tp == 0) continue;
++        const stride_extra: usize = 64;
++        const xs_stride = c.k + stride_extra;
++        const sk = if (c.fp4) tri.fp4SplitK(c.n, c.k) else tri.b16SplitK(c.n, c.k);
++        var x = try cuda.DeviceBuffer.alloc(d, max_rows * xs_stride * 2);
++        defer x.free();
++        var w = try cuda.DeviceBuffer.alloc(d, c.n * c.k * 2);
++        defer w.free();
++        const es: usize = if (c.fp32) 4 else 2;
++        var o1 = try cuda.DeviceBuffer.alloc(d, max_rows * c.n * es);
++        defer o1.free();
++        var o2 = try cuda.DeviceBuffer.alloc(d, max_rows * c.n * es);
++        defer o2.free();
++        var part = try cuda.DeviceBuffer.alloc(d, sk * max_rows * c.n * 4);
++        defer part.free();
++        var sc = try cuda.DeviceBuffer.alloc(d, (c.k / 16) * c.n * 4 + 256);
++        defer sc.free();
++        var s2 = try cuda.DeviceBuffer.alloc(d, c.n * 4 + 256);
++        defer s2.free();
++        try s2.fill32(@bitCast(@as(f32, 1.0)), t.s.handle);
++        const h1 = try gpa.alloc(u8, max_rows * c.n * es);
++        defer gpa.free(h1);
++        const h2 = try gpa.alloc(u8, max_rows * c.n * es);
++        defer gpa.free(h2);
++        for ([_]Fill{ .normal, .wide, .cancel, .edge, .special, .slices }) |fill| {
++            if (fill == .slices) {
++                try slicesFill(gpa, x, w, max_rows, xs_stride, c.n, c.k, sk, r);
++            } else {
++                try fillBuf(gpa, x, max_rows * xs_stride, r, fill);
++                // the other operand: random signs against `cancel`'s pairs, edge values against edge values
++                try fillBuf(gpa, w, c.n * c.k, r, switch (fill) {
++                    .cancel => .wide,
++                    .special => .normal,
++                    else => fill,
++                });
++            }
++            if (c.fp4) {
++                // the shared expert's scales are 1.0; other values check the scale step too
++                const hs = try gpa.alloc(f32, (c.k / 16) * c.n);
++                defer gpa.free(hs);
++                for (hs) |*v| v.* = if (fill == .normal) 1.0 else std.math.ldexp(1.0 + r.float(f32), r.intRangeAtMost(i32, -3, 3));
++                try sc.upload(0, std.mem.sliceAsBytes(hs));
++            }
++            for (rows) |m| {
++                const strides = [_]usize{ c.k, xs_stride };
++                for (strides) |stride| {
++                    if (m * stride > max_rows * xs_stride) continue;
++                    try o1.fill8(0xA5, t.s.handle);
++                    try o2.fill8(0x5A, t.s.handle);
++                    if (c.fp4) {
++                        const fp: tri.Fp4 = .{ .weight = w.ptr, .scale = sc.ptr, .scale2 = s2.ptr };
++                        try t.fp4mm(x.ptr, stride, fp, o1.ptr, c.fp32, part.ptr, m, c.n, c.k);
++                        try fp4(t, x.ptr, stride, fp, o2.ptr, c.fp32, m, c.n, c.k);
++                    } else {
++                        try t.b16mm(x.ptr, stride, w.ptr, o1.ptr, c.fp32, part.ptr, m, c.n, c.k);
++                        try b16(t, x.ptr, stride, w.ptr, o2.ptr, c.fp32, m, c.n, c.k);
++                    }
++                    try t.s.synchronize();
++                    const bytes = m * c.n * es;
++                    try o1.download(0, h1[0..bytes]);
++                    try o2.download(0, h2[0..bytes]);
++                    var differ: usize = 0;
++                    var first: ?usize = null;
++                    var i: usize = 0;
++                    while (i < bytes) : (i += es) {
++                        if (!std.mem.eql(u8, h1[i .. i + es], h2[i .. i + es])) {
++                            differ += 1;
++                            if (first == null) first = i / es;
++                        }
++                    }
++                    const ok = differ == 0;
++                    if (!ok) all = false;
++                    std.debug.print("{s} {s} N {d} K {d} SK {d} {s} M {d} stride {d} {s}: {s}", .{ if (ok) "EQUAL" else "DIFFER", if (c.fp4) "_fp4mm_ks" else "_b16mm_ks", c.n, c.k, sk, if (c.fp32) "fp32" else "bf16", m, stride, @tagName(fill), if (ok) "" else "" });
++                    if (first) |f0| std.debug.print("{d} of {d} values differ, first at row {d} col {d}", .{ differ, bytes / es, f0 / c.n, f0 % c.n });
++                    std.debug.print("\n", .{});
++                }
++            }
++        }
++    }
++    return all;
++}
++
++/// Time `reps` launches of each path for one case (ms a call), the speed side of the check.
++pub fn bench(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, c: Case, m: usize, reps: usize) !void {
++    _ = gpa;
++    const sk = if (c.fp4) tri.fp4SplitK(c.n, c.k) else tri.b16SplitK(c.n, c.k);
++    var x = try cuda.DeviceBuffer.alloc(d, m * c.k * 2);
++    defer x.free();
++    try x.fill8(0x3c, t.s.handle);
++    var w = try cuda.DeviceBuffer.alloc(d, c.n * c.k * 2);
++    defer w.free();
++    try w.fill8(0x3b, t.s.handle);
++    var o = try cuda.DeviceBuffer.alloc(d, m * c.n * 4);
++    defer o.free();
++    var part = try cuda.DeviceBuffer.alloc(d, sk * m * c.n * 4);
++    defer part.free();
++    var sc = try cuda.DeviceBuffer.alloc(d, (c.k / 16) * c.n * 4 + 256);
++    defer sc.free();
++    try sc.fill32(@bitCast(@as(f32, 1.0)), t.s.handle);
++    const fp: tri.Fp4 = .{ .weight = w.ptr, .scale = sc.ptr, .scale2 = sc.ptr };
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    var e2 = try cuda.Event.init(d, true);
++    defer e2.deinit();
++    for (0..2) |_| {
++        try e0.record(t.s);
++        for (0..reps) |_| if (c.fp4) try t.fp4mm(x.ptr, c.k, fp, o.ptr, c.fp32, part.ptr, m, c.n, c.k) else try t.b16mm(x.ptr, c.k, w.ptr, o.ptr, c.fp32, part.ptr, m, c.n, c.k);
++        try e1.record(t.s);
++        for (0..reps) |_| if (c.fp4) try fp4(t, x.ptr, c.k, fp, o.ptr, c.fp32, m, c.n, c.k) else try b16(t, x.ptr, c.k, w.ptr, o.ptr, c.fp32, m, c.n, c.k);
++        try e2.record(t.s);
++        try e2.synchronize();
++    }
++    const a = try cuda.Event.elapsedMs(e0, e1) / @as(f32, @floatFromInt(reps));
++    const b = try cuda.Event.elapsedMs(e1, e2) / @as(f32, @floatFromInt(reps));
++    const flop = 2.0 * @as(f64, @floatFromInt(m)) * @as(f64, @floatFromInt(c.n)) * @as(f64, @floatFromInt(c.k));
++    std.debug.print("bench {s} N {d} K {d} SK {d} M {d}: split + _reduce {d:.3} ms ({d:.1} TFLOPS), in-program {d:.3} ms ({d:.1} TFLOPS), {d:.2}x\n", .{ if (c.fp4) "fp4" else "b16", c.n, c.k, sk, m, a, flop / a / 1e9, b, flop / b / 1e9, a / b });
++}
++
++/// `qsa-check`: `_scores_rows` vs `_scores`, `_select_tiles` vs `_select` on random and tie-heavy keys; true if equal.
++pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast: ?*const QsaScores) !bool {
++    const capacity: usize = 262144 + 8;
++    const g = tri.AttnGeometry.init(capacity, 2048, 4);
++    const dims: tri.Dims = .{};
++    const DI = dims.index_dim;
++    const HI = dims.index_heads;
++    const rows: usize = 256;
++    var prng = std.Random.DefaultPrng.init(0x95a_0001);
++    const r = prng.random();
++    const hp = try gpa.alloc(u16, g.nb * DI);
++    defer gpa.free(hp);
++    const hq = try gpa.alloc(u16, rows * HI * DI);
++    defer gpa.free(hq);
++    var pooled = try cuda.DeviceBuffer.alloc(d, hp.len * 2);
++    defer pooled.free();
++    var iq = try cuda.DeviceBuffer.alloc(d, hq.len * 2);
++    defer iq.free();
++    var pos = try cuda.DeviceBuffer.alloc(d, 256);
++    defer pos.free();
++    var bufs: [2][4]cuda.DeviceBuffer = undefined;
++    const sz = [4]usize{ rows * g.nb * 4, rows * g.idw * 4, rows * 4, rows * 4 };
++    for (&bufs) |*set| for (set, sz) |*b, n| {
++        b.* = try cuda.DeviceBuffer.alloc(d, n + 256);
++    };
++    defer for (&bufs) |*set| for (set) |*b| b.free();
++    const host1 = try gpa.alloc(u8, sz[0]);
++    defer gpa.free(host1);
++    const host2 = try gpa.alloc(u8, sz[0]);
++    defer gpa.free(host2);
++    var all = true;
++    // 16 B-aligned start positions: dense rows, register select, near and past the tiled switch (131,072 keys)
++    const positions = [_]usize{ 1000, 2040, 20000, 70000, 129000, 131000, 200000, 261000 };
++    for ([_]u8{ 0, 1, 2 }) |kind| {
++        const ties = kind == 1;
++        // kind 2: NaN, subnormal, -0 and inf codes among the keys and queries (Grok review P1-grok-1a #3)
++        for (hp, 0..) |*v, i| v.* = if (ties) (if (i % 7 == 0) 0x3f80 else 0) else if (kind == 2) sample(r, .special, i) | (if (i % 97 == 3) @as(u16, 0x0001) else 0) else bf16Bits(r.floatNorm(f32));
++        for (hq, 0..) |*v, i| v.* = if (kind == 2 and i % 89 == 5) @as(u16, if (i % 2 == 0) 0x8000 else 0x0003) else bf16Bits(r.floatNorm(f32));
++        try pooled.upload(0, std.mem.sliceAsBytes(hp));
++        try iq.upload(0, std.mem.sliceAsBytes(hq));
++        for (positions) |p0| {
++            const n = if (p0 + rows > capacity) capacity - p0 else rows;
++            try pos.fill32(@intCast(p0), t.s.handle);
++            const ends = p0 + n;
++            var scs: [2]tri.AttnScratch = undefined;
++            for (&scs, bufs) |*sc, set| {
++                for (set) |b| try b.fill8(0xA7, t.s.handle);
++                sc.* = .{ .po = 0, .pm = 0, .pl = 0, .ids = set[1].ptr, .nk = set[2].ptr, .sparse = set[3].ptr, .scores = set[0].ptr };
++            }
++            try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, scs[0], n, g, ends, dims);
++            try qsaSelect(t, pos.ptr, scs[0], n, g, ends);
++            for ([_]usize{ 8, 16, 0, 1, 2, 3 }) |rt| {
++                try bufs[1][0].fill8(0xA7, t.s.handle);
++                if (rt < 4) {
++                    const q = fast orelse continue;
++                    var qq = q.*;
++                    qq.pick = rt;
++                    try qq.run(t.s, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, ends);
++                } else try qsaScoresRows(t, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, ends, dims, rt);
++                try t.s.synchronize();
++                try bufs[0][0].download(0, host1[0 .. n * g.nb * 4]);
++                try bufs[1][0].download(0, host2[0 .. n * g.nb * 4]);
++                const ok = std.mem.eql(u8, host1[0 .. n * g.nb * 4], host2[0 .. n * g.nb * 4]);
++                if (!ok) all = false;
++                std.debug.print("{s} {s} RT {d} position {d} rows {d}{s}: score bytes\n", .{ if (ok) "EQUAL" else "DIFFER", if (rt < 4) "fn_qsa_scores tile" else "_scores_rows", rt, p0, n, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
++            }
++            // the lists from the same scores by the tiled select
++            try qsaSelectTiles(t, pos.ptr, scs[1], n, g);
++            try t.s.synchronize();
++            var ok = true;
++            for (1..4) |k| {
++                const bytes = if (k == 1) n * g.idw * 4 else n * 4;
++                try bufs[0][k].download(0, host1[0..bytes]);
++                try bufs[1][k].download(0, host2[0..bytes]);
++                ok = ok and std.mem.eql(u8, host1[0..bytes], host2[0..bytes]);
++            }
++            if (!ok) all = false;
++            std.debug.print("{s} _select_tiles = _select position {d} rows {d}{s}: key lists, lengths, flags\n", .{ if (ok) "EQUAL" else "DIFFER", p0, n, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
++        }
++    }
++    return all;
++}
++
++/// Scoring time of 256 rows: `_scores` against fn_qsa_scores at several key counts (keys are random).
++pub fn qsaBench(d: *const cuda.Driver, t: tri.Tri, fast: *const QsaScores) !void {
++    const capacity: usize = 1048576 + 8;
++    const g = tri.AttnGeometry.init(capacity, 2048, 4);
++    const dims: tri.Dims = .{};
++    const rows: usize = 256;
++    var pooled = try cuda.DeviceBuffer.alloc(d, g.nb * dims.index_dim * 2);
++    defer pooled.free();
++    try pooled.fill8(0x3c, t.s.handle);
++    var iq = try cuda.DeviceBuffer.alloc(d, rows * dims.index_heads * dims.index_dim * 2);
++    defer iq.free();
++    try iq.fill8(0x3b, t.s.handle);
++    var pos = try cuda.DeviceBuffer.alloc(d, 256);
++    defer pos.free();
++    var scores = try cuda.DeviceBuffer.alloc(d, rows * g.nb * 4);
++    defer scores.free();
++    const sc: tri.AttnScratch = .{ .po = 0, .pm = 0, .pl = 0, .ids = 0, .nk = 0, .sparse = 0, .scores = scores.ptr };
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    var e2 = try cuda.Event.init(d, true);
++    defer e2.deinit();
++    for ([_]usize{ 32768, 131072, 524288, 1048000 }) |p0| {
++        try pos.fill32(@intCast(p0), t.s.handle);
++        const ends = p0 + rows;
++        for (0..2) |_| {
++            try e0.record(t.s);
++            for (0..5) |_| try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, sc, rows, g, ends, dims);
++            try e1.record(t.s);
++            try e2.record(t.s);
++            try e2.synchronize();
++        }
++        const a = try cuda.Event.elapsedMs(e0, e1) / 5;
++        for (0..4) |pk| {
++            var qq = fast.*;
++            qq.pick = pk;
++            try e1.record(t.s);
++            for (0..5) |_| try qq.run(t.s, iq.ptr, pooled.ptr, pos.ptr, sc, rows, g, ends);
++            try e2.record(t.s);
++            try e2.synchronize();
++            const b = try cuda.Event.elapsedMs(e1, e2) / 5;
++            std.debug.print("bench scores {d} keys, 256 rows: _scores {d:.3} ms, fn_qsa_scores tile {d} {d:.3} ms ({d:.2}x)\n", .{ ends, a, pk, b, a / b });
++        }
++    }
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_prompt_glue.zig b/zig/src/families/flashnext_mia/cuda_prompt_glue.zig
+new file mode 100644
+index 000000000..5438cea9a
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_prompt_glue.zig
+@@ -0,0 +1,205 @@
++//! glue-check: `_hc_up_mix` and `_hc_wb_norm` against the launches they fuse, bytes compared and timed.
++const std = @import("std");
++const cuda = @import("cuda");
++const tri = @import("cuda_triton.zig");
++const prompt = @import("cuda_prompt.zig");
++const samples = @import("cuda_prompt_check.zig");
++const upMix = prompt.upMix;
++const Fill = samples.Fill;
++const fillBuf = samples.fillBuf;
++const sample = samples.sample;
++
++/// `glue-check`: `_hc_up_mix` against `_b16mm` + `_hc_mix` (mixed bytes) on random and edge inputs, timed.
++pub fn glueCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
++    const D: usize = 2560;
++    const S: usize = 4;
++    const K: usize = 320;
++    const max_m: usize = 4096;
++    var prng = std.Random.DefaultPrng.init(0x61_7e);
++    const r = prng.random();
++    var act = try cuda.DeviceBuffer.alloc(d, max_m * K * 2);
++    defer act.free();
++    var w = try cuda.DeviceBuffer.alloc(d, S * D * K * 2);
++    defer w.free();
++    var normed = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
++    defer normed.free();
++    var up = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
++    defer up.free();
++    var m1 = try cuda.DeviceBuffer.alloc(d, max_m * D * 2);
++    defer m1.free();
++    var m2 = try cuda.DeviceBuffer.alloc(d, max_m * D * 2);
++    defer m2.free();
++    var xs = try cuda.DeviceBuffer.alloc(d, max_m * (D / 32) * 4);
++    defer xs.free();
++    const h1 = try gpa.alloc(u8, max_m * D * 2);
++    defer gpa.free(h1);
++    const h2 = try gpa.alloc(u8, max_m * D * 2);
++    defer gpa.free(h2);
++    var all = true;
++    for ([_]Fill{ .normal, .wide, .edge, .special }) |fill| {
++        try fillBuf(gpa, act, max_m * K, r, if (fill == .wide) .normal else fill);
++        try fillBuf(gpa, w, S * D * K, r, if (fill == .special) .normal else fill);
++        try fillBuf(gpa, normed, max_m * S * D, r, if (fill == .special) .normal else fill);
++        for ([_]usize{ 16, 17, 129, 1024, 2048, 4096 }) |m| {
++            for ([_]usize{ 64, 32 }) |bm| {
++                try m1.fill8(0xA5, t.s.handle);
++                try m2.fill8(0x5A, t.s.handle);
++                try t.b16mm(act.ptr, K, w.ptr, up.ptr, false, 0, m, S * D, K);
++                try t.hcMix(up.ptr, normed.ptr, m1.ptr, xs.ptr, m, D, S);
++                try upMix(t, act.ptr, w.ptr, normed.ptr, m2.ptr, m, D, S, K, bm);
++                try t.s.synchronize();
++                try m1.download(0, h1[0 .. m * D * 2]);
++                try m2.download(0, h2[0 .. m * D * 2]);
++                const ok = std.mem.eql(u8, h1[0 .. m * D * 2], h2[0 .. m * D * 2]);
++                if (!ok) all = false;
++                std.debug.print("{s} _hc_up_mix BM {d} rows {d} {s}: mixed bytes\n", .{ if (ok) "EQUAL" else "DIFFER", bm, m, @tagName(fill) });
++            }
++        }
++    }
++    // speed at 2048 rows
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    var e2 = try cuda.Event.init(d, true);
++    defer e2.deinit();
++    for (0..2) |_| {
++        try e0.record(t.s);
++        for (0..10) |_| {
++            try t.b16mm(act.ptr, K, w.ptr, up.ptr, false, 0, 2048, S * D, K);
++            try t.hcMix(up.ptr, normed.ptr, m1.ptr, xs.ptr, 2048, D, S);
++        }
++        try e1.record(t.s);
++        for (0..10) |_| try upMix(t, act.ptr, w.ptr, normed.ptr, m2.ptr, 2048, D, S, K, 64);
++        try e2.record(t.s);
++        try e2.synchronize();
++    }
++    const a = try cuda.Event.elapsedMs(e0, e1) / 10;
++    const b = try cuda.Event.elapsedMs(e1, e2) / 10;
++    std.debug.print("bench up+mix 2048 rows: _b16mm + _hc_mix {d:.3} ms, _hc_up_mix {d:.3} ms ({d:.2}x)\n", .{ a, b, a / b });
++    return all;
++}
++
++/// bf16 samples as the fp32 values they stand for (the fp32 branch inputs).
++fn fillF32(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
++    const h = try gpa.alloc(u32, count);
++    defer gpa.free(h);
++    for (h, 0..) |*v, i| v.* = @as(u32, sample(r, fill, i)) << 16;
++    try buf.upload(0, std.mem.sliceAsBytes(h));
++}
++
++/// `glue-check`'s second part: `_hc_wb_norm` against `_hc_writeback` + `_hc_normed`, bytes, every branch kind.
++pub fn wbNormCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri) !bool {
++    const D: usize = 2560;
++    const S: usize = 4;
++    const NC: usize = D / 256;
++    const slots: usize = 11;
++    const max_m: usize = 2048;
++    const eps: f32 = 1e-6;
++    var prng = std.Random.DefaultPrng.init(0x7b_0a);
++    const r = prng.random();
++    var h0 = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
++    defer h0.free();
++    var ha = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
++    defer ha.free();
++    var hb = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
++    defer hb.free();
++    var pa = try cuda.DeviceBuffer.alloc(d, max_m * NC * S * 4);
++    defer pa.free();
++    var pb = try cuda.DeviceBuffer.alloc(d, max_m * NC * S * 4);
++    defer pb.free();
++    var na = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
++    defer na.free();
++    var nb = try cuda.DeviceBuffer.alloc(d, max_m * S * D * 2);
++    defer nb.free();
++    var xs = try cuda.DeviceBuffer.alloc(d, max_m * S * D / 32 * 4);
++    defer xs.free();
++    var scale = try cuda.DeviceBuffer.alloc(d, S * D * 4);
++    defer scale.free();
++    var inj = try cuda.DeviceBuffer.alloc(d, max_m * S * 2);
++    defer inj.free();
++    var br16 = try cuda.DeviceBuffer.alloc(d, max_m * D * 2);
++    defer br16.free();
++    var yb = try cuda.DeviceBuffer.alloc(d, max_m * slots * D * 2);
++    defer yb.free();
++    var yf = try cuda.DeviceBuffer.alloc(d, max_m * slots * D * 4);
++    defer yf.free();
++    var wts = try cuda.DeviceBuffer.alloc(d, max_m * slots * 4);
++    defer wts.free();
++    var part = try cuda.DeviceBuffer.alloc(d, 2 * max_m * D * 4);
++    defer part.free();
++    const bytes = try gpa.alloc(u8, max_m * S * D * 2);
++    defer gpa.free(bytes);
++    const bytes2 = try gpa.alloc(u8, max_m * S * D * 2);
++    defer gpa.free(bytes2);
++    var all = true;
++    for ([_]Fill{ .normal, .wide, .edge, .special }) |fill| {
++        const calm: Fill = if (fill == .special) .normal else fill;
++        try fillBuf(gpa, h0, max_m * S * D, r, fill);
++        try fillF32(gpa, scale, S * D, r, if (fill == .wide) .normal else calm);
++        try fillBuf(gpa, inj, max_m * S, r, calm);
++        try fillBuf(gpa, br16, max_m * D, r, calm);
++        try fillBuf(gpa, yb, max_m * slots * D, r, calm);
++        try fillF32(gpa, yf, max_m * slots * D, r, calm);
++        try fillF32(gpa, wts, max_m * slots, r, calm);
++        try fillF32(gpa, part, 2 * max_m * D, r, calm);
++        const kinds = [_]struct { name: []const u8, br: tri.Branch }{
++            .{ .name = "none", .br = .none },
++            .{ .name = "bf16", .br = .{ .bf16 = br16.ptr } },
++            .{ .name = "moe bf16", .br = .{ .moe = .{ .y = yb.ptr, .y_f32 = false, .wts = wts.ptr, .slots = slots } } },
++            .{ .name = "moe fp32", .br = .{ .moe = .{ .y = yf.ptr, .y_f32 = true, .wts = wts.ptr, .slots = slots } } },
++            .{ .name = "ranks", .br = .{ .ranks = .{ .part = part.ptr, .world = 2 } } },
++        };
++        for ([_]usize{ 1, 16, 129, 1000, 2048 }) |m| {
++            for (kinds) |kd| {
++                const inject: ?u64 = if (kd.br == .none) null else inj.ptr;
++                try ha.copyFrom(0, h0.ptr, m * S * D * 2, t.s.handle);
++                try hb.copyFrom(0, h0.ptr, m * S * D * 2, t.s.handle);
++                try pa.fill8(0xA5, t.s.handle);
++                try pb.fill8(0x5A, t.s.handle);
++                try na.fill8(0xA5, t.s.handle);
++                try nb.fill8(0x5A, t.s.handle);
++                try t.hcWriteback(ha.ptr, ha.ptr, pa.ptr, inject, kd.br, m, D, S);
++                try t.hcNormed(ha.ptr, pa.ptr, scale.ptr, na.ptr, xs.ptr, m, D, S, eps);
++                try t.hcWritebackNorm(hb.ptr, hb.ptr, pb.ptr, inject, kd.br, m, D, S, .{ .scale = scale.ptr, .normed = nb.ptr, .eps = eps });
++                try t.s.synchronize();
++                var ok = true;
++                const parts = [_]struct { a: cuda.DeviceBuffer, b: cuda.DeviceBuffer, n: usize }{
++                    .{ .a = ha, .b = hb, .n = m * S * D * 2 },
++                    .{ .a = pa, .b = pb, .n = m * NC * S * 4 },
++                    .{ .a = na, .b = nb, .n = m * S * D * 2 },
++                };
++                for (parts) |pt| {
++                    try pt.a.download(0, bytes[0..pt.n]);
++                    try pt.b.download(0, bytes2[0..pt.n]);
++                    if (!std.mem.eql(u8, bytes[0..pt.n], bytes2[0..pt.n])) ok = false;
++                }
++                if (!ok) all = false;
++                std.debug.print("{s} _hc_wb_norm {s} rows {d} {s}: streams, squared sums, normed bytes\n", .{ if (ok) "EQUAL" else "DIFFER", kd.name, m, @tagName(fill) });
++            }
++        }
++    }
++    // speed at 2048 rows (MoE bf16 branch)
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    var e2 = try cuda.Event.init(d, true);
++    defer e2.deinit();
++    const moe: tri.Branch = .{ .moe = .{ .y = yb.ptr, .y_f32 = false, .wts = wts.ptr, .slots = slots } };
++    for (0..2) |_| {
++        try e0.record(t.s);
++        for (0..10) |_| {
++            try t.hcWriteback(ha.ptr, ha.ptr, pa.ptr, inj.ptr, moe, 2048, D, S);
++            try t.hcNormed(ha.ptr, pa.ptr, scale.ptr, na.ptr, xs.ptr, 2048, D, S, eps);
++        }
++        try e1.record(t.s);
++        for (0..10) |_| try t.hcWritebackNorm(hb.ptr, hb.ptr, pb.ptr, inj.ptr, moe, 2048, D, S, .{ .scale = scale.ptr, .normed = nb.ptr, .eps = eps });
++        try e2.record(t.s);
++        try e2.synchronize();
++    }
++    const a = try cuda.Event.elapsedMs(e0, e1) / 10;
++    const b = try cuda.Event.elapsedMs(e1, e2) / 10;
++    std.debug.print("bench write-back + norm 2048 rows (moe bf16): _hc_writeback + _hc_normed {d:.3} ms, _hc_wb_norm {d:.3} ms ({d:.2}x)\n", .{ a, b, a / b });
++    return all;
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_triton.zig b/zig/src/families/flashnext_mia/cuda_triton.zig
+index dca00e59d..6ef7f6f46 100644
+--- a/zig/src/families/flashnext_mia/cuda_triton.zig
++++ b/zig/src/families/flashnext_mia/cuda_triton.zig
+@@ -1,41 +1,20 @@
+ //! Triton kernels from captured cubins: one fn per qwen4_exp CUDA wrapper, same args and constexprs so find picks it.
+ 
+ const std = @import("std");
+-const cuda = @import("cuda");
+-const aot = cuda.aot;
+-
+-const p = aot.ptr;
+-
+-const bf16 = "*bf16";
+-const f32p = "*fp32";
+-const f16p = "*fp16";
+-const i32p = "*i32";
+-const fp8p = "*fp8e4nv"; // kv8.py FP8 cache rows (torch.float8_e4m3fn)
+-
+-fn int(name: []const u8, v: usize) aot.Arg {
+-    return aot.int(name, @intCast(v));
+-}
+-
+-fn ci(name: []const u8, v: usize) aot.Const {
+-    return aot.ci(name, @intCast(v));
+-}
+-
+-fn cb(name: []const u8, v: bool) aot.Const {
+-    return aot.ci(name, @intFromBool(v));
+-}
+-
+-fn u(x: usize) u32 {
+-    return @intCast(x);
+-}
+-
+-fn cdiv(a: usize, b: usize) usize {
+-    return (a + b - 1) / b;
+-}
+-
+-/// triton.next_power_of_2
+-pub fn pow2(n: usize) usize {
+-    return std.math.ceilPowerOfTwo(usize, @max(n, 1)) catch unreachable;
+-}
++const launch = @import("cuda_triton_launch.zig");
++pub const pow2 = launch.pow2;
++pub const Recorder = launch.Recorder;
++pub const Branch = launch.Branch;
++pub const AttnGeometry = launch.AttnGeometry;
++pub const AttnScratch = launch.AttnScratch;
++pub const Cache = launch.Cache;
++pub const Fp4 = launch.Fp4;
++pub const b16SplitK = launch.b16SplitK;
++pub const b16PartBytes = launch.b16PartBytes;
++pub const fp4SplitK = launch.fp4SplitK;
++pub const fp4PartBytes = launch.fp4PartBytes;
++pub const Memo = launch.Memo;
++pub const Tri = launch.Tri;
+ 
+ /// The checkpoint's dimensions a rank computes with (config.json's text_config; `rank(2)` halves what TP=2 splits).
+ pub const Dims = struct {
+@@ -87,513 +66,6 @@ pub const Dims = struct {
+     }
+ };
+ 
+-/// One launch as `aot.Set.run` takes it, copied (names and types are static strings) for the tests.
+-pub const Recorder = struct {
+-    launches: [64]Saved = undefined,
+-    n: usize = 0,
+-
+-    pub const Saved = struct {
+-        name: []const u8,
+-        grid: [3]u32,
+-        args: [24]aot.Arg = undefined,
+-        nargs: usize,
+-        consts: [16]aot.Const = undefined,
+-        nconsts: usize,
+-    };
+-
+-    fn add(r: *Recorder, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+-        if (r.n == r.launches.len) return error.TooManyLaunches;
+-        const s = &r.launches[r.n];
+-        s.* = .{ .name = name, .grid = grid, .nargs = args.len, .nconsts = consts.len };
+-        @memcpy(s.args[0..args.len], args);
+-        @memcpy(s.consts[0..consts.len], consts);
+-        r.n += 1;
+-    }
+-};
+-
+-/// What `_hc_writeback` adds to the streams before their read-out (glue.hc_writeback's `mode`).
+-pub const Branch = union(enum) {
+-    /// mode 0: no pending branch (the first layer); the streams' squared sums only
+-    none,
+-    /// mode 1: a block's bf16 output [R, D]
+-    bf16: u64,
+-    /// mode 2: the MoE's slots y [R, slots, D] (fp32 in the MTP head's buffers, bf16 in the main ones) and weights
+-    moe: struct { y: u64, y_f32: bool, wts: u64, slots: usize },
+-    /// mode 3: every rank's fp32 partials [world, R, D], summed rank 0 first (TP=2)
+-    ranks: struct { part: u64, world: usize },
+-    /// mode 4: a matmul's fp32 K slices [SK, R, D]
+-    slices: struct { part: u64, sk: usize },
+-};
+-
+-/// attention.AttnScratch's geometry for a buffer's capacity: partial chunks, the sparse key lists, the block scores.
+-pub const AttnGeometry = struct {
+-    nch: usize,
+-    qsa: bool,
+-    idw: usize,
+-    nb: usize,
+-    budget: usize,
+-    ratio: usize,
+-
+-    pub const chunk = 512;
+-    /// _select holds a row's block scores in registers up to this many
+-    pub const select_regs = 32768;
+-
+-    pub fn init(capacity: usize, budget: usize, ratio: usize) AttnGeometry {
+-        return .{ .nch = cdiv(@min(capacity, budget + ratio - 1), chunk), .qsa = capacity > budget, .idw = budget + ratio, .nb = cdiv(capacity, ratio), .budget = budget, .ratio = ratio };
+-    }
+-
+-    /// The chunks a launch covers for `context` keys (null: the whole scratch), as attention.attention bounds them.
+-    pub fn chunks(g: AttnGeometry, context: ?usize) usize {
+-        var keys = context orelse g.nch * chunk;
+-        if (g.qsa) keys = @min(keys, (g.budget / g.ratio + 1) * g.ratio - 1);
+-        return @min(g.nch, cdiv(keys, chunk));
+-    }
+-
+-    /// qsa_rows' scored blocks for `context` keys.
+-    pub fn blocks(g: AttnGeometry, context: ?usize) usize {
+-        const c = context orelse return g.nb;
+-        return @min(g.nb, @max(1, cdiv(c, g.ratio)));
+-    }
+-};
+-
+-/// AttnScratch's device buffers: chunk partials, each row's key list, its length and whether it is sparse, scores.
+-pub const AttnScratch = struct { po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, scores: u64 };
+-
+-/// One layer's attention caches: k/v (bf16, int8/int4 codes) and fp16 scales; `fp8` holds kv8.py rows, `bits` stays 0.
+-pub const Cache = struct {
+-    k: u64,
+-    v: u64,
+-    ks: u64,
+-    vs: u64,
+-    bits: usize = 0,
+-    fp8: bool = false,
+-
+-    fn codes(c: Cache) []const u8 {
+-        return switch (c.bits) {
+-            0 => bf16,
+-            8 => "*i8",
+-            else => "*u8",
+-        };
+-    }
+-};
+-
+-/// An NVFP4 matmul's table (nvfp4.FP4): bf16 patterns and fp32 scales, or the checkpoint's codes and e4m3 scales.
+-pub const Fp4 = struct { weight: u64, scale: u64, scale2: u64, codes: bool = false };
+-
+-/// bf16.split_k: K slices by the weight's shape alone, a power of two of whole 64-blocks.
+-pub fn b16SplitK(n: usize, k: usize) usize {
+-    const tiles = cdiv(n, 64);
+-    const blocks = k / 64;
+-    var sk: usize = 1;
+-    while (sk < 32 and tiles * sk < 160 and blocks % (sk * 2) == 0 and blocks / (sk * 2) >= 1) sk *= 2;
+-    return sk;
+-}
+-
+-/// The fp32 scratch bf16.matmul's split K needs for `m` rows (0 without a split).
+-pub fn b16PartBytes(m: usize, n: usize, k: usize) usize {
+-    const sk = b16SplitK(n, k);
+-    return if (sk > 1) sk * m * n * 4 else 0;
+-}
+-
+-/// nvfp4.split_for: the shapes tuned at up to 16 rows keep their K slices at every row count, else split_k.
+-pub fn fp4SplitK(n: usize, k: usize) usize {
+-    if (fp4Tuned(n, k)) |t| return t.sk;
+-    const tiles = cdiv(n, 64);
+-    const blocks = k / 16;
+-    var sk: usize = 1;
+-    while (sk < 32 and tiles * sk < 160 and blocks % (sk * 2) == 0 and blocks / (sk * 2) >= 4) sk *= 2;
+-    return sk;
+-}
+-
+-pub fn fp4PartBytes(m: usize, n: usize, k: usize) usize {
+-    const sk = fp4SplitK(n, k);
+-    return if (sk > 1) sk * m * n * 4 else 0;
+-}
+-
+-const Fp4Tuned = struct { sk: usize, gpi: usize };
+-
+-/// nvfp4.SHAPES16 (the warps and stages it also sets are not constexprs).
+-fn fp4Tuned(n: usize, k: usize) ?Fp4Tuned {
+-    if (k == 2560 and (n == 640 or n == 1280)) return .{ .sk = 1, .gpi = 4 };
+-    if (n == 2560 and k == 640) return .{ .sk = 8, .gpi = 2 };
+-    return null;
+-}
+-
+-/// nvfp4.bucket / moe._tile: 16 to 128 rows, then 128-row tiles.
+-fn bucket(m: usize) usize {
+-    for ([_]usize{ 16, 32, 64, 128 }) |b| if (m <= b) return b;
+-    return 128;
+-}
+-
+-/// nvfp4.gpi_for
+-fn gpiFor(per: usize, want: usize) usize {
+-    for ([_]usize{ want, 8, 4, 2, 1 }) |g| if (g <= want and per % g == 0) return g;
+-    return 1;
+-}
+-
+-/// Memo of `aot.Set.find`'s pick per (function, constexprs, specialization), so repeated launches skip the scan.
+-pub const Memo = struct {
+-    gpa: std.mem.Allocator,
+-    map: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+-
+-    pub fn deinit(m: *Memo) void {
+-        m.map.deinit(m.gpa);
+-    }
+-
+-    fn key(name: []const u8, args: []const aot.Arg, consts: []const aot.Const) u64 {
+-        var h = std.hash.Wyhash.init(0x7472693a);
+-        h.update(name);
+-        for (consts) |c| {
+-            h.update(&.{0xc0});
+-            h.update(c.name);
+-            if (c.int) |x| h.update(std.mem.asBytes(&x));
+-            if (c.f32) |x| h.update(std.mem.asBytes(&@as(u32, @bitCast(x))));
+-            h.update(&.{ @intFromBool(c.int != null), @intFromBool(c.f32 != null) });
+-        }
+-        for (args) |a| {
+-            h.update(&.{0xa0});
+-            h.update(a.name);
+-            switch (a.value) {
+-                .ptr => |x| {
+-                    h.update(x.ty);
+-                    h.update(&.{ 1, @intFromBool(x.addr % 16 == 0) });
+-                },
+-                .i32 => |x| h.update(&.{ 2, @intFromBool(x == 1), @intFromBool(@mod(x, 16) == 0) }),
+-                .f32 => h.update(&.{3}),
+-                .u64 => |x| h.update(&.{ 4, @intFromBool(x % 16 == 0) }),
+-            }
+-        }
+-        return h.final();
+-    }
+-};
+-
+-pub const Tri = struct {
+-    set: ?*const aot.Set,
+-    s: cuda.Stream = undefined,
+-    /// tests: record each launch instead of running it
+-    rec: ?*Recorder = null,
+-    /// the variants already picked (null: `find` every launch)
+-    memo: ?*Memo = null,
+-
+-    fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
+-        const g: [3]u32 = .{ u(grid[0]), u(grid[1]), u(grid[2]) };
+-        if (t.rec) |r| return r.add(name, g, args, consts);
+-        const set = t.set.?;
+-        const m = t.memo orelse return set.run(t.s, name, g, args, consts);
+-        const k = Memo.key(name, args, consts);
+-        const at = m.map.get(k) orelse blk: {
+-            const v = try set.find(name, args, consts);
+-            const i = (@intFromPtr(v) - @intFromPtr(set.variants.ptr)) / @sizeOf(@TypeOf(set.variants[0]));
+-            try m.map.put(m.gpa, k, i);
+-            break :blk i;
+-        };
+-        // aot.Set.run's launch: runtime arguments in the variant's order
+-        const v = &set.variants[at];
+-        var packed_args: cuda.launch.Args = .{};
+-        for (v.spec.params) |prm| {
+-            const a = for (args) |x| {
+-                if (std.mem.eql(u8, x.name, prm.name)) break x;
+-            } else return error.MissingTritonArgument;
+-            switch (a.value) {
+-                .ptr => |x| packed_args.add(x.addr),
+-                .i32 => |x| packed_args.add(x),
+-                .f32 => |x| packed_args.add(x),
+-                .u64 => |x| packed_args.add(x),
+-            }
+-        }
+-        try v.kernel.launchOn(.{ .x = g[0], .y = g[1], .z = g[2] }, t.s, &packed_args, .{}, &.{});
+-    }
+-
+-    // -- embedding, hyper-connections, norms ---------------------------------------------------------------
+-
+-    /// exl3_mm.embed: ids [R] int32 -> out [R, copies * d] bf16, the unquantized table's row in each stream.
+-    pub fn embed(t: Tri, ids: u64, table: u64, out: u64, rows: usize, d: usize, copies: usize) !void {
+-        try t.run("_embed", .{ rows, d / 256, 1 }, &.{ p("IDS", i32p, ids), p("T", bf16, table), p("OUT", bf16, out) }, &.{ ci("D", d), ci("S", copies), ci("BLOCK", 256) });
+-    }
+-
+-    /// glue.hc_writeback: branch into streams h [R, S*D], squared sums per 256 dims into pss; `inject` [R, S] gates.
+-    pub fn hcWriteback(t: Tri, h: u64, hout: u64, pss: u64, inject: ?u64, branch: Branch, rows: usize, d: usize, streams: usize) !void {
+-        return t.hcWritebackNorm(h, hout, pss, inject, branch, rows, d, streams, null);
+-    }
+-
+-    /// The scale (fp32 [S*D]), the normed rows [R, S*D] bf16 and eps of `_hc_wb_norm`.
+-    pub const NormOut = struct { scale: u64, normed: u64, eps: f32 };
+-
+-    /// hcWriteback plus, with `norm`, hcNormed's rows in one launch, a row a program (prompt_mm._hc_wb_norm).
+-    pub fn hcWritebackNorm(t: Tri, h: u64, hout: u64, pss: u64, inject: ?u64, branch: Branch, rows: usize, d: usize, streams: usize, norm: ?NormOut) !void {
+-        const block = 256;
+-        var br = p("BR", bf16, h);
+-        var y = p("Y", bf16, h);
+-        var wts = p("WTS", bf16, h);
+-        var mode: usize = 0;
+-        var top: usize = 1;
+-        var slots: usize = 1;
+-        var world: usize = 1;
+-        switch (branch) {
+-            .none => {},
+-            .bf16 => |b| {
+-                mode = 1;
+-                br = p("BR", bf16, b);
+-            },
+-            .moe => |m| {
+-                mode = 2;
+-                y = p("Y", if (m.y_f32) f32p else bf16, m.y);
+-                wts = p("WTS", f32p, m.wts);
+-                top = m.slots - 1;
+-                slots = m.slots;
+-            },
+-            .ranks => |r| {
+-                mode = 3;
+-                br = p("BR", f32p, r.part);
+-                world = r.world;
+-            },
+-            .slices => |s| {
+-                mode = 4;
+-                br = p("BR", f32p, s.part);
+-                world = s.sk;
+-            },
+-        }
+-        if (mode != 0 and inject == null) return error.MissingInject;
+-        const inj = p("INJ", bf16, inject orelse h);
+-        const consts = [_]aot.Const{ ci("D", d), ci("S", streams), ci("MODE", mode), ci("TOPK", top), ci("SLOTS", slots), ci("BLOCK", block), ci("WORLD", world) };
+-        if (norm) |nm| {
+-            try t.run("_hc_wb_norm", .{ rows, 1, 1 }, &.{ p("H", bf16, h), p("HOUT", bf16, hout), p("PSS", f32p, pss), br, inj, y, wts, int("RS", rows * d), p("SCALE", f32p, nm.scale), p("NORMED", bf16, nm.normed), aot.float("eps", nm.eps) }, &consts);
+-            return;
+-        }
+-        try t.run("_hc_writeback", .{ rows, d / block, 1 }, &.{ p("H", bf16, h), p("HOUT", bf16, hout), p("PSS", f32p, pss), br, inj, y, wts, int("RS", rows * d) }, &consts);
+-    }
+-
+-    /// glue.hc_normed: normed [R, S*D] = bf16(h * rinv_s * scale) and its 32-group sums xs, rinv from pss.
+-    pub fn hcNormed(t: Tri, h: u64, pss: u64, scale: u64, normed: u64, xs: u64, rows: usize, d: usize, streams: usize, eps: f32) !void {
+-        const block = 512;
+-        try t.run("_hc_normed", .{ rows, streams * d / block, 1 }, &.{ p("H", bf16, h), p("PSS", f32p, pss), p("SCALE", f32p, scale), p("NORMED", bf16, normed), p("XS", f32p, xs), aot.float("eps", eps) }, &.{ ci("D", d), ci("S", streams), ci("NC", d / 256), ci("BLOCK", block) });
+-    }
+-
+-    /// glue.hc_act: fp32 dn [R, ndn] -> act [R, low] bf16 (SiLU) and group sums; `inject` gates when ndn = low + S.
+-    pub fn hcAct(t: Tri, dn: u64, act: u64, xs: u64, inject: ?u64, rows: usize, ndn: usize, streams: usize, low: usize) !void {
+-        try t.run("_hc_act", .{ rows, 1, 1 }, &.{ p("DN", f32p, dn), p("ACT", bf16, act), p("XS", f32p, xs), p("INJ", bf16, inject orelse act) }, &.{ ci("S", streams), ci("LOW", low), ci("LOWP", pow2(low)), cb("HAS_INJ", inject != null), ci("NDN", ndn) });
+-    }
+-
+-    /// glue.hc_mix: mixed [R, D] = bf16(sum_s bf16(sigmoid(up_s) * normed_s) / S) and its group sums.
+-    pub fn hcMix(t: Tri, up: u64, normed: u64, mixed: u64, xs: u64, rows: usize, d: usize, streams: usize) !void {
+-        try t.run("_hc_mix", .{ rows, d / 256, 1 }, &.{ p("UP", bf16, up), p("NORMED", bf16, normed), p("MIXED", bf16, mixed), p("XS", f32p, xs) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 256) });
+-    }
+-
+-    /// glue.rmsnorm: each `group` run (null: whole row) normalized times fp32 w, bf16 out [R, d] and its 32-group sums.
+-    pub fn rmsnorm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, xs: u64, rows: usize, d: usize, group: ?usize, eps: f32) !void {
+-        const g = group orelse d;
+-        try t.run("_rmsnorm", .{ rows, d / g, 1 }, &.{ p("X", bf16, x), p("W", f32p, w), p("OUT", bf16, out), p("XS", f32p, xs), aot.float("eps", eps), int("x_stride", x_stride) }, &.{ ci("D", d), ci("G", g), ci("BLOCK", pow2(g)) });
+-    }
+-
+-    /// mtp.mtp_compute's input: out [R, S*D] = bf16(e + hs) per stream.
+-    pub fn addStreams(t: Tri, e: u64, hs: u64, out: u64, rows: usize, d: usize, streams: usize) !void {
+-        try t.run("_add_streams", .{ rows, d / 256, 1 }, &.{ p("E", bf16, e), p("HS", bf16, hs), p("OUT", bf16, out) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 256) });
+-    }
+-
+-    // -- attention -----------------------------------------------------------------------------------------
+-
+-    pub const Prep = struct { p: u64, pos0: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, cache: Cache, iq: u64, ikc: u64 };
+-
+-    /// Image/video rotary table (image_rows.attach): rows below `length` use the (t, h, w) table, later pos + delta.
+-    pub const Rope = struct { table: u64, delta: u64, length: usize };
+-
+-    /// The multimodal rotary sections' h and w counts (rope_parameters.mrope_section [11, 11, 10]).
+-    pub const rope_s1 = 11;
+-    pub const rope_s2 = 10;
+-
+-    /// glue.attn_prep on text positions (MODE 0): q, k, indexer heads normed and rotated, k/v stored at POS0 + r.
+-    pub fn attnPrep(t: Tri, a: Prep, rows: usize, d: Dims) !void {
+-        return t.attnPrepRope(a, rows, d, null);
+-    }
+-
+-    /// glue.attn_prep: text positions without `rope` (MODE 0), else the image prompt's table (MODE 2).
+-    pub fn attnPrepRope(t: Tri, a: Prep, rows: usize, d: Dims, rope: ?Rope) !void {
+-        const pw = d.attnWidth();
+-        const table = if (rope) |r| r.table else a.pos0;
+-        const delta = if (rope) |r| r.delta else a.pos0;
+-        const length: usize = if (rope) |r| r.length else 0;
+-        const mode: usize = if (rope != null) 2 else 0;
+-        if (a.cache.fp8) {
+-            // kv8._attn_prep8: _attn_prep's arithmetic, keys and values stored as FP8 rows with their scales
+-            try t.run("_attn_prep8", .{ rows, d.heads + d.kv_heads + d.index_heads + 1, 1 }, &.{ p("P", bf16, a.p), p("POS0", i32p, a.pos0), p("QW", f32p, a.qw), p("KW", f32p, a.kw), p("IW", f32p, a.iw), p("INV", f32p, a.inv), p("Q", bf16, a.q), p("KC", fp8p, a.cache.k), p("VC", fp8p, a.cache.v), p("KS", f32p, a.cache.k), p("IQ", bf16, a.iq), p("IKC", bf16, a.ikc), p("ROPE", i32p, table), p("DELTA", i32p, delta), int("length", length), aot.float("eps", d.eps) }, &.{ ci("PW", pw), ci("NQ", d.heads), ci("NKV", d.kv_heads), ci("HD", d.head_dim), ci("NI", d.index_heads), ci("IHD", d.index_dim), ci("HALF", d.rotary_half), ci("MODE", mode), ci("S1", rope_s1), ci("S2", rope_s2) });
+-            return;
+-        }
+-        try t.run("_attn_prep", .{ rows, d.heads + d.kv_heads + d.index_heads + 1, 1 }, &.{ p("P", bf16, a.p), p("POS0", i32p, a.pos0), p("QW", f32p, a.qw), p("KW", f32p, a.kw), p("IW", f32p, a.iw), p("INV", f32p, a.inv), p("Q", bf16, a.q), p("KC", a.cache.codes(), a.cache.k), p("VC", a.cache.codes(), a.cache.v), p("KS", f16p, a.cache.ks), p("VS", f16p, a.cache.vs), p("IQ", bf16, a.iq), p("IKC", bf16, a.ikc), p("ROPE", i32p, table), p("DELTA", i32p, delta), int("length", length), aot.float("eps", d.eps) }, &.{ ci("PW", pw), ci("NQ", d.heads), ci("NKV", d.kv_heads), ci("HD", d.head_dim), ci("NI", d.index_heads), ci("IHD", d.index_dim), ci("HALF", d.rotary_half), ci("BITS", a.cache.bits), ci("MODE", mode), ci("S1", rope_s1), ci("S2", rope_s2) });
+-    }
+-
+-    /// attention.attention: queries [R, H, D] over 512-key chunks merged in chunk order; `context` bounds chunks.
+-    pub fn attention(t: Tri, q: u64, cache: Cache, pos0: u64, sc: AttnScratch, out: u64, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
+-        const h = d.heads;
+-        const hk = d.kv_heads;
+-        const grp = h / hk;
+-        if (grp > 16) return error.TooManyQueryHeads;
+-        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d.head_dim), -0.5));
+-        const ty = cache.codes();
+-        if (cache.fp8) {
+-            // kv8._chunks8: the codes to bf16, each key's s_k on its dots and s_v on its probabilities
+-            try t.run("_chunks8", .{ rows, hk, g.chunks(context) }, &.{ p("Q", bf16, q), p("KC", fp8p, cache.k), p("VC", fp8p, cache.v), p("KS", f32p, cache.k), p("POS0", i32p, pos0), p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), aot.cf("SCALE", scale), ci("IDW", g.idw), cb("QSA", g.qsa) });
+-        } else try t.run("_chunks", .{ rows, hk, g.chunks(context) }, &.{ p("Q", bf16, q), p("KC", ty, cache.k), p("VC", ty, cache.v), p("KSC", f16p, cache.ks), p("VSC", f16p, cache.vs), p("POS0", i32p, pos0), p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), aot.cf("SCALE", scale), ci("IDW", g.idw), cb("QSA", g.qsa), ci("BITS", cache.bits) });
+-        try t.run("_merge", .{ rows, hk, 1 }, &.{ p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("POS0", i32p, pos0), p("OUT", bf16, out), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), cb("QSA", g.qsa), ci("BITS", cache.bits) });
+-    }
+-
+-    /// attention.qsa_pool on text positions: complete RATIO-key blocks pooled, normed (k_layernorm) and rotated.
+-    pub fn qsaPool(t: Tri, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, rows: usize, g: AttnGeometry, d: Dims) !void {
+-        return t.qsaPoolRope(ikc, pooled, pos0, w, inv, rows, g, d, null);
+-    }
+-
+-    /// attention.qsa_pool: text positions without `rope` (MODE 0), else the image prompt's table (MODE 2).
+-    pub fn qsaPoolRope(t: Tri, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, rows: usize, g: AttnGeometry, d: Dims, rope: ?Rope) !void {
+-        const grid: [3]usize = .{ rows / g.ratio + 2, 1, 1 };
+-        const consts = [_]aot.Const{ ci("DI", d.index_dim), ci("HALF", d.rotary_half), ci("RATIO", g.ratio), ci("MODE", if (rope != null) 2 else 0), ci("S1", rope_s1), ci("S2", rope_s2) };
+-        if (rope) |r| return t.run("_pool", grid, &.{ p("IKC", bf16, ikc), p("POOLED", bf16, pooled), p("POS0", i32p, pos0), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("R", rows), p("ROPE", i32p, r.table), p("DELTA", i32p, r.delta), int("length", r.length) }, &consts);
+-        try t.run("_pool", grid, &.{ p("IKC", bf16, ikc), p("POOLED", bf16, pooled), p("POS0", i32p, pos0), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("R", rows), int("length", 0) }, &consts);
+-    }
+-
+-    /// attention.qsa_rows: each sparse row's block scores, then its TOP blocks and tail into the scratch's key lists.
+-    pub fn qsaRows(t: Tri, iq: u64, pooled: u64, pos0: u64, sc: AttnScratch, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
+-        const top = g.budget / g.ratio;
+-        const blocks = g.blocks(context);
+-        try t.run("_scores", .{ rows, cdiv(blocks, 64), 1 }, &.{ p("IQ", bf16, iq), p("POOLED", bf16, pooled), p("POS0", i32p, pos0), p("SC", f32p, sc.scores), int("NB", g.nb) }, &.{ ci("HI", d.index_heads), ci("DI", d.index_dim), ci("RATIO", g.ratio), ci("TOP", top), ci("BB", 64) });
+-        const lists = [_]aot.Arg{ p("SC", f32p, sc.scores), p("POS0", i32p, pos0), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse), int("NB", g.nb) };
+-        const width = pow2(blocks);
+-        if (width <= AttnGeometry.select_regs) {
+-            try t.run("_select", .{ rows, 1, 1 }, &lists, &.{ ci("RATIO", g.ratio), ci("TOP", top), ci("IDW", g.idw), ci("BLOCK", width) });
+-        } else {
+-            try t.run("_select_tiles", .{ rows, 1, 1 }, &lists, &.{ ci("RATIO", g.ratio), ci("TOP", top), ci("IDW", g.idw), ci("TB", if (rows >= 64) 4096 else 8192) });
+-        }
+-    }
+-
+-    /// attention.qsa_select (a decode window): pool the blocks the window completes, then score and select.
+-    pub fn qsaSelect(t: Tri, iq: u64, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, sc: AttnScratch, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
+-        return t.qsaSelectRope(iq, ikc, pooled, pos0, w, inv, sc, rows, g, context, d, null);
+-    }
+-
+-    /// qsaSelect with an image prompt's rotary table (null: text).
+-    pub fn qsaSelectRope(t: Tri, iq: u64, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, sc: AttnScratch, rows: usize, g: AttnGeometry, context: ?usize, d: Dims, rope: ?Rope) !void {
+-        try t.qsaPoolRope(ikc, pooled, pos0, w, inv, rows, g, d, rope);
+-        try t.qsaRows(iq, pooled, pos0, sc, rows, g, context, d);
+-    }
+-
+-    // -- a shared round's attention in one launch a kernel (attn_multi.py) ------------------------------------
+-
+-    /// attn_multi.Step's tables: row position and stream, stream first position and count, a layer's [6][N] pointers.
+-    pub const Multi = struct { posr: u64, sid: u64, first: u64, counts: u64, n: usize };
+-
+-    /// Whether the kernel set holds attn_multi's kernels (aot/w6-ks1 and later).
+-    pub fn multiAvailable(set: *const aot.Set) bool {
+-        return set.smallestConst("_chunks_multi", "NCH", 0) != null and set.smallestConst("_prep_multi", "PW", 0) != null and
+-            set.smallestConst("_merge_multi", "NCH", 0) != null and set.smallestConst("_pool_multi", "DI", 0) != null;
+-    }
+-
+-    /// attn_multi._prep_multi: every row's attn_prep through its stream's caches (text positions, bf16 caches).
+-    pub fn prepMulti(t: Tri, m: Multi, cp: u64, pa: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, iq: u64, rows: usize, d: Dims) !void {
+-        try t.run("_prep_multi", .{ rows, d.heads + d.kv_heads + d.index_heads + 1, 1 }, &.{ p("P", bf16, pa), p("POSR", i32p, m.posr), p("SID", i32p, m.sid), p("CP", "*i64", cp), p("VP", "*i64", cp), p("QW", f32p, qw), p("KW", f32p, kw), p("IW", f32p, iw), p("INV", f32p, inv), p("Q", bf16, q), p("IQ", bf16, iq), aot.float("eps", d.eps), int("N", m.n) }, &.{ ci("PW", d.attnWidth()), ci("NQ", d.heads), ci("NKV", d.kv_heads), ci("HD", d.head_dim), ci("NI", d.index_heads), ci("IHD", d.index_dim), ci("HALF", d.rotary_half), ci("BITS", 0), cb("VISION", false), ci("S1", 11), ci("S2", 10) });
+-    }
+-
+-    /// attn_multi._pool_multi: each stream's RATIO-key blocks its rows complete, pooled (`most` the most rows).
+-    pub fn poolMulti(t: Tri, m: Multi, cp: u64, w: u64, inv: u64, most: usize, g: AttnGeometry, d: Dims) !void {
+-        try t.run("_pool_multi", .{ m.n, most / g.ratio + 2, 1 }, &.{ p("CP", "*i64", cp), p("VP", "*i64", cp), p("P0", i32p, m.first), p("RS", i32p, m.counts), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("N", m.n) }, &.{ ci("DI", d.index_dim), ci("HALF", d.rotary_half), ci("RATIO", g.ratio), cb("VISION", false), ci("S1", 11), ci("S2", 10) });
+-    }
+-
+-    /// attn_multi._chunks_multi + _merge_multi: every row over its stream's caches merged into out; `keys` the row max.
+-    pub fn attentionMulti(t: Tri, m: Multi, cp: u64, q: u64, sc: AttnScratch, out: u64, rows: usize, g: AttnGeometry, keys: usize, d: Dims) !void {
+-        const h = d.heads;
+-        const hk = d.kv_heads;
+-        const grp = h / hk;
+-        if (grp > 16) return error.TooManyQueryHeads;
+-        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d.head_dim), -0.5));
+-        const top = g.budget / g.ratio;
+-        try t.run("_chunks_multi", .{ rows, hk, g.chunks(keys) }, &.{ p("Q", bf16, q), p("CP", "*i64", cp), p("POSR", i32p, m.posr), p("SID", i32p, m.sid), p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), int("N", m.n) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), aot.cf("SCALE", scale), ci("IDW", g.idw), cb("QSA", g.qsa), ci("BITS", 0), ci("RATIO", g.ratio), ci("TOP", top) });
+-        try t.run("_merge_multi", .{ rows, hk, 1 }, &.{ p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("POSR", i32p, m.posr), p("OUT", bf16, out), p("NKR", i32p, sc.nk) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), cb("QSA", g.qsa), ci("BITS", 0), ci("RATIO", g.ratio), ci("TOP", top) });
+-    }
+-
+-    /// glue.attn_gate: out [R, H*D] = bf16(o * sigmoid(gate)), the gate from pa's [q | gate] pairs, and group sums.
+-    pub fn attnGate(t: Tri, o: u64, pa: u64, out: u64, xs: u64, rows: usize, d: Dims) !void {
+-        try t.run("_attn_gate", .{ rows, d.heads, 1 }, &.{ p("O", bf16, o), p("P", bf16, pa), p("OUT", bf16, out), p("XS", f32p, xs) }, &.{ ci("PW", d.attnWidth()), ci("NQ", d.heads), ci("HD", d.head_dim) });
+-    }
+-
+-    // -- the n-gram embedding (PLE) ------------------------------------------------------------------------
+-
+-    /// glue.ple_embed_bf16: gathered rows -> out [R, heads * dh] and group sums; `scale` 1.0 for the FP8 table (LUT).
+-    pub fn pleEmbedBf16(t: Tri, v: u64, out: u64, xs: u64, rows: usize, heads: usize, dh: usize, scale: f32) !void {
+-        try t.run("_ple_embed_bf16", .{ rows, heads, 1 }, &.{ p("V", bf16, v), p("OUT", bf16, out), p("XS", f32p, xs) }, &.{ ci("HEADS", heads), ci("DH", dh), aot.cf("SCALE", scale) });
+-    }
+-
+-    /// glue.ple_gate: each stream's gate from its normed key and query, gated values [R, S*D] and squared sums [R, S].
+-    pub fn pleGate(t: Tri, keys: u64, vals: u64, h: u64, norm_key: u64, norm_query: u64, gated: u64, pss: u64, rows: usize, d: usize, streams: usize, eps: f32) !void {
+-        try t.run("_ple_gate", .{ rows, 1, 1 }, &.{ p("KEYS", bf16, keys), p("VALS", bf16, vals), p("H", bf16, h), p("NK", f32p, norm_key), p("NQ", f32p, norm_query), p("GATED", bf16, gated), p("PSS", f32p, pss), aot.float("eps", eps) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 512) });
+-    }
+-
+-    /// glue.ple_conv (one stream): dilated conv over [tail; rows], SiLU, residual adds into hout, normed rows to nrow.
+-    pub fn pleConv(t: Tri, gated: u64, pss: u64, norm_conv: u64, tail: u64, conv_w: u64, h: u64, hout: u64, nrow: u64, rows: usize, d: usize, streams: usize, taps: usize, dilation: usize, eps: f32) !void {
+-        try t.run("_ple_conv", .{ rows, streams * d / 512, 1 }, &.{ p("GATED", bf16, gated), p("PSS", f32p, pss), p("NC", f32p, norm_conv), p("TAIL", bf16, tail), p("CW", bf16, conv_w), p("H", bf16, h), p("HOUT", bf16, hout), p("NROW", bf16, nrow), aot.float("eps", eps), int("R", rows) }, &.{ ci("D", d), ci("S", streams), ci("TAPS", taps), ci("DIL", dilation), ci("BLOCK", 512) });
+-    }
+-
+-    // -- matmuls -------------------------------------------------------------------------------------------
+-
+-    /// bf16.matmul: x [M, K] @ w [N, K].T -> out [M, N] (bf16 or fp32); K slices summed in order by `_reduce`.
+-    pub fn b16mm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
+-        if (k % 64 != 0) return error.KNotBlocked;
+-        const sk = b16SplitK(n, k);
+-        const bm: usize = if (m > 128) 128 else 16;
+-        const oty = if (fp32) f32p else bf16;
+-        const split = sk > 1;
+-        try t.run("_b16mm", .{ cdiv(m, bm), cdiv(n, 64), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("BLOCK_N", 64), ci("BK", 64), cb("F32", fp32) });
+-        if (split) try t.reduce(part, out, fp32, m * n, sk);
+-    }
+-
+-    /// bf16._reduce and nvfp4._reduce: `total` fp32 sums of `sk` slices in order, one rounding for bf16 out.
+-    fn reduce(t: Tri, part: u64, out: u64, fp32: bool, total: usize, sk: usize) !void {
+-        try t.run("_reduce", .{ cdiv(total, 1024), 1, 1 }, &.{ p("PART", f32p, part), p("OUT", if (fp32) f32p else bf16, out), int("total", total) }, &.{ ci("SK", sk), ci("BLOCK", 1024), cb("F32", fp32) });
+-    }
+-
+-    /// nvfp4.matmul at defaults (shared expert): x [M, K] bf16 @ fp.T -> out [M, N], K slices summed in order.
+-    pub fn fp4mm(t: Tri, x: u64, x_stride: usize, fp: Fp4, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
+-        if (n % 64 != 0) return error.NNotTiled;
+-        const bm = bucket(m);
+-        var want: usize = switch (bm) {
+-            16 => 4,
+-            32, 64 => 2,
+-            else => 1,
+-        };
+-        if (bm == 16) if (fp4Tuned(n, k)) |tuned| {
+-            want = tuned.gpi;
+-        };
+-        const sk = fp4SplitK(n, k);
+-        const gpi = gpiFor((k / 16) / sk, want);
+-        const oty = if (fp32) f32p else bf16;
+-        const split = sk > 1;
+-        try t.run("_fp4mm", .{ cdiv(m, bm), n / 64, sk }, &.{ p("X", bf16, x), p("W", if (fp.codes) "*u8" else "*u16", fp.weight), p("S", if (fp.codes) "*u8" else f32p, fp.scale), p("S2", f32p, fp.scale2), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("SBN", 64), ci("BLOCK_N", 64), ci("GPI", gpi), cb("F32", fp32), cb("PACKED", fp.codes) });
+-        if (split) try t.reduce(part, out, fp32, m * n, sk);
+-    }
+-
+-    // -- MoE -----------------------------------------------------------------------------------------------
+-
+-    /// moe.router: logits [M, E + 1] fp32 = x [M, D] . rows (the router's E rows, then the shared expert's gate).
+-    pub fn router(t: Tri, x: u64, x_stride: usize, rows_w: u64, out: u64, m: usize, d: usize, ne: usize) !void {
+-        const bm = bucket(m);
+-        const be: usize, const bk: usize = if (bm == 16) .{ 32, 256 } else .{ 64, 64 };
+-        try t.run("_router", .{ cdiv(m, bm), cdiv(ne, be), 1 }, &.{ p("X", bf16, x), p("W", bf16, rows_w), p("OUT", f32p, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("D", d), ci("NE", ne), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
+-    }
+-
+-    /// moe.select_rows: each row's top_k experts and weights, then the shared expert as slot top_k (pick, wts).
+-    pub fn topkRows(t: Tri, logits: u64, pick: u64, wts: u64, rows: usize, experts: usize, top_k: usize) !void {
+-        try t.run("_topk_rows", .{ rows, 1, 1 }, &.{ p("L", f32p, logits), p("PICK", i32p, pick), p("WTS", f32p, wts) }, &.{ ci("NE", experts), ci("NL", experts + 1), ci("TOPK", top_k), ci("SLOTS", top_k + 1), ci("BLOCK", pow2(experts + 1)), ci("SLOTP", pow2(top_k + 1)) });
+-    }
+-
+-    /// glue.moe_partial (TP=2): a rank's fp32 MoE share sum_k w_k y_k + w_s y_s [R, D], gathered for mode 3.
+-    pub fn moePartial(t: Tri, y: u64, y_f32: bool, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
+-        try t.run("_moe_partial", .{ rows, d / 256, 1 }, &.{ p("Y", if (y_f32) f32p else bf16, y), p("WTS", f32p, wts), p("OUT", f32p, out) }, &.{ ci("D", d), ci("TOPK", slots - 1), ci("SLOTS", slots), ci("BLOCK", 256) });
+-    }
+-
+-    // -- commit --------------------------------------------------------------------------------------------
+-
+-    /// forward.shift_windows: old [L, T, C] in place takes rows keep .. keep + T of [old; new rows].
+-    pub fn shiftWindows(t: Tri, old: u64, new: u64, keep: usize, old_l: usize, new_l: usize, new_row: usize, layers: usize, channels: usize, taps: usize) !void {
+-        try t.run("_shift_windows", .{ layers, cdiv(channels, 256), 1 }, &.{ p("OLD", bf16, old), p("NEW", bf16, new), int("keep", keep), int("OLD_L", old_l), int("NEW_L", new_l), int("NEW_ROW", new_row) }, &.{ ci("C", channels), ci("T", taps), ci("TP", pow2(taps)), ci("BLOCK", 256) });
+-    }
+-};
+-
+ // -- tests: the Python wrappers' own launches (fixtures_cuda_triton.json) -------------------------------------
+ 
+ const testing = std.testing;
+diff --git a/zig/src/families/flashnext_mia/cuda_triton_launch.zig b/zig/src/families/flashnext_mia/cuda_triton_launch.zig
+new file mode 100644
+index 000000000..53af913e1
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_triton_launch.zig
+@@ -0,0 +1,546 @@
++//! Triton launch bindings `Tri`: their argument types, split-K shapes, the launch recorder and the variant memo.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const aot = cuda.aot;
++const Dims = @import("cuda_triton.zig").Dims;
++
++const p = aot.ptr;
++
++const bf16 = "*bf16";
++const f32p = "*fp32";
++const f16p = "*fp16";
++const i32p = "*i32";
++const fp8p = "*fp8e4nv"; // kv8.py FP8 cache rows (torch.float8_e4m3fn)
++
++fn int(name: []const u8, v: usize) aot.Arg {
++    return aot.int(name, @intCast(v));
++}
++
++fn ci(name: []const u8, v: usize) aot.Const {
++    return aot.ci(name, @intCast(v));
++}
++
++fn cb(name: []const u8, v: bool) aot.Const {
++    return aot.ci(name, @intFromBool(v));
++}
++
++fn u(x: usize) u32 {
++    return @intCast(x);
++}
++
++fn cdiv(a: usize, b: usize) usize {
++    return (a + b - 1) / b;
++}
++
++/// triton.next_power_of_2
++pub fn pow2(n: usize) usize {
++    return std.math.ceilPowerOfTwo(usize, @max(n, 1)) catch unreachable;
++}
++
++/// One launch as `aot.Set.run` takes it, copied (names and types are static strings) for the tests.
++pub const Recorder = struct {
++    launches: [64]Saved = undefined,
++    n: usize = 0,
++
++    pub const Saved = struct {
++        name: []const u8,
++        grid: [3]u32,
++        args: [24]aot.Arg = undefined,
++        nargs: usize,
++        consts: [16]aot.Const = undefined,
++        nconsts: usize,
++    };
++
++    fn add(r: *Recorder, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
++        if (r.n == r.launches.len) return error.TooManyLaunches;
++        const s = &r.launches[r.n];
++        s.* = .{ .name = name, .grid = grid, .nargs = args.len, .nconsts = consts.len };
++        @memcpy(s.args[0..args.len], args);
++        @memcpy(s.consts[0..consts.len], consts);
++        r.n += 1;
++    }
++};
++
++/// What `_hc_writeback` adds to the streams before their read-out (glue.hc_writeback's `mode`).
++pub const Branch = union(enum) {
++    /// mode 0: no pending branch (the first layer); the streams' squared sums only
++    none,
++    /// mode 1: a block's bf16 output [R, D]
++    bf16: u64,
++    /// mode 2: the MoE's slots y [R, slots, D] (fp32 in the MTP head's buffers, bf16 in the main ones) and weights
++    moe: struct { y: u64, y_f32: bool, wts: u64, slots: usize },
++    /// mode 3: every rank's fp32 partials [world, R, D], summed rank 0 first (TP=2)
++    ranks: struct { part: u64, world: usize },
++    /// mode 4: a matmul's fp32 K slices [SK, R, D]
++    slices: struct { part: u64, sk: usize },
++};
++
++/// attention.AttnScratch's geometry for a buffer's capacity: partial chunks, the sparse key lists, the block scores.
++pub const AttnGeometry = struct {
++    nch: usize,
++    qsa: bool,
++    idw: usize,
++    nb: usize,
++    budget: usize,
++    ratio: usize,
++
++    pub const chunk = 512;
++    /// _select holds a row's block scores in registers up to this many
++    pub const select_regs = 32768;
++
++    pub fn init(capacity: usize, budget: usize, ratio: usize) AttnGeometry {
++        return .{ .nch = cdiv(@min(capacity, budget + ratio - 1), chunk), .qsa = capacity > budget, .idw = budget + ratio, .nb = cdiv(capacity, ratio), .budget = budget, .ratio = ratio };
++    }
++
++    /// The chunks a launch covers for `context` keys (null: the whole scratch), as attention.attention bounds them.
++    pub fn chunks(g: AttnGeometry, context: ?usize) usize {
++        var keys = context orelse g.nch * chunk;
++        if (g.qsa) keys = @min(keys, (g.budget / g.ratio + 1) * g.ratio - 1);
++        return @min(g.nch, cdiv(keys, chunk));
++    }
++
++    /// qsa_rows' scored blocks for `context` keys.
++    pub fn blocks(g: AttnGeometry, context: ?usize) usize {
++        const c = context orelse return g.nb;
++        return @min(g.nb, @max(1, cdiv(c, g.ratio)));
++    }
++};
++
++/// AttnScratch's device buffers: chunk partials, each row's key list, its length and whether it is sparse, scores.
++pub const AttnScratch = struct { po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, scores: u64 };
++
++/// One layer's attention caches: k/v (bf16, int8/int4 codes) and fp16 scales; `fp8` holds kv8.py rows, `bits` stays 0.
++pub const Cache = struct {
++    k: u64,
++    v: u64,
++    ks: u64,
++    vs: u64,
++    bits: usize = 0,
++    fp8: bool = false,
++
++    fn codes(c: Cache) []const u8 {
++        return switch (c.bits) {
++            0 => bf16,
++            8 => "*i8",
++            else => "*u8",
++        };
++    }
++};
++
++/// An NVFP4 matmul's table (nvfp4.FP4): bf16 patterns and fp32 scales, or the checkpoint's codes and e4m3 scales.
++pub const Fp4 = struct { weight: u64, scale: u64, scale2: u64, codes: bool = false };
++
++/// bf16.split_k: K slices by the weight's shape alone, a power of two of whole 64-blocks.
++pub fn b16SplitK(n: usize, k: usize) usize {
++    const tiles = cdiv(n, 64);
++    const blocks = k / 64;
++    var sk: usize = 1;
++    while (sk < 32 and tiles * sk < 160 and blocks % (sk * 2) == 0 and blocks / (sk * 2) >= 1) sk *= 2;
++    return sk;
++}
++
++/// The fp32 scratch bf16.matmul's split K needs for `m` rows (0 without a split).
++pub fn b16PartBytes(m: usize, n: usize, k: usize) usize {
++    const sk = b16SplitK(n, k);
++    return if (sk > 1) sk * m * n * 4 else 0;
++}
++
++/// nvfp4.split_for: the shapes tuned at up to 16 rows keep their K slices at every row count, else split_k.
++pub fn fp4SplitK(n: usize, k: usize) usize {
++    if (fp4Tuned(n, k)) |t| return t.sk;
++    const tiles = cdiv(n, 64);
++    const blocks = k / 16;
++    var sk: usize = 1;
++    while (sk < 32 and tiles * sk < 160 and blocks % (sk * 2) == 0 and blocks / (sk * 2) >= 4) sk *= 2;
++    return sk;
++}
++
++pub fn fp4PartBytes(m: usize, n: usize, k: usize) usize {
++    const sk = fp4SplitK(n, k);
++    return if (sk > 1) sk * m * n * 4 else 0;
++}
++
++const Fp4Tuned = struct { sk: usize, gpi: usize };
++
++/// nvfp4.SHAPES16 (the warps and stages it also sets are not constexprs).
++fn fp4Tuned(n: usize, k: usize) ?Fp4Tuned {
++    if (k == 2560 and (n == 640 or n == 1280)) return .{ .sk = 1, .gpi = 4 };
++    if (n == 2560 and k == 640) return .{ .sk = 8, .gpi = 2 };
++    return null;
++}
++
++/// nvfp4.bucket / moe._tile: 16 to 128 rows, then 128-row tiles.
++fn bucket(m: usize) usize {
++    for ([_]usize{ 16, 32, 64, 128 }) |b| if (m <= b) return b;
++    return 128;
++}
++
++/// nvfp4.gpi_for
++fn gpiFor(per: usize, want: usize) usize {
++    for ([_]usize{ want, 8, 4, 2, 1 }) |g| if (g <= want and per % g == 0) return g;
++    return 1;
++}
++
++/// Memo of `aot.Set.find`'s pick per (function, constexprs, specialization), so repeated launches skip the scan.
++pub const Memo = struct {
++    gpa: std.mem.Allocator,
++    map: std.AutoHashMapUnmanaged(u64, usize) = .empty,
++
++    pub fn deinit(m: *Memo) void {
++        m.map.deinit(m.gpa);
++    }
++
++    fn key(name: []const u8, args: []const aot.Arg, consts: []const aot.Const) u64 {
++        var h = std.hash.Wyhash.init(0x7472693a);
++        h.update(name);
++        for (consts) |c| {
++            h.update(&.{0xc0});
++            h.update(c.name);
++            if (c.int) |x| h.update(std.mem.asBytes(&x));
++            if (c.f32) |x| h.update(std.mem.asBytes(&@as(u32, @bitCast(x))));
++            h.update(&.{ @intFromBool(c.int != null), @intFromBool(c.f32 != null) });
++        }
++        for (args) |a| {
++            h.update(&.{0xa0});
++            h.update(a.name);
++            switch (a.value) {
++                .ptr => |x| {
++                    h.update(x.ty);
++                    h.update(&.{ 1, @intFromBool(x.addr % 16 == 0) });
++                },
++                .i32 => |x| h.update(&.{ 2, @intFromBool(x == 1), @intFromBool(@mod(x, 16) == 0) }),
++                .f32 => h.update(&.{3}),
++                .u64 => |x| h.update(&.{ 4, @intFromBool(x % 16 == 0) }),
++            }
++        }
++        return h.final();
++    }
++};
++
++pub const Tri = struct {
++    set: ?*const aot.Set,
++    s: cuda.Stream = undefined,
++    /// tests: record each launch instead of running it
++    rec: ?*Recorder = null,
++    /// the variants already picked (null: `find` every launch)
++    memo: ?*Memo = null,
++
++    fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
++        const g: [3]u32 = .{ u(grid[0]), u(grid[1]), u(grid[2]) };
++        if (t.rec) |r| return r.add(name, g, args, consts);
++        const set = t.set.?;
++        const m = t.memo orelse return set.run(t.s, name, g, args, consts);
++        const k = Memo.key(name, args, consts);
++        const at = m.map.get(k) orelse blk: {
++            const v = try set.find(name, args, consts);
++            const i = (@intFromPtr(v) - @intFromPtr(set.variants.ptr)) / @sizeOf(@TypeOf(set.variants[0]));
++            try m.map.put(m.gpa, k, i);
++            break :blk i;
++        };
++        // aot.Set.run's launch: runtime arguments in the variant's order
++        const v = &set.variants[at];
++        var packed_args: cuda.launch.Args = .{};
++        for (v.spec.params) |prm| {
++            const a = for (args) |x| {
++                if (std.mem.eql(u8, x.name, prm.name)) break x;
++            } else return error.MissingTritonArgument;
++            switch (a.value) {
++                .ptr => |x| packed_args.add(x.addr),
++                .i32 => |x| packed_args.add(x),
++                .f32 => |x| packed_args.add(x),
++                .u64 => |x| packed_args.add(x),
++            }
++        }
++        try v.kernel.launchOn(.{ .x = g[0], .y = g[1], .z = g[2] }, t.s, &packed_args, .{}, &.{});
++    }
++
++    // -- embedding, hyper-connections, norms ---------------------------------------------------------------
++
++    /// exl3_mm.embed: ids [R] int32 -> out [R, copies * d] bf16, the unquantized table's row in each stream.
++    pub fn embed(t: Tri, ids: u64, table: u64, out: u64, rows: usize, d: usize, copies: usize) !void {
++        try t.run("_embed", .{ rows, d / 256, 1 }, &.{ p("IDS", i32p, ids), p("T", bf16, table), p("OUT", bf16, out) }, &.{ ci("D", d), ci("S", copies), ci("BLOCK", 256) });
++    }
++
++    /// glue.hc_writeback: branch into streams h [R, S*D], squared sums per 256 dims into pss; `inject` [R, S] gates.
++    pub fn hcWriteback(t: Tri, h: u64, hout: u64, pss: u64, inject: ?u64, branch: Branch, rows: usize, d: usize, streams: usize) !void {
++        return t.hcWritebackNorm(h, hout, pss, inject, branch, rows, d, streams, null);
++    }
++
++    /// The scale (fp32 [S*D]), the normed rows [R, S*D] bf16 and eps of `_hc_wb_norm`.
++    pub const NormOut = struct { scale: u64, normed: u64, eps: f32 };
++
++    /// hcWriteback plus, with `norm`, hcNormed's rows in one launch, a row a program (prompt_mm._hc_wb_norm).
++    pub fn hcWritebackNorm(t: Tri, h: u64, hout: u64, pss: u64, inject: ?u64, branch: Branch, rows: usize, d: usize, streams: usize, norm: ?NormOut) !void {
++        const block = 256;
++        var br = p("BR", bf16, h);
++        var y = p("Y", bf16, h);
++        var wts = p("WTS", bf16, h);
++        var mode: usize = 0;
++        var top: usize = 1;
++        var slots: usize = 1;
++        var world: usize = 1;
++        switch (branch) {
++            .none => {},
++            .bf16 => |b| {
++                mode = 1;
++                br = p("BR", bf16, b);
++            },
++            .moe => |m| {
++                mode = 2;
++                y = p("Y", if (m.y_f32) f32p else bf16, m.y);
++                wts = p("WTS", f32p, m.wts);
++                top = m.slots - 1;
++                slots = m.slots;
++            },
++            .ranks => |r| {
++                mode = 3;
++                br = p("BR", f32p, r.part);
++                world = r.world;
++            },
++            .slices => |s| {
++                mode = 4;
++                br = p("BR", f32p, s.part);
++                world = s.sk;
++            },
++        }
++        if (mode != 0 and inject == null) return error.MissingInject;
++        const inj = p("INJ", bf16, inject orelse h);
++        const consts = [_]aot.Const{ ci("D", d), ci("S", streams), ci("MODE", mode), ci("TOPK", top), ci("SLOTS", slots), ci("BLOCK", block), ci("WORLD", world) };
++        if (norm) |nm| {
++            try t.run("_hc_wb_norm", .{ rows, 1, 1 }, &.{ p("H", bf16, h), p("HOUT", bf16, hout), p("PSS", f32p, pss), br, inj, y, wts, int("RS", rows * d), p("SCALE", f32p, nm.scale), p("NORMED", bf16, nm.normed), aot.float("eps", nm.eps) }, &consts);
++            return;
++        }
++        try t.run("_hc_writeback", .{ rows, d / block, 1 }, &.{ p("H", bf16, h), p("HOUT", bf16, hout), p("PSS", f32p, pss), br, inj, y, wts, int("RS", rows * d) }, &consts);
++    }
++
++    /// glue.hc_normed: normed [R, S*D] = bf16(h * rinv_s * scale) and its 32-group sums xs, rinv from pss.
++    pub fn hcNormed(t: Tri, h: u64, pss: u64, scale: u64, normed: u64, xs: u64, rows: usize, d: usize, streams: usize, eps: f32) !void {
++        const block = 512;
++        try t.run("_hc_normed", .{ rows, streams * d / block, 1 }, &.{ p("H", bf16, h), p("PSS", f32p, pss), p("SCALE", f32p, scale), p("NORMED", bf16, normed), p("XS", f32p, xs), aot.float("eps", eps) }, &.{ ci("D", d), ci("S", streams), ci("NC", d / 256), ci("BLOCK", block) });
++    }
++
++    /// glue.hc_act: fp32 dn [R, ndn] -> act [R, low] bf16 (SiLU) and group sums; `inject` gates when ndn = low + S.
++    pub fn hcAct(t: Tri, dn: u64, act: u64, xs: u64, inject: ?u64, rows: usize, ndn: usize, streams: usize, low: usize) !void {
++        try t.run("_hc_act", .{ rows, 1, 1 }, &.{ p("DN", f32p, dn), p("ACT", bf16, act), p("XS", f32p, xs), p("INJ", bf16, inject orelse act) }, &.{ ci("S", streams), ci("LOW", low), ci("LOWP", pow2(low)), cb("HAS_INJ", inject != null), ci("NDN", ndn) });
++    }
++
++    /// glue.hc_mix: mixed [R, D] = bf16(sum_s bf16(sigmoid(up_s) * normed_s) / S) and its group sums.
++    pub fn hcMix(t: Tri, up: u64, normed: u64, mixed: u64, xs: u64, rows: usize, d: usize, streams: usize) !void {
++        try t.run("_hc_mix", .{ rows, d / 256, 1 }, &.{ p("UP", bf16, up), p("NORMED", bf16, normed), p("MIXED", bf16, mixed), p("XS", f32p, xs) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 256) });
++    }
++
++    /// glue.rmsnorm: each `group` run (null: whole row) normalized times fp32 w, bf16 out [R, d] and its 32-group sums.
++    pub fn rmsnorm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, xs: u64, rows: usize, d: usize, group: ?usize, eps: f32) !void {
++        const g = group orelse d;
++        try t.run("_rmsnorm", .{ rows, d / g, 1 }, &.{ p("X", bf16, x), p("W", f32p, w), p("OUT", bf16, out), p("XS", f32p, xs), aot.float("eps", eps), int("x_stride", x_stride) }, &.{ ci("D", d), ci("G", g), ci("BLOCK", pow2(g)) });
++    }
++
++    /// mtp.mtp_compute's input: out [R, S*D] = bf16(e + hs) per stream.
++    pub fn addStreams(t: Tri, e: u64, hs: u64, out: u64, rows: usize, d: usize, streams: usize) !void {
++        try t.run("_add_streams", .{ rows, d / 256, 1 }, &.{ p("E", bf16, e), p("HS", bf16, hs), p("OUT", bf16, out) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 256) });
++    }
++
++    // -- attention -----------------------------------------------------------------------------------------
++
++    pub const Prep = struct { p: u64, pos0: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, cache: Cache, iq: u64, ikc: u64 };
++
++    /// Image/video rotary table (image_rows.attach): rows below `length` use the (t, h, w) table, later pos + delta.
++    pub const Rope = struct { table: u64, delta: u64, length: usize };
++
++    /// The multimodal rotary sections' h and w counts (rope_parameters.mrope_section [11, 11, 10]).
++    pub const rope_s1 = 11;
++    pub const rope_s2 = 10;
++
++    /// glue.attn_prep on text positions (MODE 0): q, k, indexer heads normed and rotated, k/v stored at POS0 + r.
++    pub fn attnPrep(t: Tri, a: Prep, rows: usize, d: Dims) !void {
++        return t.attnPrepRope(a, rows, d, null);
++    }
++
++    /// glue.attn_prep: text positions without `rope` (MODE 0), else the image prompt's table (MODE 2).
++    pub fn attnPrepRope(t: Tri, a: Prep, rows: usize, d: Dims, rope: ?Rope) !void {
++        const pw = d.attnWidth();
++        const table = if (rope) |r| r.table else a.pos0;
++        const delta = if (rope) |r| r.delta else a.pos0;
++        const length: usize = if (rope) |r| r.length else 0;
++        const mode: usize = if (rope != null) 2 else 0;
++        if (a.cache.fp8) {
++            // kv8._attn_prep8: _attn_prep's arithmetic, keys and values stored as FP8 rows with their scales
++            try t.run("_attn_prep8", .{ rows, d.heads + d.kv_heads + d.index_heads + 1, 1 }, &.{ p("P", bf16, a.p), p("POS0", i32p, a.pos0), p("QW", f32p, a.qw), p("KW", f32p, a.kw), p("IW", f32p, a.iw), p("INV", f32p, a.inv), p("Q", bf16, a.q), p("KC", fp8p, a.cache.k), p("VC", fp8p, a.cache.v), p("KS", f32p, a.cache.k), p("IQ", bf16, a.iq), p("IKC", bf16, a.ikc), p("ROPE", i32p, table), p("DELTA", i32p, delta), int("length", length), aot.float("eps", d.eps) }, &.{ ci("PW", pw), ci("NQ", d.heads), ci("NKV", d.kv_heads), ci("HD", d.head_dim), ci("NI", d.index_heads), ci("IHD", d.index_dim), ci("HALF", d.rotary_half), ci("MODE", mode), ci("S1", rope_s1), ci("S2", rope_s2) });
++            return;
++        }
++        try t.run("_attn_prep", .{ rows, d.heads + d.kv_heads + d.index_heads + 1, 1 }, &.{ p("P", bf16, a.p), p("POS0", i32p, a.pos0), p("QW", f32p, a.qw), p("KW", f32p, a.kw), p("IW", f32p, a.iw), p("INV", f32p, a.inv), p("Q", bf16, a.q), p("KC", a.cache.codes(), a.cache.k), p("VC", a.cache.codes(), a.cache.v), p("KS", f16p, a.cache.ks), p("VS", f16p, a.cache.vs), p("IQ", bf16, a.iq), p("IKC", bf16, a.ikc), p("ROPE", i32p, table), p("DELTA", i32p, delta), int("length", length), aot.float("eps", d.eps) }, &.{ ci("PW", pw), ci("NQ", d.heads), ci("NKV", d.kv_heads), ci("HD", d.head_dim), ci("NI", d.index_heads), ci("IHD", d.index_dim), ci("HALF", d.rotary_half), ci("BITS", a.cache.bits), ci("MODE", mode), ci("S1", rope_s1), ci("S2", rope_s2) });
++    }
++
++    /// attention.attention: queries [R, H, D] over 512-key chunks merged in chunk order; `context` bounds chunks.
++    pub fn attention(t: Tri, q: u64, cache: Cache, pos0: u64, sc: AttnScratch, out: u64, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
++        const h = d.heads;
++        const hk = d.kv_heads;
++        const grp = h / hk;
++        if (grp > 16) return error.TooManyQueryHeads;
++        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d.head_dim), -0.5));
++        const ty = cache.codes();
++        if (cache.fp8) {
++            // kv8._chunks8: the codes to bf16, each key's s_k on its dots and s_v on its probabilities
++            try t.run("_chunks8", .{ rows, hk, g.chunks(context) }, &.{ p("Q", bf16, q), p("KC", fp8p, cache.k), p("VC", fp8p, cache.v), p("KS", f32p, cache.k), p("POS0", i32p, pos0), p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), aot.cf("SCALE", scale), ci("IDW", g.idw), cb("QSA", g.qsa) });
++        } else try t.run("_chunks", .{ rows, hk, g.chunks(context) }, &.{ p("Q", bf16, q), p("KC", ty, cache.k), p("VC", ty, cache.v), p("KSC", f16p, cache.ks), p("VSC", f16p, cache.vs), p("POS0", i32p, pos0), p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), aot.cf("SCALE", scale), ci("IDW", g.idw), cb("QSA", g.qsa), ci("BITS", cache.bits) });
++        try t.run("_merge", .{ rows, hk, 1 }, &.{ p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("POS0", i32p, pos0), p("OUT", bf16, out), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), cb("QSA", g.qsa), ci("BITS", cache.bits) });
++    }
++
++    /// attention.qsa_pool on text positions: complete RATIO-key blocks pooled, normed (k_layernorm) and rotated.
++    pub fn qsaPool(t: Tri, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, rows: usize, g: AttnGeometry, d: Dims) !void {
++        return t.qsaPoolRope(ikc, pooled, pos0, w, inv, rows, g, d, null);
++    }
++
++    /// attention.qsa_pool: text positions without `rope` (MODE 0), else the image prompt's table (MODE 2).
++    pub fn qsaPoolRope(t: Tri, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, rows: usize, g: AttnGeometry, d: Dims, rope: ?Rope) !void {
++        const grid: [3]usize = .{ rows / g.ratio + 2, 1, 1 };
++        const consts = [_]aot.Const{ ci("DI", d.index_dim), ci("HALF", d.rotary_half), ci("RATIO", g.ratio), ci("MODE", if (rope != null) 2 else 0), ci("S1", rope_s1), ci("S2", rope_s2) };
++        if (rope) |r| return t.run("_pool", grid, &.{ p("IKC", bf16, ikc), p("POOLED", bf16, pooled), p("POS0", i32p, pos0), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("R", rows), p("ROPE", i32p, r.table), p("DELTA", i32p, r.delta), int("length", r.length) }, &consts);
++        try t.run("_pool", grid, &.{ p("IKC", bf16, ikc), p("POOLED", bf16, pooled), p("POS0", i32p, pos0), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("R", rows), int("length", 0) }, &consts);
++    }
++
++    /// attention.qsa_rows: each sparse row's block scores, then its TOP blocks and tail into the scratch's key lists.
++    pub fn qsaRows(t: Tri, iq: u64, pooled: u64, pos0: u64, sc: AttnScratch, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
++        const top = g.budget / g.ratio;
++        const blocks = g.blocks(context);
++        try t.run("_scores", .{ rows, cdiv(blocks, 64), 1 }, &.{ p("IQ", bf16, iq), p("POOLED", bf16, pooled), p("POS0", i32p, pos0), p("SC", f32p, sc.scores), int("NB", g.nb) }, &.{ ci("HI", d.index_heads), ci("DI", d.index_dim), ci("RATIO", g.ratio), ci("TOP", top), ci("BB", 64) });
++        const lists = [_]aot.Arg{ p("SC", f32p, sc.scores), p("POS0", i32p, pos0), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), p("SPR", i32p, sc.sparse), int("NB", g.nb) };
++        const width = pow2(blocks);
++        if (width <= AttnGeometry.select_regs) {
++            try t.run("_select", .{ rows, 1, 1 }, &lists, &.{ ci("RATIO", g.ratio), ci("TOP", top), ci("IDW", g.idw), ci("BLOCK", width) });
++        } else {
++            try t.run("_select_tiles", .{ rows, 1, 1 }, &lists, &.{ ci("RATIO", g.ratio), ci("TOP", top), ci("IDW", g.idw), ci("TB", if (rows >= 64) 4096 else 8192) });
++        }
++    }
++
++    /// attention.qsa_select (a decode window): pool the blocks the window completes, then score and select.
++    pub fn qsaSelect(t: Tri, iq: u64, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, sc: AttnScratch, rows: usize, g: AttnGeometry, context: ?usize, d: Dims) !void {
++        return t.qsaSelectRope(iq, ikc, pooled, pos0, w, inv, sc, rows, g, context, d, null);
++    }
++
++    /// qsaSelect with an image prompt's rotary table (null: text).
++    pub fn qsaSelectRope(t: Tri, iq: u64, ikc: u64, pooled: u64, pos0: u64, w: u64, inv: u64, sc: AttnScratch, rows: usize, g: AttnGeometry, context: ?usize, d: Dims, rope: ?Rope) !void {
++        try t.qsaPoolRope(ikc, pooled, pos0, w, inv, rows, g, d, rope);
++        try t.qsaRows(iq, pooled, pos0, sc, rows, g, context, d);
++    }
++
++    // -- a shared round's attention in one launch a kernel (attn_multi.py) ------------------------------------
++
++    /// attn_multi.Step's tables: row position and stream, stream first position and count, a layer's [6][N] pointers.
++    pub const Multi = struct { posr: u64, sid: u64, first: u64, counts: u64, n: usize };
++
++    /// Whether the kernel set holds attn_multi's kernels (aot/w6-ks1 and later).
++    pub fn multiAvailable(set: *const aot.Set) bool {
++        return set.smallestConst("_chunks_multi", "NCH", 0) != null and set.smallestConst("_prep_multi", "PW", 0) != null and
++            set.smallestConst("_merge_multi", "NCH", 0) != null and set.smallestConst("_pool_multi", "DI", 0) != null;
++    }
++
++    /// attn_multi._prep_multi: every row's attn_prep through its stream's caches (text positions, bf16 caches).
++    pub fn prepMulti(t: Tri, m: Multi, cp: u64, pa: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, iq: u64, rows: usize, d: Dims) !void {
++        try t.run("_prep_multi", .{ rows, d.heads + d.kv_heads + d.index_heads + 1, 1 }, &.{ p("P", bf16, pa), p("POSR", i32p, m.posr), p("SID", i32p, m.sid), p("CP", "*i64", cp), p("VP", "*i64", cp), p("QW", f32p, qw), p("KW", f32p, kw), p("IW", f32p, iw), p("INV", f32p, inv), p("Q", bf16, q), p("IQ", bf16, iq), aot.float("eps", d.eps), int("N", m.n) }, &.{ ci("PW", d.attnWidth()), ci("NQ", d.heads), ci("NKV", d.kv_heads), ci("HD", d.head_dim), ci("NI", d.index_heads), ci("IHD", d.index_dim), ci("HALF", d.rotary_half), ci("BITS", 0), cb("VISION", false), ci("S1", 11), ci("S2", 10) });
++    }
++
++    /// attn_multi._pool_multi: each stream's RATIO-key blocks its rows complete, pooled (`most` the most rows).
++    pub fn poolMulti(t: Tri, m: Multi, cp: u64, w: u64, inv: u64, most: usize, g: AttnGeometry, d: Dims) !void {
++        try t.run("_pool_multi", .{ m.n, most / g.ratio + 2, 1 }, &.{ p("CP", "*i64", cp), p("VP", "*i64", cp), p("P0", i32p, m.first), p("RS", i32p, m.counts), p("W", f32p, w), p("INV", f32p, inv), aot.float("eps", d.eps), int("N", m.n) }, &.{ ci("DI", d.index_dim), ci("HALF", d.rotary_half), ci("RATIO", g.ratio), cb("VISION", false), ci("S1", 11), ci("S2", 10) });
++    }
++
++    /// attn_multi._chunks_multi + _merge_multi: every row over its stream's caches merged into out; `keys` the row max.
++    pub fn attentionMulti(t: Tri, m: Multi, cp: u64, q: u64, sc: AttnScratch, out: u64, rows: usize, g: AttnGeometry, keys: usize, d: Dims) !void {
++        const h = d.heads;
++        const hk = d.kv_heads;
++        const grp = h / hk;
++        if (grp > 16) return error.TooManyQueryHeads;
++        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(d.head_dim), -0.5));
++        const top = g.budget / g.ratio;
++        try t.run("_chunks_multi", .{ rows, hk, g.chunks(keys) }, &.{ p("Q", bf16, q), p("CP", "*i64", cp), p("POSR", i32p, m.posr), p("SID", i32p, m.sid), p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("IDS", i32p, sc.ids), p("NKR", i32p, sc.nk), int("N", m.n) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), aot.cf("SCALE", scale), ci("IDW", g.idw), cb("QSA", g.qsa), ci("BITS", 0), ci("RATIO", g.ratio), ci("TOP", top) });
++        try t.run("_merge_multi", .{ rows, hk, 1 }, &.{ p("PO", f32p, sc.po), p("PM", f32p, sc.pm), p("PL", f32p, sc.pl), p("POSR", i32p, m.posr), p("OUT", bf16, out), p("NKR", i32p, sc.nk) }, &.{ ci("H", h), ci("HK", hk), ci("D", d.head_dim), ci("G", grp), ci("CH", AttnGeometry.chunk), ci("NCH", g.nch), cb("QSA", g.qsa), ci("BITS", 0), ci("RATIO", g.ratio), ci("TOP", top) });
++    }
++
++    /// glue.attn_gate: out [R, H*D] = bf16(o * sigmoid(gate)), the gate from pa's [q | gate] pairs, and group sums.
++    pub fn attnGate(t: Tri, o: u64, pa: u64, out: u64, xs: u64, rows: usize, d: Dims) !void {
++        try t.run("_attn_gate", .{ rows, d.heads, 1 }, &.{ p("O", bf16, o), p("P", bf16, pa), p("OUT", bf16, out), p("XS", f32p, xs) }, &.{ ci("PW", d.attnWidth()), ci("NQ", d.heads), ci("HD", d.head_dim) });
++    }
++
++    // -- the n-gram embedding (PLE) ------------------------------------------------------------------------
++
++    /// glue.ple_embed_bf16: gathered rows -> out [R, heads * dh] and group sums; `scale` 1.0 for the FP8 table (LUT).
++    pub fn pleEmbedBf16(t: Tri, v: u64, out: u64, xs: u64, rows: usize, heads: usize, dh: usize, scale: f32) !void {
++        try t.run("_ple_embed_bf16", .{ rows, heads, 1 }, &.{ p("V", bf16, v), p("OUT", bf16, out), p("XS", f32p, xs) }, &.{ ci("HEADS", heads), ci("DH", dh), aot.cf("SCALE", scale) });
++    }
++
++    /// glue.ple_gate: each stream's gate from its normed key and query, gated values [R, S*D] and squared sums [R, S].
++    pub fn pleGate(t: Tri, keys: u64, vals: u64, h: u64, norm_key: u64, norm_query: u64, gated: u64, pss: u64, rows: usize, d: usize, streams: usize, eps: f32) !void {
++        try t.run("_ple_gate", .{ rows, 1, 1 }, &.{ p("KEYS", bf16, keys), p("VALS", bf16, vals), p("H", bf16, h), p("NK", f32p, norm_key), p("NQ", f32p, norm_query), p("GATED", bf16, gated), p("PSS", f32p, pss), aot.float("eps", eps) }, &.{ ci("D", d), ci("S", streams), ci("BLOCK", 512) });
++    }
++
++    /// glue.ple_conv (one stream): dilated conv over [tail; rows], SiLU, residual adds into hout, normed rows to nrow.
++    pub fn pleConv(t: Tri, gated: u64, pss: u64, norm_conv: u64, tail: u64, conv_w: u64, h: u64, hout: u64, nrow: u64, rows: usize, d: usize, streams: usize, taps: usize, dilation: usize, eps: f32) !void {
++        try t.run("_ple_conv", .{ rows, streams * d / 512, 1 }, &.{ p("GATED", bf16, gated), p("PSS", f32p, pss), p("NC", f32p, norm_conv), p("TAIL", bf16, tail), p("CW", bf16, conv_w), p("H", bf16, h), p("HOUT", bf16, hout), p("NROW", bf16, nrow), aot.float("eps", eps), int("R", rows) }, &.{ ci("D", d), ci("S", streams), ci("TAPS", taps), ci("DIL", dilation), ci("BLOCK", 512) });
++    }
++
++    // -- matmuls -------------------------------------------------------------------------------------------
++
++    /// bf16.matmul: x [M, K] @ w [N, K].T -> out [M, N] (bf16 or fp32); K slices summed in order by `_reduce`.
++    pub fn b16mm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
++        if (k % 64 != 0) return error.KNotBlocked;
++        const sk = b16SplitK(n, k);
++        const bm: usize = if (m > 128) 128 else 16;
++        const oty = if (fp32) f32p else bf16;
++        const split = sk > 1;
++        try t.run("_b16mm", .{ cdiv(m, bm), cdiv(n, 64), sk }, &.{ p("X", bf16, x), p("W", bf16, w), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("BLOCK_N", 64), ci("BK", 64), cb("F32", fp32) });
++        if (split) try t.reduce(part, out, fp32, m * n, sk);
++    }
++
++    /// bf16._reduce and nvfp4._reduce: `total` fp32 sums of `sk` slices in order, one rounding for bf16 out.
++    fn reduce(t: Tri, part: u64, out: u64, fp32: bool, total: usize, sk: usize) !void {
++        try t.run("_reduce", .{ cdiv(total, 1024), 1, 1 }, &.{ p("PART", f32p, part), p("OUT", if (fp32) f32p else bf16, out), int("total", total) }, &.{ ci("SK", sk), ci("BLOCK", 1024), cb("F32", fp32) });
++    }
++
++    /// nvfp4.matmul at defaults (shared expert): x [M, K] bf16 @ fp.T -> out [M, N], K slices summed in order.
++    pub fn fp4mm(t: Tri, x: u64, x_stride: usize, fp: Fp4, out: u64, fp32: bool, part: u64, m: usize, n: usize, k: usize) !void {
++        if (n % 64 != 0) return error.NNotTiled;
++        const bm = bucket(m);
++        var want: usize = switch (bm) {
++            16 => 4,
++            32, 64 => 2,
++            else => 1,
++        };
++        if (bm == 16) if (fp4Tuned(n, k)) |tuned| {
++            want = tuned.gpi;
++        };
++        const sk = fp4SplitK(n, k);
++        const gpi = gpiFor((k / 16) / sk, want);
++        const oty = if (fp32) f32p else bf16;
++        const split = sk > 1;
++        try t.run("_fp4mm", .{ cdiv(m, bm), n / 64, sk }, &.{ p("X", bf16, x), p("W", if (fp.codes) "*u8" else "*u16", fp.weight), p("S", if (fp.codes) "*u8" else f32p, fp.scale), p("S2", f32p, fp.scale2), p("OUT", oty, out), p("PART", if (split) f32p else oty, if (split) part else out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", sk), ci("BM", bm), ci("SBN", 64), ci("BLOCK_N", 64), ci("GPI", gpi), cb("F32", fp32), cb("PACKED", fp.codes) });
++        if (split) try t.reduce(part, out, fp32, m * n, sk);
++    }
++
++    // -- MoE -----------------------------------------------------------------------------------------------
++
++    /// moe.router: logits [M, E + 1] fp32 = x [M, D] . rows (the router's E rows, then the shared expert's gate).
++    pub fn router(t: Tri, x: u64, x_stride: usize, rows_w: u64, out: u64, m: usize, d: usize, ne: usize) !void {
++        const bm = bucket(m);
++        const be: usize, const bk: usize = if (bm == 16) .{ 32, 256 } else .{ 64, 64 };
++        try t.run("_router", .{ cdiv(m, bm), cdiv(ne, be), 1 }, &.{ p("X", bf16, x), p("W", bf16, rows_w), p("OUT", f32p, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("D", d), ci("NE", ne), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
++    }
++
++    /// moe.select_rows: each row's top_k experts and weights, then the shared expert as slot top_k (pick, wts).
++    pub fn topkRows(t: Tri, logits: u64, pick: u64, wts: u64, rows: usize, experts: usize, top_k: usize) !void {
++        try t.run("_topk_rows", .{ rows, 1, 1 }, &.{ p("L", f32p, logits), p("PICK", i32p, pick), p("WTS", f32p, wts) }, &.{ ci("NE", experts), ci("NL", experts + 1), ci("TOPK", top_k), ci("SLOTS", top_k + 1), ci("BLOCK", pow2(experts + 1)), ci("SLOTP", pow2(top_k + 1)) });
++    }
++
++    /// glue.moe_partial (TP=2): a rank's fp32 MoE share sum_k w_k y_k + w_s y_s [R, D], gathered for mode 3.
++    pub fn moePartial(t: Tri, y: u64, y_f32: bool, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
++        try t.run("_moe_partial", .{ rows, d / 256, 1 }, &.{ p("Y", if (y_f32) f32p else bf16, y), p("WTS", f32p, wts), p("OUT", f32p, out) }, &.{ ci("D", d), ci("TOPK", slots - 1), ci("SLOTS", slots), ci("BLOCK", 256) });
++    }
++
++    // -- commit --------------------------------------------------------------------------------------------
++
++    /// forward.shift_windows: old [L, T, C] in place takes rows keep .. keep + T of [old; new rows].
++    pub fn shiftWindows(t: Tri, old: u64, new: u64, keep: usize, old_l: usize, new_l: usize, new_row: usize, layers: usize, channels: usize, taps: usize) !void {
++        try t.run("_shift_windows", .{ layers, cdiv(channels, 256), 1 }, &.{ p("OLD", bf16, old), p("NEW", bf16, new), int("keep", keep), int("OLD_L", old_l), int("NEW_L", new_l), int("NEW_ROW", new_row) }, &.{ ci("C", channels), ci("T", taps), ci("TP", pow2(taps)), ci("BLOCK", 256) });
++    }
++};

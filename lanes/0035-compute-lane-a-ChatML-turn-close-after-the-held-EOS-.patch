@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 01:40:10 +0700
+Subject: [PATCH 35/79] compute lane: a ChatML turn close after the held EOS
+ goes in with the result turn
+
+Qwen templates (Qwen3.x, Qwen3.8-Flash-Next) close every turn with
+<|im_end|> and a newline. The lane rendered the call turn, saw its last
+token was the newline rather than an EOS, logged "this template's
+tool-result turn does not extend the call turn" and ended the reply at
+the call: on Flash-Next every lane call came back empty with
+finish=length.
+
+The call turn now ends at its last EOS when only the template's
+whitespace follows it; that close is the template's, not the model's,
+so it is forced in with the result turn. The history must still stand
+unchanged under the results, and a call turn with no EOS of its own
+still ends the reply.
+
+The new test drives the chat route with a Qwen template: on the old
+code the held call gets one empty resume; now the result turn goes in
+from the newline on and the reply goes on to its answer.
+---
+ zig/src/server/compute_lane_chatml_test.zig | 71 +++++++++++++++++++++
+ zig/src/server/compute_segments.zig         | 19 ++++--
+ zig/src/server/root.zig                     |  1 +
+ 3 files changed, 86 insertions(+), 5 deletions(-)
+ create mode 100644 zig/src/server/compute_lane_chatml_test.zig
+
+diff --git a/zig/src/server/compute_lane_chatml_test.zig b/zig/src/server/compute_lane_chatml_test.zig
+new file mode 100644
+index 000000000..b9e56d300
+--- /dev/null
++++ b/zig/src/server/compute_lane_chatml_test.zig
+@@ -0,0 +1,71 @@
++//! The compute lane on a template closing turns with `<|im_end|>\n` (Qwen3.x, Qwen3.8-Flash-Next): the reply goes on.
++const std = @import("std");
++const json = @import("json");
++const HfText = @import("hf_text.zig").HfText;
++const tf = @import("control_tokens_fixture.zig");
++const h = @import("compute_lane_http_test.zig");
++const lane = @import("engine_api").hold.compute_lane;
++const t = std.testing;
++
++const template = @embedFile("fixtures/dory/chat_template.jinja");
++
++test "compute lane: a ChatML turn close after the held EOS goes in with the result turn, not instead of it" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // the lane's executor runs on Linux only
++    const python = "/usr/bin/python3";
++    std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    // the byte-level mini vocabulary; the call and think markers are text, as in a Qwen tokenizer
++    const tok = try h.obj(a, @embedFile("fixtures/control_tokens/mini_tokenizer.json"));
++    for (tok.get("added_tokens").?.array) |added| {
++        const name = added.strField("content").?;
++        if (!std.mem.startsWith(u8, name, "<|")) try added.object.put(a, "special", .{ .bool = false });
++    }
++    try tok.object.put(a, "pre_tokenizer", try h.obj(a, "{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":false,\"use_regex\":false}"));
++    try tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer.json", .data = try json.stringify(a, tok, .{}) });
++    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"dory\",\"vocab_size\":2048}" });
++    try tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\":\"<|im_end|>\"}" });
++    try tmp.dir.writeFile(t.io, .{ .sub_path = "chat_template.jinja", .data = template });
++    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
++    var problem: []const u8 = "";
++    const hf = try HfText.load(a, t.io, dir, null, a, &problem);
++    defer hf.deinit();
++    const text = hf.text();
++    const eos = text.tokenId("<|im_end|>").?;
++    // the model's segments: a Qwen XML call held at its EOS, then the answer
++    const call_text = "<tool_call>\n<function=python>\n<parameter=code>\nprint(6*7)\n</parameter>\n</function>\n</tool_call>\n";
++    const call = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, call_text), &.{eos} });
++    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, "It is 42."), &.{eos} });
++    var script: h.Script = .{ .a = a, .call = call, .answer = answer };
++    const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
++    defer srv.deinit();
++    const cfg: lane.Config = .{ .python = python };
++    srv.info.compute = cfg;
++    srv.compute = lane.Pool.init(cfg, &.{ "/bin/sh", "-c", "exec \"$0\" -I -B -u -c \"$1\"", python, lane.runner.runner });
++    var reply: h.Reply = .{ .a = a };
++    var conn = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
++    defer conn.deinit();
++    const body = try json.newObject(a);
++    try body.put(a, "model", .{ .string = "m" });
++    try body.put(a, "max_tokens", try json.intValue(a, 400));
++    try body.put(a, "messages", try tf.messages(a, "What is 6*7?"));
++    try body.put(a, "tools", try h.obj(a, "[{\"type\":\"code_interpreter\"}]"));
++    @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
++    const said = try json.stringify(a, reply.body, .{});
++    errdefer std.debug.print("COMPUTE_LANE_CHATML_REPLY {s}\n", .{said});
++    try t.expectEqual(@as(u16, 200), reply.code);
++    // the result went in (not an empty resume ending the reply at the call), then the answer's EOS ended it
++    try t.expectEqual(@as(usize, 2), script.resumes.items.len);
++    try t.expectEqual(@as(usize, 0), script.resumes.items[1].len);
++    // the forced rows: the template's own close after the EOS, the result turn, the next generation prompt
++    try t.expectEqualStrings("\n<|im_start|>user\n<tool_response>\n42\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think></think>", try text.decode(a, script.resumes.items[0]));
++    const choice = reply.body.get("choices").?.array[0];
++    try t.expectEqualStrings("stop", choice.get("finish_reason").?.string);
++    try t.expect(std.mem.indexOf(u8, choice.get("message").?.strField("content").?, "It is 42.") != null);
++    const report = reply.body.get("tensorfold").?.get("compute").?.get("calls").?.array[0];
++    try t.expectEqualStrings("42", report.strField("output").?);
++    try t.expect(report.get("inserted").?.bool);
++}
+diff --git a/zig/src/server/compute_segments.zig b/zig/src/server/compute_segments.zig
+index 7d2cea983..ab572884c 100644
+--- a/zig/src/server/compute_segments.zig
++++ b/zig/src/server/compute_segments.zig
+@@ -253,7 +253,7 @@ fn toolTurn(a: Allocator, call: Value, output: []const u8) Allocator.Error!Value
+     return .{ .object = o };
+ }
+ 
+-/// The template's tokens after the held EOS: render(history + call turn + results) past render(history + call turn).
++/// The template's tokens after the held EOS: render(history + call turn + results) past the call turn's EOS.
+ fn suffix(srv: *Server, cx: *Cx, p: chat.Prepared, history: *const std.ArrayList(Value), assistant: Value, calls: []const Value, reports: []const Value) chat.Failure!?[]const u32 {
+     const a = cx.a;
+     var with: std.ArrayList(Value) = .empty;
+@@ -262,13 +262,22 @@ fn suffix(srv: *Server, cx: *Cx, p: chat.Prepared, history: *const std.ArrayList
+     const before = prompt_mod.renderIds(srv, cx, .{ .array = try a.dupe(Value, with.items) }, p.input.tools, p.thinking, p.effort, false) catch |e| return lost(e);
+     for (calls, reports) |c, r| try with.append(a, try toolTurn(a, c, r.get("output").?.string));
+     const after = prompt_mod.renderIds(srv, cx, .{ .array = with.items }, p.input.tools, p.thinking, p.effort, true) catch |e| return lost(e);
+-    // the history must end at the model's own EOS and stand unchanged under the results: else no exact insert exists
+-    const ends = before.len > 0 and std.mem.indexOfScalar(u32, srv.eos, before[before.len - 1]) != null;
+-    if (!ends or after.len <= before.len or !std.mem.eql(u32, after[0..before.len], before)) {
++    // the history stands unchanged under the results, its call turn ends at the model's EOS: else no exact insert
++    const end = try callEnd(srv, a, before);
++    if (end == null or after.len <= before.len or !std.mem.eql(u32, after[0..before.len], before)) {
+         log.line("warning: compute lane: this template's tool-result turn does not extend the call turn; the reply ends at the call", .{});
+         return null;
+     }
+-    return after[before.len..];
++    return after[end.?..];
++}
++
++/// Past the call turn's EOS if only template whitespace follows it (ChatML's `<|im_end|>\n`), forced in after it.
++fn callEnd(srv: *Server, a: Allocator, before: []const u32) Allocator.Error!?usize {
++    const at = std.mem.lastIndexOfAny(u32, before, srv.eos) orelse return null;
++    const close = before[at + 1 ..];
++    if (close.len == 0) return before.len;
++    const text = try srv.text.decode(a, close);
++    return if (std.mem.trim(u8, text, " \t\r\n").len == 0) at + 1 else null;
+ }
+ 
+ fn lost(e: anyerror) chat.Failure!?[]const u32 {
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 48cdc1116..fc8786d47 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -212,6 +212,7 @@ test {
+     _ = @import("compute_turns.zig");
+     _ = @import("compute_segments.zig");
+     _ = @import("compute_lane_http_test.zig");
++    _ = @import("compute_lane_chatml_test.zig");
+     _ = @import("compute_default_test.zig");
+     _ = @import("compute_default_fit_test.zig");
+     _ = @import("reply_owned_test.zig");

@@ -1,0 +1,569 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:02:58 +0700
+Subject: [PATCH 32/79] flashnext: the in-model runner's family binding (Qwen's
+ markup quiet and never owned)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Flash-Next's (qwen4_exp) runner binding replaces the core stub; the native CUDA host opens it from the generic
+TF_RUNNER* knobs and hands it to the lane host.
+
+- runner_binding.Family: a family's quiet spans, its never-owned markup and its trust guide. Binding.parse stamps
+  them on the runner's config.
+- Scanner quiet spans (runner_scan_quiet.zig): bytes from an opener to its closer never reach the cell scanner,
+  matched across token boundaries. Flash-Next quiets <tool_call>…</tool_call> (XML <function=…> or JSON bodies) and
+  <tool_response>…</tool_response>.
+- Delivery: an owned result that spells the family's markup (<think>, </think>, the tool call and response tags,
+  <function=, <parameter=, <|im_start|>, <|im_end|>, <|endoftext|>) abstains as `markup` (stage "own") instead of
+  landing in the reply.
+- Trust guide slot: Family.trust. DeepSeek-V4.1 keeps AB3's text (moved into its binding, bytes unchanged).
+  Flash-Next has none yet (TODO: measure); the compute default warns and gives no guide rather than reuse
+  DeepSeek-V4.1's wording.
+- The markers come from the checkpoint's own chat template and tokenizer; the template is not vendored (Qwen's
+  licence). test-flashnext-runner-host checks every marker against it when TF_FLASHNEXT_TEMPLATE names it.
+- lane_host_lone.takes leaves runner streams (run_cells) in the lane core, where cells are read and held: the lone
+  driver Flash-Next serves through would otherwise bypass the runner's hooks.
+
+DeepSeek-V4.1 sets no quiet or never markup, so its runner is byte-identical.
+---
+ zig/build/cuda_fault_host.zig                 |  1 +
+ zig/src/core/lane_host_lone.zig               |  2 +-
+ zig/src/core/lane_host_lone_test.zig          |  6 ++
+ zig/src/core/runner.zig                       |  5 +-
+ zig/src/core/runner_abstain.zig               |  5 +-
+ zig/src/core/runner_abstain_test.zig          |  9 ++-
+ zig/src/core/runner_api.zig                   |  2 +-
+ zig/src/core/runner_binding.zig               | 51 ++++++++++++++---
+ zig/src/core/runner_scan.zig                  |  5 ++
+ zig/src/core/runner_scan_quiet.zig            | 55 +++++++++++++++++++
+ zig/src/core/runner_test.zig                  |  2 +-
+ zig/src/families/flashnext/cuda_lanes.zig     |  1 +
+ zig/src/families/flashnext/cuda_launch.zig    |  2 +
+ zig/src/families/flashnext/runner_binding.zig | 32 +++++++++++
+ .../flashnext/runner_binding_test.zig         | 19 +++++++
+ zig/src/native/cuda.zig                       |  4 ++
+ zig/src/native/cuda_startup_phase.zig         |  1 +
+ zig/src/server/runner_guide.zig               |  7 ++-
+ zig/src/server/server.zig                     |  7 ++-
+ 19 files changed, 194 insertions(+), 22 deletions(-)
+ create mode 100644 zig/src/core/runner_scan_quiet.zig
+ create mode 100644 zig/src/families/flashnext/runner_binding.zig
+ create mode 100644 zig/src/families/flashnext/runner_binding_test.zig
+
+diff --git a/zig/build/cuda_fault_host.zig b/zig/build/cuda_fault_host.zig
+index 717950cce..048990984 100644
+--- a/zig/build/cuda_fault_host.zig
++++ b/zig/build/cuda_fault_host.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ pub fn steps(b: *std.Build, cuda: *std.Build.Module, flashnext: *std.Build.Module, native: *std.Build.Module) void {
+     b.step("test-cuda-context-health-host", "Sticky CUDA context faults and real graph-instantiation refusal without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "CUDA context health:", "CUDA graph refusal:" } })).step);
+     b.step("test-flashnext-loader-host", "The threaded NVFP4 expert loader: the loop's words, no pinned or device memory left after a failed load, geometry first").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next expert loader:"} })).step);
++    b.step("test-flashnext-runner-host", "Flash Next's runner binding: the checkpoint template's markup, the generic knob names").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next runner:"} })).step);
+     b.step("test-flashnext-compute-host", "Flash Next's compute lane binding: the generic knob names and the python tool").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next compute lane:"} })).step);
+     b.step("test-flashnext-completion-host", "Actual CUDA sequence rollback drains asynchronous destinations before release").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next completion:"} })).step);
+     b.step("test-cuda-fault-admission-host", "Sticky context health reaches native status and queue admission").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"CUDA context health:"} })).step);
+diff --git a/zig/src/core/lane_host_lone.zig b/zig/src/core/lane_host_lone.zig
+index 90c386018..ccfbe84c9 100644
+--- a/zig/src/core/lane_host_lone.zig
++++ b/zig/src/core/lane_host_lone.zig
+@@ -15,7 +15,7 @@ fn takes(h: *LaneHost, job: *Job) bool {
+     const r = job.request;
+     const lone = h.lone orelse return false;
+     const think = lone.min_budget > 0 and (r.think_budget == 0 or r.think_budget > lone.min_budget);
+-    return !((r.sampling != null and !lone.sampled) or (!r.drafts and !lone.plain) or ((r.think_budget > 0 or r.loop_guard) and !think) or r.call != null or r.hold_eos or (r.structure != null and !lone.structures) or (r.images.len > 0 and !lone.images) or (r.logprobs != null and !lone.logprobs) or r.prompt_logprobs != null);
++    return !((r.sampling != null and !lone.sampled) or (!r.drafts and !lone.plain) or ((r.think_budget > 0 or r.loop_guard) and !think) or r.call != null or r.hold_eos or r.run_cells or (r.structure != null and !lone.structures) or (r.images.len > 0 and !lone.images) or (r.logprobs != null and !lone.logprobs) or r.prompt_logprobs != null);
+ }
+ 
+ /// After a round: the lane core's last live stream goes back to the driver when nothing else waits or is due.
+diff --git a/zig/src/core/lane_host_lone_test.zig b/zig/src/core/lane_host_lone_test.zig
+index a101071ff..fa48f465c 100644
+--- a/zig/src/core/lane_host_lone_test.zig
++++ b/zig/src/core/lane_host_lone_test.zig
+@@ -124,6 +124,12 @@ test "a stream the lone driver does not take stays in the lane core to its end"
+     try std.testing.expectEqual(@as(u32, 0), runs.resumed);
+ }
+ 
++test "a runner's stream stays in the lane core, where its cells are read and held" {
++    const runs = try serve(&.{ .prompt = &prompt, .max_tokens = 24, .run_cells = true }, true);
++    try std.testing.expectEqual(@as(u32, 0), runs.opened);
++    try std.testing.expectEqual(@as(u32, 0), runs.resumed);
++}
++
+ test "a lone driver that takes plain streams opens one with drafts off" {
+     const runs = try serveDriver(&.{ .prompt = &prompt, .max_tokens = 24, .drafts = false }, false, true, true);
+     try std.testing.expectEqual(@as(u32, 1), runs.opened);
+diff --git a/zig/src/core/runner.zig b/zig/src/core/runner.zig
+index 1c969c76d..6c8d63aaa 100644
+--- a/zig/src/core/runner.zig
++++ b/zig/src/core/runner.zig
+@@ -12,9 +12,6 @@ const log = std.log.scoped(.runner);
+ const output = @import("runner_output.zig");
+ const answer = @import("runner_commit.zig");
+ 
+-/// Opt-in attribution on a successfully owned inline value; plain-text tokens, not a special token.
+-pub const inline_mark_suffix = output.suffix;
+-
+ pub const Config = struct {
+     scan: scan.Config = .{},
+     max_steps: u64 = 4_000_000, // per run (a step count: wall time never changes a result)
+@@ -37,6 +34,7 @@ pub const Config = struct {
+     abstains: bool = false, // PREFIX_ABSTAINS: with cells, each abstained cell's source, reason and stage (runner_abstain.zig)
+     commit: bool = false, // PREFIX_COMMIT: an owned value of the task's own expression closes the think and is the answer
+     prefix: []const u8 = "TF_RUNNER", // the knob prefix it was parsed under (runner_binding.zig), for messages
++    family: @import("runner_binding.zig").Family = .{}, // the family's chat markup (its binding sets it)
+ 
+     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
+     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
+@@ -360,6 +358,7 @@ pub const Session = struct {
+         if (w.trace) return try s.ownTrace(c, w.index, held_ms);
+         // an inline value is owned only when the run halted with a one-line value
+         if (!c.abstained and w.inline_space != null and (c.result.?.status != .ok or std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, c.result.?.out, "\n"), '\n') != null)) c.abstained = true;
++        if (!c.abstained and s.r.cfg.family.screen(&c.result.?)) c.abstained = true; // it would read as the family's markup
+         if (!c.abstained and s.r.cfg.inline_mark and w.inline_space != null) {
+             const value = output.value(c.result.?.out);
+             if (std.mem.trim(u8, value, " \t\r").len == 0 or std.mem.indexOfAny(u8, value, "\r\n") != null)
+diff --git a/zig/src/core/runner_abstain.zig b/zig/src/core/runner_abstain.zig
+index 2e0d13dd7..93dd00bc9 100644
+--- a/zig/src/core/runner_abstain.zig
++++ b/zig/src/core/runner_abstain.zig
+@@ -20,6 +20,7 @@ pub const Reason = enum {
+     fault, // the run: its own abstain (error_name: its tag), the step budget, a machine fault
+     empty_output,
+     multiline_output, // an inline value that is not one line
++    markup, // a result that spells the family's chat markup (runner_binding.Family.never)
+     mark_value_shape, // INLINE_MARK: a blank or multi-line value cannot carry the mark
+     token_cap, // the owned text would pass the token cap
+     trace_shape, // a trace run that did not print one value
+@@ -31,7 +32,7 @@ pub fn stage(r: Reason) []const u8 {
+         .language, .unsupported, .syntax, .name, .too_long, .too_big => "frontend",
+         .out_of_memory => "dispatch",
+         .backend_abstain, .budget, .fault => "execute",
+-        .empty_output, .multiline_output, .mark_value_shape, .token_cap, .trace_shape => "own",
++        .empty_output, .multiline_output, .mark_value_shape, .token_cap, .trace_shape, .markup => "own",
+     };
+ }
+ 
+@@ -62,7 +63,7 @@ pub fn reason(c: anytype, hint: ?Reason) struct { Reason, ?[]const u8 } {
+     }
+     const res = c.result orelse return .{ .out_of_memory, "OutOfMemory" };
+     return switch (res.status) {
+-        .abstain => .{ .backend_abstain, if (res.abstain) |a| @tagName(a) else null },
++        .abstain => if (res.abstain == .markup) .{ .markup, "markup" } else .{ .backend_abstain, if (res.abstain) |a| @tagName(a) else null },
+         .budget => .{ .budget, "budget" },
+         .fault => .{ .fault, "fault" },
+         .ok => if (res.out.len == 0) .{ .empty_output, null } else if (std.mem.indexOfScalar(u8, std.mem.trimEnd(u8, res.out, "\n"), '\n') != null) .{ .multiline_output, null } else .{ .mark_value_shape, null },
+diff --git a/zig/src/core/runner_abstain_test.zig b/zig/src/core/runner_abstain_test.zig
+index cbc74377d..e9794588e 100644
+--- a/zig/src/core/runner_abstain_test.zig
++++ b/zig/src/core/runner_abstain_test.zig
+@@ -134,7 +134,11 @@ test "runner abstain records: the reason of every frontend tag, a lost start, an
+         const why = abstain.reason(Fake{ .translation = .{ .abstain = tag } }, null);
+         try t.expectEqualStrings(@tagName(tag), @tagName(why[0]));
+         try t.expectEqualStrings(@tagName(tag), why[1].?);
+-        try t.expectEqualStrings(if (tag == .context) "context" else "frontend", abstain.stage(why[0]));
++        try t.expectEqualStrings(switch (tag) {
++            .context => "context",
++            .markup => "own", // the run's screen gives it (runner_binding.Family.never), not a frontend
++            else => "frontend",
++        }, abstain.stage(why[0]));
+     }
+     const prog: rapi.Translation = .{ .program = .{ .kind = .graph, .bytes = "" } };
+     const lost = abstain.reason(Fake{ .translation = prog }, null);
+@@ -143,6 +147,9 @@ test "runner abstain records: the reason of every frontend tag, a lost start, an
+     const bare = abstain.reason(Fake{ .translation = prog, .result = .{ .status = .abstain } }, null);
+     try t.expectEqual(abstain.Reason.backend_abstain, bare[0]);
+     try t.expect(bare[1] == null);
++    const marked = abstain.reason(Fake{ .translation = prog, .result = .{ .status = .abstain, .abstain = .markup } }, null);
++    try t.expectEqual(abstain.Reason.markup, marked[0]);
++    try t.expectEqualStrings("markup", marked[1].?);
+     try t.expectEqual(abstain.Reason.token_cap, abstain.reason(Fake{ .translation = prog, .result = .{ .status = .ok, .out = "1" } }, .token_cap)[0]);
+ }
+ 
+diff --git a/zig/src/core/runner_api.zig b/zig/src/core/runner_api.zig
+index 4a2f8cb5b..4ed9ded2a 100644
+--- a/zig/src/core/runner_api.zig
++++ b/zig/src/core/runner_api.zig
+@@ -23,7 +23,7 @@ pub const Program = struct {
+ };
+ 
+ /// Why a frontend or backend declines; the model's own continuation then stands (nothing is owned).
+-pub const Abstain = enum { language, unsupported, syntax, name, too_long, too_big, context };
++pub const Abstain = enum { language, unsupported, syntax, name, too_long, too_big, context, markup }; // markup: runner_binding.Family
+ 
+ pub const Translation = union(enum) { program: Program, abstain: Abstain };
+ 
+diff --git a/zig/src/core/runner_binding.zig b/zig/src/core/runner_binding.zig
+index 00ee987d9..c21f676bd 100644
+--- a/zig/src/core/runner_binding.zig
++++ b/zig/src/core/runner_binding.zig
+@@ -2,21 +2,52 @@
+ const std = @import("std");
+ const runner = @import("runner.zig");
+ const log = std.log.scoped(.runner);
++const quiet_max = @import("runner_scan_quiet.zig").max;
++
++/// What the runner must know of a family's chat markup, taken from its chat template and tokenizer.
++pub const Family = struct {
++    quiet: []const [2][]const u8 = &.{}, // opener and closer of text no cell is read in: tool calls, tool results
++    never: []const []const u8 = &.{}, // markup an owned result may not spell (it would read as a call or a think end)
++    trust: ?[]const u8 = null, // the compute default's guide, measured on this family; null: none yet, chats get none
++
++    /// Whether `out` spells any of the family's markup: such a result is the model's to write, never owned.
++    pub fn unsafe(f: Family, out: []const u8) bool {
++        for (f.never) |m| if (std.mem.indexOf(u8, out, m) != null) return true;
++        return false;
++    }
++
++    /// Marks `res` abstained (`markup`) when its output spells the family's markup; true when it did.
++    pub fn screen(f: Family, res: *@import("runner_api.zig").Result) bool {
++        if (!f.unsafe(res.out)) return false;
++        res.status = .abstain;
++        res.abstain = .markup;
++        return true;
++    }
++};
+ 
+ pub const Binding = struct {
+     prefix: []const u8 = "TF_RUNNER", // PREFIX=1 enables; PREFIX_CIRCUIT, PREFIX_FORMS, ... (runner.Config.parse)
+     alias: ?[]const u8 = null, // the family's own older names for the same knobs: a boot switches one or the other on
++    family: Family = .{},
+ 
+     /// The runner's config under the prefix whose switch the boot set; both switches set is error.BadKnob.
+     pub fn parse(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!?runner.Config {
+         // by the switch alone: TF_RUNNER_CIRCUIT, _CLANG and _LLD also name tools for tests and image checks
+-        const old = b.alias orelse return runner.Config.parse(get, b.prefix);
+-        if (!set(get(old))) return runner.Config.parse(get, b.prefix);
++        const old = b.alias orelse return b.of(try runner.Config.parse(get, b.prefix));
++        if (!set(get(old))) return b.of(try runner.Config.parse(get, b.prefix));
+         if (set(get(b.prefix))) {
+             log.warn("turn the in-model runner on with {s} or {s}, not both", .{ b.prefix, old });
+             return error.BadKnob;
+         }
+-        return runner.Config.parse(get, old);
++        return b.of(try runner.Config.parse(get, old));
++    }
++
++    fn of(comptime b: Binding, parsed: ?runner.Config) ?runner.Config {
++        comptime for (b.family.quiet) |s| std.debug.assert(s[0].len > 0 and s[0].len <= quiet_max and s[1].len <= quiet_max);
++        var c = parsed orelse return null;
++        c.family = b.family;
++        c.scan.quiet = b.family.quiet;
++        return c;
+     }
+ 
+     /// The prefix a boot's knobs are read under: the alias when its switch is set, else the generic one.
+@@ -54,10 +85,8 @@ fn set(v: ?[]const u8) bool {
+     return if (v) |s| s.len > 0 else false;
+ }
+ 
+-/// DeepSeek-V4.1: the generic names, or TF_DSV41_RUNNER* as before.
+-pub const dsv41: Binding = .{ .alias = "TF_DSV41_RUNNER" };
+-/// Qwen3.8 Flash-Next (`qwen4_exp`): the generic names only. Its serve engine does not read it yet.
+-pub const flashnext: Binding = .{};
++/// DeepSeek-V4.1: the generic names, or TF_DSV41_RUNNER* as before; AB3's tool-full guide is its trust guide.
++pub const dsv41: Binding = .{ .alias = "TF_DSV41_RUNNER", .family = .{ .trust = "Think and compute in small chunks. As soon as a sub-computation is needed, write its complete expression as `<expr> =` and continue from the returned value. Do not finish a manual trace before requesting it. For a short integer program, use a Python fenced cell with print, then `Result:`. Unsupported cells leave your continuation. Verify the setup, program semantics and non-computational reasoning. Engine values after `=` or `Result:` are computed exactly; use as given; do not re-derive or re-check by hand." } };
+ 
+ const t = std.testing;
+ 
+@@ -79,12 +108,16 @@ test "runner binding: the generic names or the family's alias, never both switch
+     try t.expectEqualStrings("/g.tfpc", generic.circuit);
+     try t.expect(generic.scan.inline_math and !generic.scan.fence);
+     try t.expectEqualStrings("TF_RUNNER", dsv41.active(&Env.get));
+-    try t.expectEqualStrings("/g.tfpc", (try flashnext.parse(&Env.get)).?.circuit);
++    const plain: Binding = .{ .family = .{ .quiet = &.{.{ "<a>", "</a>" }}, .never = &.{"</a>"} } };
++    const fam = (try plain.parse(&Env.get)).?;
++    try t.expectEqualStrings("/g.tfpc", fam.circuit);
++    try t.expectEqualStrings("</a>", fam.scan.quiet[0][1]);
++    try t.expect(fam.family.unsafe("1 </a>") and !fam.family.unsafe("42") and fam.family.trust == null);
+     Env.pairs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_DSV41_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/g.tfpc" } };
+     try t.expectError(error.BadKnob, dsv41.parse(&Env.get));
+     Env.pairs = &.{.{ "TF_RUNNER_CIRCUIT", "/test.tfpc" }};
+     try t.expect((try dsv41.parse(&Env.get)) == null);
+-    try t.expect((try flashnext.parse(&Env.get)) == null);
++    try t.expect((try plain.parse(&Env.get)) == null);
+ }
+ 
+ test "runner binding: the round trace stays off unless asked, and a bad round count is refused" {
+diff --git a/zig/src/core/runner_scan.zig b/zig/src/core/runner_scan.zig
+index 48a994ba7..e8c38876b 100644
+--- a/zig/src/core/runner_scan.zig
++++ b/zig/src/core/runner_scan.zig
+@@ -4,6 +4,7 @@ const api = @import("runner_api.zig");
+ const trace = @import("runner_trace.zig");
+ const header = @import("runner_scan_boundary.zig");
+ const inline_scan = @import("runner_scan_inline.zig");
++const quiet = @import("runner_scan_quiet.zig");
+ const Allocator = std.mem.Allocator;
+ 
+ pub const Config = struct {
+@@ -20,6 +21,7 @@ pub const Config = struct {
+     trace_window: u32 = 512, // tokens after a stated computation's line in which a hand-trace cue counts
+     trace_repeat: u8 = 0, // a restated, already owned line is owned again up to this many times
+     trace_whole: bool = false, // opt-in (PREFIX_STATED): trace also takes the whole-statement shapes
++    quiet: quiet.Spans = &.{}, // the family's spans no cell is read in: tool calls, tool results (runner_binding.Family)
+ };
+ 
+ /// Trace ownerships per reply, and trace cells (stated computations) a reply may open.
+@@ -64,6 +66,7 @@ pub const Scanner = struct {
+     tail: [16]u8 = undefined, // the last bytes fed, for cues split across tokens
+     tail_len: usize = 0,
+     think: bool = false, // the think block was open at the last token
++    hush: quiet.Quiet = .{}, // inside one of cfg.quiet's spans
+     code_cells: u32 = 0, // fence and REPL cells closed so far
+     tracer: ?trace.Tracer = null, // names and owned statements (form trace; made at the first reasoning line)
+     trace_src: std.ArrayList(u8) = .empty, // the pending statement's Python source
+@@ -104,6 +107,7 @@ pub const Scanner = struct {
+         }
+         if (s.trace_cell != null and s.tokens - s.trace_at > s.cfg.trace_window) s.trace_cell = null;
+         for (bytes) |b| {
++            if (s.hush.skip(s.cfg.quiet, b)) continue;
+             s.cue(b);
+             if (s.state == .after and !std.ascii.isWhitespace(b)) s.terminal_ready = false;
+             if (s.armed != null and b != '\n' and b != ' ' and b != '\t' and b != '\r') s.armed = null;
+@@ -560,4 +564,5 @@ test "runner scan: a header after an inline cell still names the fence cell befo
+ 
+ comptime {
+     _ = @import("runner_scan_result_test.zig");
++    _ = @import("runner_scan_quiet.zig");
+ }
+diff --git a/zig/src/core/runner_scan_quiet.zig b/zig/src/core/runner_scan_quiet.zig
+new file mode 100644
+index 000000000..ca47e3eb2
+--- /dev/null
++++ b/zig/src/core/runner_scan_quiet.zig
+@@ -0,0 +1,55 @@
++//! A family's quiet spans: the text from an opener to its closer (a tool call, a tool's result) is never a cell's.
++const std = @import("std");
++
++/// Opener and closer pairs, each at most `max` bytes (runner_binding.Family.quiet).
++pub const Spans = []const [2][]const u8;
++pub const max = 32;
++
++/// Where the reply stands: the last bytes seen (markers may span tokens), and the span it is inside.
++pub const Quiet = struct {
++    tail: [max]u8 = undefined,
++    len: u8 = 0,
++    in: ?usize = null, // the span whose closer ends the quiet
++
++    /// Whether byte `b` is quiet: inside a span, or its closer's; an opener's own bytes before it were prose.
++    pub fn skip(q: *Quiet, spans: Spans, b: u8) bool {
++        if (spans.len == 0) return false;
++        if (q.len == max) {
++            std.mem.copyForwards(u8, q.tail[0 .. max - 1], q.tail[1..max]);
++            q.len -= 1;
++        }
++        q.tail[q.len] = b;
++        q.len += 1;
++        const seen = q.tail[0..q.len];
++        if (q.in) |i| {
++            if (std.mem.endsWith(u8, seen, spans[i][1])) q.in = null;
++            return true;
++        }
++        for (spans, 0..) |s, i| if (std.mem.endsWith(u8, seen, s[0])) {
++            q.in = i;
++            return true;
++        };
++        return false;
++    }
++};
++
++const t = std.testing;
++
++fn prose(q: *Quiet, spans: Spans, text: []const u8, out: *std.ArrayList(u8)) !void {
++    for (text) |b| if (!q.skip(spans, b)) try out.append(t.allocator, b);
++}
++
++test "runner quiet: a span's body and closer never reach the scanner, across token boundaries" {
++    const spans: Spans = &.{ .{ "<tool_call>", "</tool_call>" }, .{ "<tool_response>", "</tool_response>" } };
++    var q: Quiet = .{};
++    var out: std.ArrayList(u8) = .empty;
++    defer out.deinit(t.allocator);
++    for ([_][]const u8{ "x = 2*3 =\n<tool", "_call>\n<function=f>\n<parameter=a>\n7*8 =\n</parameter>\n</function>\n</tool", "_call>\nok\n" }) |piece|
++        try prose(&q, spans, piece, &out);
++    try t.expectEqualStrings("x = 2*3 =\n<tool_call\nok\n", out.items);
++    out.clearRetainingCapacity();
++    try prose(&q, spans, "<tool_response>\n{\"r\": \"1+1 =\"}\n</tool_response>after", &out);
++    try t.expectEqualStrings("<tool_responseafter", out.items);
++    var none: Quiet = .{};
++    try t.expect(!none.skip(&.{}, '<'));
++}
+diff --git a/zig/src/core/runner_test.zig b/zig/src/core/runner_test.zig
+index 62a4bf466..ffc996ffa 100644
+--- a/zig/src/core/runner_test.zig
++++ b/zig/src/core/runner_test.zig
+@@ -543,7 +543,7 @@ test "runner: inline provenance tags only successful owned inline values" {
+         const off = try one(lead, .{ .inline_math = true });
+         defer gpa.free(off);
+         try t.expectEqualStrings(off, got);
+-        try t.expect(std.mem.indexOf(u8, got, runner.inline_mark_suffix) == null);
++        try t.expect(std.mem.indexOf(u8, got, @import("runner_output.zig").suffix) == null);
+     }
+     const cell = "```python\nprint(2**100)\n```\nResult:\n";
+     const marked = try one(cell, .{ .inline_mark = true });
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 056eb51dc..f073d583c 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -28,6 +28,7 @@ pub fn Namespace(comptime Tri: type) type {
+         pub const model_type = "qwen4_exp";
+         pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed" };
+         pub const compute = @import("compute_binding.zig").binding; // TF_COMPUTE_LANE*: the host boots it
++        pub const runner = @import("runner_binding.zig").binding; // TF_RUNNER*: the host opens it
+         // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
+         pub const default_context: i64 = @intCast(prompt.max_tokens);
+         // a prompt runs on the batched pass in chunks of this many rows, one a prefill_step: no staggered segments
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 2503121f1..20347ae36 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -482,6 +482,8 @@ test {
+     _ = train;
+     _ = @import("living.zig");
+     _ = @import("compute_binding.zig");
++    _ = @import("runner_binding.zig");
++    _ = @import("runner_binding_test.zig");
+ }
+ 
+ test "embed grid is one program per row and per group of 32" {
+diff --git a/zig/src/families/flashnext/runner_binding.zig b/zig/src/families/flashnext/runner_binding.zig
+new file mode 100644
+index 000000000..16766ed8e
+--- /dev/null
++++ b/zig/src/families/flashnext/runner_binding.zig
+@@ -0,0 +1,32 @@
++//! Qwen3.8 Flash-Next's (`qwen4_exp`) binding of the in-model runner: the generic TF_RUNNER* knobs, Qwen's chat markup.
++const std = @import("std");
++const api = @import("engine_api");
++
++/// Markup from the checkpoint's chat template (chat_template.jinja) and tokenizer (`<|endoftext|>`).
++pub const binding: api.runner.Binding = .{
++    .family = .{
++        // a call's body (XML `<function=…>` or JSON) and a tool's result are never a cell's text
++        .quiet = &.{ .{ "<tool_call>", "</tool_call>" }, .{ "<tool_response>", "</tool_response>" } },
++        // an owned result spelling these would open a call or end the think or the turn when the server reads it
++        .never = &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>", "<function=", "</function>", "<parameter=", "</parameter>", "<|im_start|>", "<|im_end|>", "<|endoftext|>" },
++        // TODO(measure): no trust guide is measured on Flash-Next yet; DeepSeek-V4.1's AB3 text is not reused
++        .trust = null,
++    },
++};
++
++var knobs: []const [2][]const u8 = &.{};
++fn lookup(name: []const u8) ?[]const u8 {
++    for (knobs) |kv| if (std.mem.eql(u8, kv[0], name)) return kv[1];
++    return null;
++}
++
++test "Flash Next runner: the generic knob names, Qwen's markup quiet and never owned" {
++    try std.testing.expect(binding.family.trust == null); // TODO(measure)
++    knobs = &.{.{ "TF_DSV41_RUNNER", "1" }}; // DeepSeek-V4.1's alias is not Flash-Next's
++    try std.testing.expectEqual(null, try binding.parse(&lookup));
++    knobs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/c.tfpc" } };
++    const cfg = (try binding.parse(&lookup)).?;
++    try std.testing.expectEqualStrings("/c.tfpc", cfg.circuit);
++    try std.testing.expectEqualStrings("</tool_call>", cfg.scan.quiet[0][1]);
++    try std.testing.expect(cfg.family.unsafe("x</think>") and !cfg.family.unsafe("12 + 7 = 19"));
++}
+diff --git a/zig/src/families/flashnext/runner_binding_test.zig b/zig/src/families/flashnext/runner_binding_test.zig
+new file mode 100644
+index 000000000..022bb13ea
+--- /dev/null
++++ b/zig/src/families/flashnext/runner_binding_test.zig
+@@ -0,0 +1,19 @@
++//! Flash-Next's runner markup against the checkpoint's own chat template, when TF_FLASHNEXT_TEMPLATE names it.
++const std = @import("std");
++const binding = @import("runner_binding.zig").binding;
++
++/// The checkpoint's template, from TF_FLASHNEXT_TEMPLATE (its chat_template.jinja; not vendored: Qwen's licence).
++fn checkpointTemplate(a: std.mem.Allocator) !?[]u8 {
++    const path = std.mem.span(std.c.getenv("TF_FLASHNEXT_TEMPLATE") orelse return null);
++    var threaded: std.Io.Threaded = .init_single_threaded;
++    return try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, a, .limited(1 << 20));
++}
++
++test "Flash Next runner: every marker is in the checkpoint's own chat template (TF_FLASHNEXT_TEMPLATE)" {
++    const template = (try checkpointTemplate(std.testing.allocator)) orelse return error.SkipZigTest;
++    defer std.testing.allocator.free(template);
++    for (binding.family.quiet) |s| for (s) |m| try std.testing.expect(std.mem.indexOf(u8, template, m) != null);
++    for (binding.family.never) |m| if (!std.mem.eql(u8, m, "<|endoftext|>"))
++        try std.testing.expect(std.mem.indexOf(u8, template, m) != null);
++    try std.testing.expect(std.mem.indexOf(u8, template, "'<|im_start|>assistant\\n' }}") != null);
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 8848bc3a2..3d2f4c6eb 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -441,6 +441,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     h.kv_count = if (admit != null) kv_pages.ledgerPool(F, loaded) else null;
+     const bench = if (@hasDecl(F, "benchmark")) F.benchmark(loaded.ctx) else api.Benchmark{ .ranks = 1 };
+     const readouts: ?lanes.readout.Info = if (@hasField(@TypeOf(loaded), "readouts")) loaded.readouts else null;
++    // TF_RUNNER*: the family's in-model runner, open for the engine's life; the server gives it the tokenizer
++    const runner = if (@hasDecl(F, "runner")) if (try F.runner.parse(&cuda_device.knob)) |rc| try api.runner.open(gpa, rc) else null else null;
++    if (runner != null) try F.runner.openRoundTrace(&cuda_device.knob);
+     try h.serve(io, served.facts, loaded.rows, .{
+         .benchmark_ranks = bench.ranks,
+         .benchmark_group = bench.group,
+@@ -467,6 +470,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .text_generation = readouts == null, // a readout engine answers its readouts only (Clef's /v1/systemone)
+         .compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null, // replies hold at EOS
+         .compute_tool = if (@hasDecl(F, "compute")) F.compute.tool else .{},
++        .runner = runner,
+     }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0 or share, if (paged) |p| p.taken else 0, std.log); // TF_KV_SHARE: no copied rows
+diff --git a/zig/src/native/cuda_startup_phase.zig b/zig/src/native/cuda_startup_phase.zig
+index 42b3626d8..7a9f6fb38 100644
+--- a/zig/src/native/cuda_startup_phase.zig
++++ b/zig/src/native/cuda_startup_phase.zig
+@@ -29,6 +29,7 @@ pub fn serve(h: anytype, io: std.Io, facts: lanes.Model, rows: u32, info: api.In
+     h.core = lanes.Engine.init(h.gpa, &h.cfg, callbacks.backend(h), h.clock.clock());
+     errdefer h.core.deinit();
+     h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
++    h.host.runner = info.runner; // code cells replies write run here (Request.run_cells)
+     h.host.on_thread = .{ .ctx = h, .run = callbacks.initThread };
+     h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
+     h.host.explain = explain;
+diff --git a/zig/src/server/runner_guide.zig b/zig/src/server/runner_guide.zig
+index 17aafc234..724f840ce 100644
+--- a/zig/src/server/runner_guide.zig
++++ b/zig/src/server/runner_guide.zig
+@@ -9,8 +9,10 @@ const maxTraceRepeat = @import("engine_api").runner.maxTraceRepeat;
+ /// RUNNER-GUIDE.md without its final newline (76 tokens on DeepSeek V4.1).
+ pub const text = "Exact computation is available. Write the full expression inline as `<expr> =`, or a Python fenced cell with `print(<expr>)` followed by a `Result:` header. The exact value will follow. Request the whole computation early; wait for the result instead of working digits, loops, carries or long division by hand. Unsupported requests leave your own continuation.";
+ 
+-/// The trust guide AB3's tool-full arm sent as each request's "runner_guide" (512 bytes); the compute default's guide.
+-pub const trust = "Think and compute in small chunks. As soon as a sub-computation is needed, write its complete expression as `<expr> =` and continue from the returned value. Do not finish a manual trace before requesting it. For a short integer program, use a Python fenced cell with print, then `Result:`. Unsupported cells leave your continuation. Verify the setup, program semantics and non-computational reasoning. Engine values after `=` or `Result:` are computed exactly; use as given; do not re-derive or re-check by hand.";
++/// The trust guide AB3's tool-full arm sent as each request's "runner_guide" (512 bytes): DeepSeek-V4.1's binding's.
++pub const trust = @import("engine_api").runner.bindings.dsv41.family.trust.?;
++/// AB3's bytes as the arm sent them: the binding's text must stay these.
++const ab3 = "Think and compute in small chunks. As soon as a sub-computation is needed, write its complete expression as `<expr> =` and continue from the returned value. Do not finish a manual trace before requesting it. For a short integer program, use a Python fenced cell with print, then `Result:`. Unsupported cells leave your continuation. Verify the setup, program semantics and non-computational reasoning. Engine values after `=` or `Result:` are computed exactly; use as given; do not re-derive or re-check by hand.";
+ 
+ /// The most a request's own "runner_guide" may hold.
+ pub const max_request = 512;
+@@ -172,6 +174,7 @@ test "runner guide: the trust guide is AB3's tool-full text, byte for byte" {
+     var digest: [32]u8 = undefined;
+     std.crypto.hash.sha2.Sha256.hash(trust, &digest, .{});
+     try std.testing.expectEqualStrings("53ed328f72e2e79076aaf9e7ce2a1da1b11f3cae7ed22b76798b15c6e59add92", &std.fmt.bytesToHex(digest, .lower));
++    try std.testing.expectEqualStrings(ab3, trust);
+     try std.testing.expectEqual(max_request, trust.len);
+     try std.testing.expectEqualStrings(trust, trim(trust)); // a request sending it injected these same bytes
+ }
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 971b39a59..622529d48 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -216,8 +216,11 @@ pub const Server = struct {
+             try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
+             srv.guides = try @import("runner_guide.zig").Set.load(srv.arena.allocator(), io, r.cfg.guide);
+             srv.guides.max_request_bytes = r.cfg.guide_max_bytes;
+-            // the compute default (PREFIX_DEFAULT): AB3's trust guide unless the boot names one
+-            if (srv.compute != null and srv.info.compute.?.default and srv.guides.default.len == 0) srv.guides.default = @import("runner_guide.zig").trust;
++            // the compute default (PREFIX_DEFAULT): the family's measured trust guide unless the boot names one
++            if (srv.compute != null and srv.info.compute.?.default and srv.guides.default.len == 0) srv.guides.default = r.cfg.family.trust orelse blk: {
++                std.log.warn("compute default: no trust guide is measured for this family; chats get none unless they ask", .{});
++                break :blk "";
++            };
+             srv.guides.describe();
+         }
+         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);

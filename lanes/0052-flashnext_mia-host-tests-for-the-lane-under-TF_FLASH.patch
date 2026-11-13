@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:04:59 +0700
+Subject: [PATCH 52/79] flashnext_mia: host tests for the lane under
+ TF_FLASHNEXT_ENGINE=mia, her lanes holding
+
+test-flashnext-mia-host now runs three more native tests:
+
+- her family declares upstream flashnext's compute and runner bindings,
+  the declarations openWith boots the lane and opens the runner from;
+- the ML arm (TF_COMPUTE_LANE=1, _DEFAULT=1, TF_RUNNER=0) and the MR arm
+  (the graph-bank runner, S3 on TF_COMPUTE_LANE_RUNNER*) parse through
+  them: the lane's default, the runner's forms and knobs, Qwen's quiet
+  spans and never-owned markup, S3's circuit, bank and settle time;
+- her lane backend (Lanes over her Toy engine) under the real LaneHost:
+  two replies held at their EOS, resumed with results that hold the EOS
+  (ChatML's <|im_end|>), land every result row and draw on, each drawn
+  token her target's greedy one over the whole history. Drafted, drafts
+  off, and a backend without a head; two streams a forward.
+
+Her module root exports cuda_lanes.zig as lane_backend for that test.
+---
+ zig/src/families/flashnext_mia/cuda.zig       |   1 +
+ zig/src/native/cuda_flashnext_mia.zig         |   4 +
+ .../native/cuda_flashnext_mia_lane_test.zig   | 214 ++++++++++++++++++
+ 3 files changed, 219 insertions(+)
+ create mode 100644 zig/src/native/cuda_flashnext_mia_lane_test.zig
+
+diff --git a/zig/src/families/flashnext_mia/cuda.zig b/zig/src/families/flashnext_mia/cuda.zig
+index 90d1b3623..8ca71709d 100644
+--- a/zig/src/families/flashnext_mia/cuda.zig
++++ b/zig/src/families/flashnext_mia/cuda.zig
+@@ -1,6 +1,7 @@
+ //! Flash Next (qwen4_exp) on CUDA in Zig: the Python engine's kernels and layouts, bit-exact on one GPU and TP=2.
+ 
+ pub const native = @import("cuda_native.zig");
++pub const lane_backend = @import("cuda_lanes.zig"); // her lanes (and Toy): native's compute hold test drives them
+ pub const ngram = @import("cuda_ngram.zig");
+ pub const rope = @import("cuda_rope.zig");
+ pub const sampler = @import("cuda_sampler.zig");
+diff --git a/zig/src/native/cuda_flashnext_mia.zig b/zig/src/native/cuda_flashnext_mia.zig
+index 95634b6ea..f8d767ae1 100644
+--- a/zig/src/native/cuda_flashnext_mia.zig
++++ b/zig/src/native/cuda_flashnext_mia.zig
+@@ -12,6 +12,10 @@ pub fn wanted(o: api.Open) bool {
+     return std.mem.eql(u8, o.model_type, family.model_type) and mia.selected();
+ }
+ 
++test {
++    _ = @import("cuda_flashnext_mia_lane_test.zig"); // the compute lane and runner under TF_FLASHNEXT_ENGINE=mia
++}
++
+ test "flashnext_mia family: two ranks and fp8 caches through the options, no --vision or --slide" {
+     const F = family;
+     try std.testing.expect(refusals.family(F, .{ .dir = "d", .model_type = F.model_type, .tp = 2, .rank = 1, .master = "192.0.2.1", .kv8 = true }) == null);
+diff --git a/zig/src/native/cuda_flashnext_mia_lane_test.zig b/zig/src/native/cuda_flashnext_mia_lane_test.zig
+new file mode 100644
+index 000000000..9e7027128
+--- /dev/null
++++ b/zig/src/native/cuda_flashnext_mia_lane_test.zig
+@@ -0,0 +1,214 @@
++//! TF_FLASHNEXT_ENGINE=mia serves the compute lane as upstream flashnext does: bindings, the arms' knobs, held replies.
++const std = @import("std");
++const api = @import("engine_api");
++const lanes = @import("lanes");
++const mia = @import("flashnext_mia");
++const family = @import("cuda_flashnext_mia.zig").family;
++const L = mia.lane_backend;
++const Toy = L.Toy;
++
++const t = std.testing;
++const gpa = t.allocator;
++
++/// A boot's environment as the bindings read it (native/cuda_device.knob in a server).
++const Env = struct {
++    var pairs: []const [2][]const u8 = &.{};
++    fn get(name: []const u8) ?[]const u8 {
++        for (pairs) |kv| if (std.mem.eql(u8, kv[0], name)) return kv[1];
++        return null;
++    }
++};
++
++const circuit = "/opt/tensorfold/share/runner/calc.tfpc";
++const bank = "/opt/tensorfold/share/runner/graph-v7-powmod/bank/bank.json";
++/// The ML arm: the compute lane offered to every thinking chat, no in-model runner.
++const ml = [_][2][]const u8{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_COMPUTE_LANE_DEFAULT", "1" }, .{ "TF_RUNNER", "0" } };
++/// The MR arm: the lane, the in-thinking runner on the graph bank, and S3's lane calls on the shared runner.
++const mr = [_][2][]const u8{
++    .{ "TF_COMPUTE_LANE", "1" },
++    .{ "TF_COMPUTE_LANE_DEFAULT", "1" },
++    .{ "TF_RUNNER", "1" },
++    .{ "TF_RUNNER_CIRCUIT", circuit },
++    .{ "TF_RUNNER_FORMS", "fence,repl,inline,trace" },
++    .{ "TF_RUNNER_BACKEND", "graph" },
++    .{ "TF_RUNNER_GRAPH_BANK", bank },
++    .{ "TF_RUNNER_STATED", "0" },
++    .{ "TF_RUNNER_INLINE_CHAIN", "0" },
++    .{ "TF_RUNNER_INLINE_MARK", "0" },
++    .{ "TF_RUNNER_SYNC_GRAPH", "0" },
++    .{ "TF_RUNNER_COMPILE_STEPS", "10522" },
++    .{ "TF_RUNNER_CELLS", "1" },
++    .{ "TF_RUNNER_COMMIT", "0" },
++    .{ "TF_COMPUTE_LANE_RUNNER", "1" },
++    .{ "TF_COMPUTE_LANE_RUNNER_CIRCUIT", circuit },
++    .{ "TF_COMPUTE_LANE_RUNNER_BACKEND", "graph" },
++    .{ "TF_COMPUTE_LANE_RUNNER_GRAPH_BANK", bank },
++    .{ "TF_COMPUTE_LANE_RUNNER_SETTLE_US", "3000" },
++};
++
++test "flashnext_mia family: it declares upstream flashnext's compute lane and runner, which openWith boots" {
++    // native/cuda.zig's openWith boots the lane and opens the runner only for a family that declares them
++    try t.expect(@hasDecl(family, "compute") and @hasDecl(family, "runner"));
++    const upstream = @import("flashnext").native;
++    try t.expectEqualDeep(upstream.compute, family.compute);
++    try t.expectEqualDeep(upstream.runner, family.runner);
++}
++
++test "flashnext_mia family: the ML and MR arms' knobs parse into the lane, the runner and S3" {
++    const s3 = comptime api.compute_circuit.binding(family.compute);
++    Env.pairs = &ml;
++    try t.expect((try family.compute.parse(&Env.get)).?.default);
++    try t.expect((try family.runner.parse(&Env.get)) == null);
++    try t.expect((try s3.parse(&Env.get)) == null);
++    Env.pairs = &mr;
++    try t.expect((try family.compute.parse(&Env.get)).?.default);
++    const rc = (try family.runner.parse(&Env.get)).?;
++    try t.expectEqualStrings(circuit, rc.circuit);
++    try t.expectEqualStrings(bank, rc.graph_bank);
++    try t.expect(rc.backend == .graph and rc.cells and !rc.commit and !rc.inline_mark and !rc.sync_graph);
++    try t.expectEqual(@as(usize, 10522), rc.compile_steps);
++    try t.expect(rc.scan.fence and rc.scan.repl and rc.scan.inline_math and rc.scan.trace);
++    try t.expect(!rc.scan.trace_whole and !rc.scan.inline_chain);
++    // Qwen's markup: tool calls and results are never a cell's text, an owned result never closes a turn
++    try t.expectEqual(@as(usize, 2), rc.scan.quiet.len);
++    try t.expect(rc.family.unsafe("7<|im_end|>") and !rc.family.unsafe("7"));
++    const sc = (try s3.parse(&Env.get)).?;
++    try t.expectEqualStrings(circuit, sc.circuit);
++    try t.expectEqualStrings(bank, sc.graph_bank);
++    try t.expect(sc.backend == .graph);
++    try t.expectEqual(@as(u32, 3000), sc.settle_us);
++}
++
++/// A reply's events as the server's mailbox keeps them.
++const Box = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    done: ?api.Reason = null,
++    fn event(ctx: *anyopaque, _: api.Id, e: *const api.Event) void {
++        const b: *@This() = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(t.io);
++        defer b.mutex.unlock(t.io);
++        switch (e.*) {
++            .tokens => |x| b.tokens.appendSlice(gpa, x) catch {},
++            .finished => |f| b.done = f.reason,
++            else => {},
++        }
++    }
++    fn count(b: *@This()) struct { n: usize, done: ?api.Reason } {
++        b.mutex.lockUncancelable(t.io);
++        defer b.mutex.unlock(t.io);
++        return .{ .n = b.tokens.items.len, .done = b.done };
++    }
++    /// Waits until `n` tokens arrived (or the reply ended), up to 10 s.
++    fn reach(b: *@This(), n: usize) !void {
++        for (0..10_000) |_| {
++            const c = b.count();
++            if (c.n >= n or c.done != null) return;
++            std.Io.sleep(t.io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.Timeout;
++    }
++    fn wait(b: *@This()) !api.Reason {
++        for (0..10_000) |_| {
++            if (b.count().done) |r| return r;
++            std.Io.sleep(t.io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.Timeout;
++    }
++};
++
++/// Her toy target's greedy draw after `history` (it hashes the whole history; its vocabulary is 50 tokens).
++fn greedy(history: []const u32) u32 {
++    return Toy.next(history, &.{}, null, 0);
++}
++
++const Eos = struct { token: u32, at: usize };
++
++/// The first greedy draw after `p` (index 2 or later) that no earlier draw repeats: a reachable EOS.
++fn eosAfter(p: []const u32) !Eos {
++    var h: std.ArrayList(u32) = .empty;
++    defer h.deinit(gpa);
++    try h.appendSlice(gpa, p);
++    var seen: [50]bool = @splat(false);
++    for (0..64) |i| {
++        const x = greedy(h.items);
++        if (i >= 2 and !seen[x]) return .{ .token = x, .at = i };
++        seen[x] = true;
++        try h.append(gpa, x);
++    }
++    return error.NoEos;
++}
++
++const Shape = enum { drafted, no_drafts, plain };
++
++/// Two replies held at their EOS on her lanes, resumed with results holding the EOS: rows land, greedy draws go on.
++fn heldResults(shape: Shape) !void {
++    var toy: Toy = .{ .gpa = gpa };
++    const drafting = shape != .plain;
++    var b = L.Lanes(Toy).init(gpa, &toy, drafting, 1 << 16, L.max_rows);
++    defer b.deinit();
++    b.streams = 2;
++    b.confidence = mia.engine.confidenceSetting(); // her served stop rule, as cuda_native.openOn sets it
++    b.product_streams = mia.engine.productStreams();
++    if (drafting) {
++        for (b.costs[0..L.max_rows], 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 8.0 + 0.3 * @as(f64, @floatFromInt(w)) };
++        b.cost_count = L.max_rows;
++        for (b.shared[0..2], [_]usize{ 2, 4 }) |*c, n| c.* = .{ .width = @intCast(n * L.max_rows), .ms = 9.0 + 0.2 * @as(f64, @floatFromInt(n * L.max_rows)) };
++        b.shared_count = 2;
++        b.mtp_ms = 0.4;
++    }
++    const rows: u32 = if (drafting) L.max_rows else 1; // native/cuda_startup_phase.serve's lanes.Config
++    var cfg = try lanes.Config.init(gpa, b.facts(), rows, rows - 1);
++    defer cfg.deinit(gpa);
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
++    defer core.deinit();
++    var host = api.LaneHost.init(gpa, t.io, &core, .{ .lanes = 2 });
++
++    const prompts = [2][]const u32{ &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 }, &.{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5 } };
++    const ids = [2]api.Id{ 7, 8 };
++    var eos: [2]Eos = undefined;
++    var eos_ids: [2][1]u32 = undefined;
++    var results: [2][21]u32 = undefined;
++    var requests: [2]api.Request = undefined;
++    var boxes: [2]Box = .{ .{}, .{} };
++    defer for (&boxes) |*x| x.tokens.deinit(gpa);
++    for (prompts, 0..) |p, i| {
++        eos[i] = try eosAfter(p);
++        const q = eos[i].token;
++        eos_ids[i] = .{q};
++        // ChatML's tool turn: its rows close with <|im_end|>, Qwen's EOS, and the next turn opens after it
++        results[i] = .{ 11, 22, 33, q, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89, 13, 24, q, 35 };
++        requests[i] = .{ .prompt = p, .max_tokens = 80, .eos = &eos_ids[i], .hold_eos = true, .drafts = shape != .no_drafts };
++    }
++    const e = host.engine();
++    try host.start();
++    defer host.stop();
++    for (ids, &requests, &boxes) |id, *r, *x| try e.submit(id, r, .{ .ctx = x, .event = Box.event });
++    errdefer for (ids) |id| e.cancel(id); // a held stream would keep the host from stopping
++    for (&boxes, eos) |*x, q| try x.reach(q.at + 1);
++    for (ids, &results) |id, *r| try t.expect(api.hold.resumeHeld(e, id, .{ .tokens = r }));
++    // every forced row and the model's next draw arrive: a forced EOS neither holds nor ends the reply
++    for (&boxes, eos, results) |*x, q, r| try x.reach(q.at + 1 + r.len + 1);
++    for (ids) |id| e.cancel(id);
++    for (&boxes) |*x| _ = try x.wait();
++    for (prompts, &boxes, eos, results) |p, *x, q, r| {
++        const out = x.tokens.items;
++        try t.expect(out.len >= q.at + 1 + r.len + 1);
++        try t.expectEqualSlices(u32, &r, out[q.at + 1 ..][0..r.len]);
++        var history: std.ArrayList(u32) = .empty;
++        defer history.deinit(gpa);
++        try history.appendSlice(gpa, p);
++        for (out, 0..) |token, i| {
++            const forced = i > q.at and i <= q.at + r.len;
++            if (!forced) try t.expectEqual(greedy(history.items), token);
++            try history.append(gpa, token);
++        }
++    }
++}
++
++test "flashnext_mia family: compute hold: her lanes land a held reply's result whole and draw on exactly" {
++    try heldResults(.drafted);
++    try heldResults(.no_drafts);
++    try heldResults(.plain);
++}

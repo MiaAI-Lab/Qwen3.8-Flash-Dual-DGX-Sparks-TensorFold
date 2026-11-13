@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 04:12:01 +0700
+Subject: [PATCH 36/79] lanes: a held reply's result rows land whole, their EOS
+ neither holds nor ends it
+
+ChatML templates (Qwen3.x, Qwen3.8-Flash-Next) close the tool-result turn with <|im_end|>,
+the model's EOS. Stream.commit took that forced EOS for a drawn one and held the stream
+again, so every lane call stalled after its result. hold.resumeHeld now counts the result's
+rows (hold.resultRow); while they land, the EOS hold, EOS stop and stop-sequence checks skip them.
+---
+ zig/src/core/lane_host_hold_test.zig | 43 ++++++++++++++++++++++++++++
+ zig/src/core/lanes/hold.zig          |  7 +++++
+ zig/src/core/lanes/stream.zig        | 10 +++++--
+ 3 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/core/lane_host_hold_test.zig b/zig/src/core/lane_host_hold_test.zig
+index 9d16e4ede..d90993ece 100644
+--- a/zig/src/core/lane_host_hold_test.zig
++++ b/zig/src/core/lane_host_hold_test.zig
+@@ -164,3 +164,46 @@ test "compute hold: a held reply that is cancelled ends cancelled, in the defaul
+     try heldReply(false, .cancel);
+     try heldReply(true, .cancel);
+ }
++
++const Shape = enum { plain, mtp, mtp_no_drafts };
++
++/// A result whose rows hold the EOS (ChatML closes the tool turn with `<|im_end|>`, Qwen's EOS): it lands whole.
++fn forcedEos(shape: Shape) !void {
++    const eos = try eosAfter(&prompt);
++    const result = [_]u32{ 11, 22, 33, eos.token, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89, 13, 24, eos.token, 35 };
++    var costs: [16]lanes.config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
++    // Flash-Next's lanes model (families/flashnext/batch_costs.zig): MTP head drafts over 16-row windows
++    const model: lanes.config.Model = if (shape == .plain) .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true } else .{ .exact_width = 16, .first_copy_rows = 4, .gpu_tokens = true, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .window_costs = &costs, .mtp_step_ms = 0.5, .hidden_rows = true, .batch_rows = 16, .max_streams = 2, .draft_streams = true };
++    var cfg = try lanes.Config.init(gpa, model, if (shape == .plain) 8 else 16, if (shape == .plain) 7 else 15);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    var box: Box = .{};
++    defer box.tokens.deinit(gpa);
++    const request: Request = .{ .prompt = &prompt, .max_tokens = 80, .eos = &.{eos.token}, .hold_eos = true, .drafts = shape != .mtp_no_drafts };
++    const e = host.engine();
++    try host.start();
++    defer host.stop();
++    try e.submit(7, &request, .{ .ctx = &box, .event = Box.event });
++    errdefer e.cancel(7); // a stream held again would keep the host from stopping
++    try box.reach(eos.at + 1);
++    try std.testing.expect(api.hold.resumeHeld(e, 7, .{ .tokens = &result }));
++    // every forced row and the model's next draw arrive: a forced EOS neither holds nor ends the reply
++    try box.reach(eos.at + 1 + result.len + 1);
++    const c = box.count();
++    try std.testing.expect(c.n >= eos.at + 1 + result.len + 1);
++    try std.testing.expectEqualSlices(u32, &result, box.tokens.items[eos.at + 1 .. eos.at + 1 + result.len]);
++    e.cancel(7);
++    _ = try box.wait();
++}
++
++test "compute hold: a result whose forced rows hold the EOS lands whole, plain, MTP-drafted and MTP without drafts" {
++    try forcedEos(.plain);
++    try forcedEos(.mtp);
++    try forcedEos(.mtp_no_drafts);
++}
+diff --git a/zig/src/core/lanes/hold.zig b/zig/src/core/lanes/hold.zig
+index aac8faecb..cbd6d3252 100644
+--- a/zig/src/core/lanes/hold.zig
++++ b/zig/src/core/lanes/hold.zig
+@@ -38,12 +38,19 @@ pub fn resumeHeld(s: *Stream, gpa: Allocator, tokens: []const u32, think_open: b
+         return if (tokens.len == 0) .ended else .no_room;
+     }
+     try s.force.appendSlice(gpa, tokens);
++    s.resumed_rows = tokens.len;
+     s.held = false;
+     s.paused = false;
+     s.think_open = think_open;
+     return .resumed;
+ }
+ 
++/// Whether the token landing now is a resumeHeld result's row: the template's, so its EOS neither holds nor ends.
++pub fn resultRow(s: *Stream) bool {
++    defer s.resumed_rows -|= 1;
++    return s.resumed_rows > 0;
++}
++
+ /// Continues a stream held at a runner trigger: `tokens` (cut to the room left) are forced next, then the model draws.
+ pub fn resumeAwaiting(s: *Stream, gpa: Allocator, tokens: []const u32) Allocator.Error!bool {
+     if (!s.awaiting or !s.held or s.finished) return false;
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 5e8cc8a84..e3cb0f6ab 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -216,6 +216,7 @@ pub const Stream = struct {
+     paused: bool = false,
+     hold_eos: bool = false,
+     held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
++    resumed_rows: usize = 0, // a held reply's result rows still to land: their EOS neither holds nor ends it
+     runner: ?RunnerHook = null,
+     awaiting: bool = false, // held at a runner trigger: hold.resumeAwaiting continues it
+     settle: enum { none, matching, cut } = .none, // this commit: a result settled at a trigger (hold.settle), its end
+@@ -403,6 +404,7 @@ pub const Stream = struct {
+         s.think_open = false;
+         s.force.clearRetainingCapacity();
+         s.force.appendSliceAssumeCapacity(s.think_close[1..]);
++        s.resumed_rows = 0;
+         return s.think_close[0];
+     }
+ 
+@@ -480,7 +482,8 @@ pub const Stream = struct {
+             }
+             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
+             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
+-            if (@import("runner_eos.zig").hold(s, t, stopped)) break;
++            const result_row = @import("hold.zig").resultRow(s); // its EOS (ChatML's <|im_end|>) closes the tool turn
++            if (!result_row and @import("runner_eos.zig").hold(s, t, stopped)) break;
+             const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
+             if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold, ended_think) and can_hold) {
+                 if (try @import("hold.zig").settle(s, gpa, r)) continue;
+@@ -489,11 +492,11 @@ pub const Stream = struct {
+                 s.paused = true;
+                 break;
+             };
+-            if (s.isEos(t) and s.hold_eos) {
++            if (s.isEos(t) and s.hold_eos and !result_row) {
+                 s.held = true;
+                 s.paused = true;
+                 break;
+-            } else if (s.isEos(t) or s.stopped()) {
++            } else if (!result_row and (s.isEos(t) or s.stopped())) {
+                 s.finished = true;
+                 s.reason = .stop;
+             } else if (fire) |period| {
+@@ -508,6 +511,7 @@ pub const Stream = struct {
+                     s.think_open = false;
+                     s.force.clearRetainingCapacity();
+                     s.force.appendSliceAssumeCapacity(s.think_close);
++                    s.resumed_rows = 0;
+                 }
+                 break;
+             } else if (s.budgetLeft() <= 0) {

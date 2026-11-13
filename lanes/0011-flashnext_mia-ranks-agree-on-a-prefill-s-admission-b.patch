@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:34:06 +0200
+Subject: [PATCH 11/79] flashnext_mia: ranks agree on a prefill's admission
+ before either makes its sequence
+
+The two ranks agree on a prefill's admission before either makes its sequence, whose growth runs a collective
+(MiaAI-Lab issue #6: a rank that refused with NoRoom left the other in a collective it never joined, until
+TF_TP_TIMEOUT_S took both down). The patch and its regression test are by Drake Lu (xinlu8439).
+
+Source: patches/0011-prefill-admission-before-sequence.patch @ MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold dc05c912342e
+Port: applied as is to zig/src/families/flashnext_mia/cuda_lanes.zig (her zig/src/families/flashnext/cuda_lanes.zig).
+---
+ zig/src/families/flashnext_mia/cuda_lanes.zig | 91 +++++++++++++++----
+ 1 file changed, 71 insertions(+), 20 deletions(-)
+
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes.zig b/zig/src/families/flashnext_mia/cuda_lanes.zig
+index 94197a227..f045479bf 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes.zig
+@@ -219,14 +219,12 @@ pub fn Lanes(comptime E: type) type {
+             const self = of(ptr);
+             self.fillLate();
+             const e = self.e;
+-            const l = self.preparePrefill(s) catch |err| {
++            const a = self.admit(s, 0) catch |err| {
+                 try self.agree(err);
+                 unreachable;
+             };
+-            self.agree(null) catch |err| {
+-                self.dropLane(s, l);
+-                return err;
+-            };
++            try self.agree(null);
++            const l = self.makeLane(s, a) catch |err| return self.lost("a prompt's sequence", err);
+             const requested = s.reuse.at > 0;
+             var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
+             if (requested) {
+@@ -404,14 +402,12 @@ pub fn Lanes(comptime E: type) type {
+             const self = of(ptr);
+             self.fillLate();
+             const e = self.e;
+-            const l = self.preparePrefill(s) catch |err| {
++            const a = self.admit(s, 0) catch |err| {
+                 try self.agree(err);
+                 unreachable;
+             };
+-            self.agree(null) catch |err| {
+-                self.dropLane(s, l);
+-                return err;
+-            };
++            try self.agree(null);
++            const l = self.makeLane(s, a) catch |err| return self.lost("a prompt's sequence", err);
+             // a resume both ranks can make (each holds the state), else both prefill from the start
+             const requested = s.reuse.at > 0;
+             var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
+@@ -439,19 +435,24 @@ pub fn Lanes(comptime E: type) type {
+             // an image or video prompt prefills alone (attachMedia, the MODE 2 prompt rows)
+             for (ss) |s| if (s.reuse.at > 0 or s.reuse.marks.len > 0 or s.media != null) return error.BurstRefused;
+             var ls: [max_rows]*Lane = undefined;
+-            var made: usize = 0;
++            var adm: [max_rows]Admission = undefined;
++            var admitted: usize = 0;
++            var ahead: usize = 0; // the burst's earlier streams' reservations, not made yet
+             var failure: ?anyerror = null;
+             for (ss) |s| {
+-                ls[made] = self.preparePrefill(s) catch |err| {
++                adm[admitted] = self.admit(s, ahead) catch |err| {
+                     failure = err;
+                     break;
+                 };
++                ahead += adm[admitted].need;
++                admitted += 1;
++            }
++            self.agree(failure) catch return error.BurstRefused;
++            var made: usize = 0;
++            for (ss, adm[0..ss.len]) |s, a| {
++                ls[made] = self.makeLane(s, a) catch |err| return self.burstLost(ss, ls[0..made], err);
+                 made += 1;
+             }
+-            self.agree(failure) catch {
+-                for (ss[0..made], ls[0..made]) |s, l| self.dropLane(s, l);
+-                return error.BurstRefused;
+-            };
+             for (ss) |s| {
+                 s.cached = 0;
+                 s.reuse_failed = false;
+@@ -744,9 +745,14 @@ pub fn Lanes(comptime E: type) type {
+             return null;
+         }
+ 
+-        /// The prefill's local steps: admission, the last round's commits, the stream's lane and a new sequence.
+-        fn preparePrefill(self: *Self, s: *lanes.Stream) !*Lane {
+-            const e = self.e;
++        /// An admitted prompt's window and reservation (admit), for its lane (makeLane).
++        const Admission = struct { limit: usize, need: usize, before: usize };
++
++        /// The prefill's admission, local and with no collective: the window and its reservation beside the admitted
++        /// streams', `ahead` bytes more for a burst's earlier streams. The ranks agree on it before makeLane, whose
++        /// new sequence runs a collective (growMapped's vote): a rank refusing alone while the other made its sequence
++        /// left that one in a collective the refusing rank never joined (MiaAI-Lab dual-Spark issue #6).
++        fn admit(self: *Self, s: *lanes.Stream, ahead: usize) !Admission {
+             const ids = s.prompt();
+             const limit = ids.len + s.max_new + self.window;
+             if (ids.len == 0 or limit > self.context) return error.PromptTooLong;
+@@ -754,7 +760,16 @@ pub fn Lanes(comptime E: type) type {
+             const media_bytes: usize = if (s.media) |m| std.mem.alignForward(usize, ids.len * 12, 256) + std.mem.alignForward(usize, m.featureBytes(), 256) else 0;
+             const need = self.footprint(limit) + media_bytes;
+             const before = if (self.lanes.get(s)) |old| old.reserved else 0;
+-            if (!self.overcommit and self.reserved - before + need + self.kept_bytes > self.budget()) return error.NoRoom;
++            if (!self.overcommit and self.reserved - before + ahead + need + self.kept_bytes > self.budget()) return error.NoRoom;
++            return .{ .limit = limit, .need = need, .before = before };
++        }
++
++        /// The agreed prefill's steps: the last round's commits, the stream's lane and a new sequence.
++        fn makeLane(self: *Self, s: *lanes.Stream, a: Admission) !*Lane {
++            const e = self.e;
++            const limit = a.limit;
++            const need = a.need;
++            const before = a.before;
+             try self.settle();
+             const l = if (self.lanes.get(s)) |old| blk: {
+                 e.freeSeq(old.seq);
+@@ -1669,6 +1684,42 @@ test "a rank's failed prepare stops both ranks before a collective; an engine er
+     try std.testing.expectEqual(@as(usize, 0), t.seqs);
+ }
+ 
++test "the ranks agree on admission before a sequence is made: its growth runs a collective the other rank must join" {
++    const gpa = std.testing.allocator;
++    const G = struct {
++        toy: *Toy,
++        refuse: bool = false,
++        seqs_at: [4]usize = undefined,
++        agreements: usize = 0,
++        fn agree(p: *anyopaque, ok: bool) anyerror!bool {
++            const g: *@This() = @ptrCast(@alignCast(p));
++            g.seqs_at[g.agreements] = g.toy.seqs;
++            g.agreements += 1;
++            return ok and !g.refuse;
++        }
++        fn fatal(_: *anyopaque, _: []const u8, _: anyerror) void {}
++    };
++    var t: Toy = .{ .gpa = gpa };
++    var g: G = .{ .toy = &t };
++    var b = Lanes(Toy).init(gpa, &t, true, 4096, max_rows);
++    defer b.deinit();
++    b.gate = .{ .ptr = &g, .agree = G.agree, .fatal = G.fatal };
++    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 20 });
++    defer s.deinit(gpa);
++    // admitted on both ranks: the vote comes first, the sequence after it
++    try b.backend().prefill(&s);
++    try std.testing.expectEqual(@as(usize, 1), g.agreements);
++    try std.testing.expectEqual(@as(usize, 0), g.seqs_at[0]);
++    try std.testing.expectEqual(@as(usize, 1), t.seqs);
++    b.backend().release(&s);
++    // the other rank refused (its NoRoom): this rank made no sequence, nothing reserved
++    g.refuse = true;
++    try std.testing.expectError(error.OtherRankFailed, b.backend().prefill(&s));
++    try std.testing.expectEqual(@as(usize, 0), g.seqs_at[1]);
++    try std.testing.expectEqual(@as(usize, 0), t.seqs);
++    try std.testing.expectEqual(@as(usize, 0), b.reserved);
++}
++
+ test "admission reserves each stream's whole window: a prompt that would not fit beside the others waits for room" {
+     const gpa = std.testing.allocator;
+     var t: Toy = .{ .gpa = gpa };

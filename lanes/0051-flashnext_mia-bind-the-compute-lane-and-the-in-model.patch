@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:59:13 +0700
+Subject: [PATCH 51/79] flashnext_mia: bind the compute lane and the in-model
+ runner as upstream's flashnext
+
+Her family (TF_FLASHNEXT_ENGINE=mia) declares `compute` and `runner`, the
+same bindings upstream's flashnext Namespace declares: both read qwen4_exp
+checkpoints with the same ChatML template and tokenizer, so the generic
+TF_COMPUTE_LANE* / TF_RUNNER* knobs, the python tool and Qwen's quiet and
+never-owned markup are one definition. native/cuda.zig's openWith already
+boots both for any family that declares them (Info.compute, compute_tool,
+runner, compute_runner for S3).
+
+Build: one flashnext module, shared by the native engines module and hers.
+---
+ zig/build/cuda_engines.zig                     | 5 +++--
+ zig/build/flashnext_mia.zig                    | 5 +++--
+ zig/src/families/flashnext_mia/cuda_native.zig | 3 +++
+ 3 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index c29320d94..079670a48 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -48,6 +48,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const api = qwen35.import_table.get("engine_api").?; // family()'s, so the server and qwen3_5 share one
+     const canon = canonModule(b, target, optimize);
+     const verbs = @import("tp.zig").verbsModule(b, target, optimize);
++    const flashnext = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision, api); // MiaAI-Lab's family's too
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+@@ -61,7 +62,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "drama3", .module = @import("drama3_host.zig").module(b, target, optimize, cuda, core) },
+             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
+             .{ .name = "core", .module = core },
+-            .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision, api) },
++            .{ .name = "flashnext", .module = flashnext },
+             .{ .name = "glm_cuda", .module = glmCudaShared(b, target, optimize, cuda, core, lanes, heat, api, canon, verbs) },
+             .{ .name = "minimax_m3_cuda", .module = @import("minimax_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "qwen35", .module = qwen35 },
+@@ -70,7 +71,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "spark25", .module = @import("spark25.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "lfm2_moe_cuda", .module = @import("lfm2_moe_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "dory", .module = @import("dory.zig").module(b, target, optimize, cuda, core, lanes) },
+-            .{ .name = "flashnext_mia", .module = @import("flashnext_mia.zig").module(b, target, optimize, cuda, core, lanes) },
++            .{ .name = "flashnext_mia", .module = @import("flashnext_mia.zig").module(b, target, optimize, cuda, core, lanes, flashnext) },
+         },
+     });
+     mod.addImport("qwen4", @import("qwen4.zig").module(b, target, optimize, core));
+diff --git a/zig/build/flashnext_mia.zig b/zig/build/flashnext_mia.zig
+index eca1c3b28..7ff566f0a 100644
+--- a/zig/build/flashnext_mia.zig
++++ b/zig/build/flashnext_mia.zig
+@@ -1,12 +1,13 @@
+ //! MiaAI-Lab's Flash Next engine on CUDA (zig/src/families/flashnext_mia): its module and its own check steps.
+ const std = @import("std");
+ 
+-/// The family over the runtime, the core and the lane core.
+-pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
++/// The family over the runtime, the core, the lane core and upstream flashnext (its compute lane and runner bindings).
++pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, flashnext: *std.Build.Module) *std.Build.Module {
+     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext_mia/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     m.addImport("cuda", cuda);
+     m.addImport("core", core);
+     m.addImport("lanes", lanes);
++    m.addImport("flashnext", flashnext); // the same qwen4_exp markup: its compute and runner bindings are hers
+     return m;
+ }
+ 
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index 597e7dd4e..4825955c5 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -18,6 +18,9 @@ pub const default_context: i64 = 262144;
+ /// One prompt pass at a time (no staggered segments); her pass runs in her engine's own 2048-row chunks.
+ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = 2048;
++/// The compute lane and in-model runner as upstream's flashnext binds them: one checkpoint, so one ChatML markup.
++pub const compute = @import("flashnext").native.compute; // TF_COMPUTE_LANE*: native/cuda.zig's openWith boots it
++pub const runner = @import("flashnext").native.runner; // TF_RUNNER*: openWith opens it for the lane host
+ 
+ /// f212's contract (cuda_options.zig): lanes is --parallel, kv8 --kv-cache fp8 (her --kv-dtype fp8); segments ignored.
+ pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: ?[]const u8 = null, master_port: u16 = 29551, kv8: bool = false };

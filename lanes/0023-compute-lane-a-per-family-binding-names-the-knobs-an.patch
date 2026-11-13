@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 16:15:26 +0700
+Subject: [PATCH 23/79] compute lane: a per-family binding names the knobs and
+ the built-in tool
+
+core/compute_binding.zig: a Binding is a knob prefix (TF_COMPUTE_LANE by
+default), an optional family alias, and the Tool the server offers (name,
+opt-in type, the compute default's min max_tokens). A boot sets the generic
+names or the alias, not both (BadKnob).
+
+- dsv41: generic names or TF_DSV41_COMPUTE_LANE* as before; the tool is
+  python / code_interpreter / 1024, so its definition bytes are unchanged.
+- flashnext: generic names only; a stub its serve engine does not read yet.
+
+The server reads Info.compute_tool for the tool's name, opt-in type and
+min_tokens; the existing one-argument helpers keep the default binding.
+---
+ zig/src/core/compute_binding.zig              | 38 ++++++++
+ zig/src/core/compute_lane.zig                 |  7 ++
+ zig/src/core/compute_lane_unit_test.zig       | 25 +++++
+ zig/src/core/engine_api.zig                   |  1 +
+ .../families/deepseek_v41/serve_engine.zig    |  6 +-
+ zig/src/server/chat.zig                       |  2 +-
+ zig/src/server/compute_segments.zig           | 12 +--
+ zig/src/server/compute_turns.zig              | 91 +++++++++++++------
+ zig/src/server/openai_calls.zig               |  4 +-
+ 9 files changed, 148 insertions(+), 38 deletions(-)
+ create mode 100644 zig/src/core/compute_binding.zig
+
+diff --git a/zig/src/core/compute_binding.zig b/zig/src/core/compute_binding.zig
+new file mode 100644
+index 000000000..ab9b028be
+--- /dev/null
++++ b/zig/src/core/compute_binding.zig
+@@ -0,0 +1,38 @@
++//! A family's binding of the compute lane: the knob names it boots from and the built-in tool its requests see.
++const std = @import("std");
++const lane = @import("compute_lane.zig");
++const log = std.log.scoped(.compute_lane);
++
++/// The built-in tool as the server offers it.
++pub const Tool = struct {
++    name: []const u8 = "python", // the function the model calls
++    opt_in: []const u8 = "code_interpreter", // the tool type a request lists to ask for it
++    min_tokens: i64 = 1024, // under this max_tokens the compute default offers it to no one unasked
++};
++
++pub const Binding = struct {
++    prefix: []const u8 = "TF_COMPUTE_LANE", // PREFIX=1 enables; PREFIX_DEFAULT, PREFIX_WORKERS, ... (compute_lane.Config)
++    alias: ?[]const u8 = null, // the family's own older names for the same knobs: a boot sets one or the other
++    tool: Tool = .{},
++
++    /// The lane's config from the names the boot set; knobs under both the prefix and the alias are error.BadKnob.
++    pub fn parse(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!?lane.Config {
++        const old = b.alias orelse return lane.Config.parse(get, b.prefix);
++        if (!anySet(get, old)) return lane.Config.parse(get, b.prefix);
++        if (anySet(get, b.prefix)) {
++            log.warn("set the compute lane under {s}* or {s}*, not both", .{ b.prefix, old });
++            return error.BadKnob;
++        }
++        return lane.Config.parse(get, old);
++    }
++};
++
++fn anySet(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) bool {
++    inline for (lane.Config.knobs) |k| if (get(prefix ++ k)) |v| if (v.len > 0) return true;
++    return false;
++}
++
++/// DeepSeek-V4.1: the generic names, or TF_DSV41_COMPUTE_LANE* as before.
++pub const dsv41: Binding = .{ .alias = "TF_DSV41_COMPUTE_LANE" };
++/// Qwen3.8 Flash-Next (`qwen4_exp`): the generic names only. Its serve engine does not read it yet.
++pub const flashnext: Binding = .{};
+diff --git a/zig/src/core/compute_lane.zig b/zig/src/core/compute_lane.zig
+index abd1fe5a3..e458e92cc 100644
+--- a/zig/src/core/compute_lane.zig
++++ b/zig/src/core/compute_lane.zig
+@@ -5,6 +5,10 @@ const linux = std.os.linux;
+ const Allocator = std.mem.Allocator;
+ pub const sandbox = @import("compute_sandbox.zig");
+ pub const runner = @import("compute_runner.zig");
++/// A family's knob names and built-in tool (compute_binding.zig).
++pub const Binding = @import("compute_binding.zig").Binding;
++pub const Tool = @import("compute_binding.zig").Tool;
++pub const bindings = @import("compute_binding.zig");
+ const log = std.log.scoped(.compute_lane);
+ 
+ pub const Config = struct {
+@@ -18,6 +22,9 @@ pub const Config = struct {
+     cpus: []const u8 = "", // optional affinity list like "16-19" or "1,3,5-7"
+     default: bool = false, // PREFIX_DEFAULT=1: every thinking chat gets the built-in tool, whatever it sends
+ 
++    /// The knobs `parse` reads, after the prefix.
++    pub const knobs = [_][]const u8{ "", "_DEFAULT", "_WORKERS", "_MAX_MS", "_MAX_RESULT_TOKENS", "_MAX_CALLS", "_MEM_MB", "_PYTHON", "_CPUS" };
++
+     /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
+     pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
+         const always = try flag(get, prefix ++ "_DEFAULT");
+diff --git a/zig/src/core/compute_lane_unit_test.zig b/zig/src/core/compute_lane_unit_test.zig
+index e535a4ae9..d6701de91 100644
+--- a/zig/src/core/compute_lane_unit_test.zig
++++ b/zig/src/core/compute_lane_unit_test.zig
+@@ -49,6 +49,31 @@ test "compute lane config: _DEFAULT is off unless 1, needs the lane and refuses
+     try std.testing.expectError(error.BadKnob, parse(&.{ .{ "TF_X", "0" }, .{ "TF_X_DEFAULT", "1" } }));
+ }
+ 
++test "compute lane binding: generic names or the family's alias, not both; the tool is python" {
++    const dsv41 = lane.bindings.dsv41;
++    knobs = &.{};
++    try expectEqual(null, try dsv41.parse(&lookup));
++    knobs = &.{ .{ "TF_DSV41_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE_WORKERS", "3" } };
++    try expectEqual(@as(u8, 3), (try dsv41.parse(&lookup)).?.workers);
++    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_COMPUTE_LANE_DEFAULT", "1" } };
++    try expect((try dsv41.parse(&lookup)).?.default);
++    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE_MAX_MS", "5" } };
++    try std.testing.expectError(error.BadKnob, dsv41.parse(&lookup));
++    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE", "" } }; // empty is unset
++    try expect((try dsv41.parse(&lookup)) != null);
++    // Flash-Next reads the generic names only
++    const flashnext = lane.bindings.flashnext;
++    knobs = &.{.{ "TF_DSV41_COMPUTE_LANE", "1" }};
++    try expectEqual(null, try flashnext.parse(&lookup));
++    knobs = &.{.{ "TF_COMPUTE_LANE", "1" }};
++    try expect((try flashnext.parse(&lookup)) != null);
++    inline for (.{ dsv41, flashnext }) |b| {
++        try expectEqualStrings("python", b.tool.name);
++        try expectEqualStrings("code_interpreter", b.tool.opt_in);
++        try expectEqual(@as(i64, 1024), b.tool.min_tokens);
++    }
++}
++
+ test "compute lane config: every knob parses" {
+     const c = (try parse(&.{
+         .{ "TF_X", "1" },                          .{ "TF_X_WORKERS", "3" },    .{ "TF_X_MAX_MS", "2500" },
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index aa74a15ae..443d1e871 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -233,6 +233,7 @@ pub const Info = struct {
+     /// A byte budget each request promises its caches from as it is admitted (null: none); never beside `admit`.
+     ledger: ?Ledger = null,
+     compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
++    compute_tool: hold.compute_lane.Tool = .{}, // the built-in tool its binding names (compute_binding.zig)
+ 
+     pub const Capability = @import("engine_capabilities.zig").Capability;
+ 
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index 9990a4552..af8c6b9cf 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -131,8 +131,10 @@ pub const Served = struct {
+         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
+         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .benchmark_ranks = m.session.nccl.size, .benchmark_group = m.benchmark_group, .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows });
+         s.host.info_.draft_sources = draftSources(m.pass != null, s.cfg.max_copy > 0);
+-        // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
+-        s.host.info_.compute = try api.hold.compute_lane.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE");
++        // TF_COMPUTE_LANE=1 or TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS
++        const binding = api.hold.compute_lane.bindings.dsv41;
++        s.host.info_.compute = try binding.parse(&@import("serve_knobs.zig").env);
++        s.host.info_.compute_tool = binding.tool;
+         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
+         s.host.on_thread = .{ .ctx = m, .run = bindContext };
+         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 74fc67b17..f274c74f7 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -264,7 +264,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     srv.release(preparing, null); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |x| x else undefined };
++    var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |x| x else undefined, .tool = srv.info.compute_tool.name };
+     const shown: ?Sink = if (request.hold_eos and sink != null) filter.sink() else sink; // built-in calls stay hidden
+     var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false, .deadline_ns = prepared.deadline_ns, .lane_own = input.lane_own };
+     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
+diff --git a/zig/src/server/compute_segments.zig b/zig/src/server/compute_segments.zig
+index e3aff4210..8db1f6cca 100644
+--- a/zig/src/server/compute_segments.zig
++++ b/zig/src/server/compute_segments.zig
+@@ -44,7 +44,7 @@ pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter
+     while (g.held) {
+         const used = m.ids.items.len + g.collected.items.len;
+         const answer = try segmentAnswer(g);
+-        const calls = builtInOnly(answer.calls);
++        const calls = builtInOnly(answer.calls, srv.info.compute_tool.name);
+         var plan: ?[]const u32 = null;
+         var assistant: Value = .null;
+         var reports: []Value = &.{};
+@@ -97,9 +97,9 @@ fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Genera
+ }
+ 
+ /// The segment's calls when every one is the built-in tool's (a client's call ends the reply for its client).
+-fn builtInOnly(calls: ?[]Value) []Value {
++fn builtInOnly(calls: ?[]Value, n: []const u8) []Value {
+     const all = calls orelse return &.{};
+-    for (all) |c| if (!turns.isBuiltInCall(c)) return &.{};
++    for (all) |c| if (!turns.isCallTo(c, n)) return &.{};
+     return all;
+ }
+ 
+@@ -137,7 +137,7 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
+             body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
+             ran.* += 1;
+         }
+-        slot.* = try report(a, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
++        slot.* = try report(a, srv.info.compute_tool.name, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
+     }
+     return out;
+ }
+@@ -166,9 +166,9 @@ fn capTokens(a: Allocator, srv: *Server, body: []const u8, max: u32) Allocator.E
+     return std.fmt.allocPrint(a, "[output truncated at {d} tokens]", .{max});
+ }
+ 
+-fn report(a: Allocator, call: Value, code: []const u8, o: lane.Outcome, output: []const u8) Allocator.Error!Value {
++fn report(a: Allocator, n: []const u8, call: Value, code: []const u8, o: lane.Outcome, output: []const u8) Allocator.Error!Value {
+     const r = try json.newObject(a);
+-    try r.put(a, "name", .{ .string = turns.name });
++    try r.put(a, "name", .{ .string = n });
+     try r.put(a, "id", call.get("id") orelse .null);
+     try r.put(a, "code", .{ .string = code });
+     try r.put(a, "status", .{ .string = @tagName(o.status) });
+diff --git a/zig/src/server/compute_turns.zig b/zig/src/server/compute_turns.zig
+index e2d9811d8..04ac0c7f3 100644
+--- a/zig/src/server/compute_turns.zig
++++ b/zig/src/server/compute_turns.zig
+@@ -11,16 +11,25 @@ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+ 
+-/// The built-in tool's name, the type a request lists to opt in, and its description (which marks it as ours).
++/// The default binding's tool name and opt-in type (a family's: srv.info.compute_tool), and our description.
+ pub const name = "python";
+ pub const opt_in = "code_interpreter";
+ pub const description = "Run Python 3 code in a sandbox with no network, no files and no installs, and get its stdout and " ++
+     "stderr. print() what you need; the value of a final bare expression is printed too.";
+-pub const definition =
+-    \\{"type":"function","function":{"name":"python","description":"
++const head =
++    \\{"type":"function","function":{"name":"
++;
++const tail =
++    \\","description":"
+ ++ description ++
+     \\","parameters":{"type":"object","properties":{"code":{"type":"string","description":"Python 3 source to run"}},"required":["code"]}}}
+ ;
++pub const definition = head ++ name ++ tail;
++
++/// The built-in tool's definition under the binding's name `n`.
++fn definitionOf(a: Allocator, n: []const u8) Allocator.Error![]const u8 {
++    return std.mem.concat(a, u8, &.{ head, n, tail });
++}
+ 
+ /// The server's sandbox pool for an engine that serves the lane; boot fails when an opted-in sandbox cannot run.
+ pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
+@@ -45,16 +54,16 @@ pub fn forced(srv: *const Server) bool {
+     return srv.compute != null and srv.info.compute.?.default;
+ }
+ 
+-/// Under this max_tokens the default offers no built-in tool unasked: a call, its result and an answer do not fit.
++/// The default binding's max_tokens under which the default offers no built-in tool unasked (Tool.min_tokens).
+ pub const default_min_tokens = 1024;
+ 
+ /// What a request asks, known before it renders, that decides whether its reply can hold for the lane (`arms`).
+ pub const Fit = struct { max_tokens: i64, thinking: bool = true, stop: bool = false, logprobs: bool = false, structured: bool = false };
+ 
+-/// Whether a reply that asked `f` thinks, holds at its EOS and has room for a call, its result and an answer.
+-fn fits(f: Fit) bool {
++/// Whether a reply that asked `f` thinks, holds at its EOS and has `min` tokens for a call, its result and an answer.
++fn fits(f: Fit, min: i64) bool {
+     // unthinking, the prose before a call is the visible answer and the result's answer runs on into it
+-    return f.thinking and !f.stop and !f.logprobs and !f.structured and f.max_tokens >= default_min_tokens;
++    return f.thinking and !f.stop and !f.logprobs and !f.structured and f.max_tokens >= min;
+ }
+ 
+ /// A chat body's tools (`tools`) and `lane_own` into `input`, whose max_tokens is read; `logprobs`: rows asked.
+@@ -72,28 +81,29 @@ pub fn requestTools(srv: *Server, cx: *Cx, body: Value, input: *chat.Input, logp
+ /// The request's tools, `{"type": "code_interpreter"}` as the built-in tool (the default's: every chat that `fit`s).
+ pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value, fit: Fit) errors.Refused![]Value {
+     const always = forced(srv);
++    const tool = srv.info.compute_tool;
+     const list = raw orelse Value{ .array = &.{} };
+     if (list != .array and !always) return active(srv, cx, raw, choice);
+     var rest: std.ArrayList(Value) = .empty;
+     var listed = false;
+     if (list == .array) for (list.array) |t| {
+         const kind = if (t == .object) t.strField("type") orelse "" else "";
+-        if (std.mem.eql(u8, kind, opt_in)) listed = true else try rest.append(cx.a, t);
++        if (std.mem.eql(u8, kind, tool.opt_in)) listed = true else try rest.append(cx.a, t);
+     };
+-    if (!listed and (!always or !fits(fit))) return active(srv, cx, raw, choice);
+-    if (srv.compute == null) return cx.other("code_interpreter is not enabled on this server");
++    if (!listed and (!always or !fits(fit, tool.min_tokens))) return active(srv, cx, raw, choice);
++    if (srv.compute == null) return cx.other(try std.fmt.allocPrint(cx.a, "{s} is not enabled on this server", .{tool.opt_in}));
+     var specs = try active(srv, cx, if (list == .array) .{ .array = rest.items } else raw, choice);
+     // a client's own copy of the built-in definition is the same tool: one declaration, not a refusal (default only)
+-    if (always) specs = try withoutBuiltIn(cx.a, specs);
+-    for (specs) |t| if (std.mem.eql(u8, toolName(t), name)) {
++    if (always) specs = try withoutBuiltIn(cx.a, specs, tool.name);
++    for (specs) |t| if (std.mem.eql(u8, toolName(t), tool.name)) {
+         // a call names only its tool: the default leaves `python` to the client that offers it
+         if (always and !listed) return specs;
+-        return cx.other("a request with code_interpreter cannot also offer a function named python");
++        return cx.other(try std.fmt.allocPrint(cx.a, "a request with {s} cannot also offer a function named {s}", .{ tool.opt_in, tool.name }));
+     };
+     // only an automatic choice offers it ("required" and a named function do not); the default also offers it on "none"
+     if (choice) |c| if (!(c == .null or (c == .string and std.mem.eql(u8, c.string, "auto")) or
+         (always and c == .string and std.mem.eql(u8, c.string, "none")))) return specs;
+-    const built = switch (try json.parse(cx.a, definition)) {
++    const built = switch (try json.parse(cx.a, try definitionOf(cx.a, tool.name))) {
+         .ok => |v| v,
+         .err => unreachable,
+     };
+@@ -118,9 +128,9 @@ pub fn countExecuted(a: Allocator, runtime: Value, ran: usize) Allocator.Error!v
+     try runtime.object.put(a, "compute_executed", .{ .object = o });
+ }
+ 
+-fn withoutBuiltIn(a: Allocator, specs: []Value) Allocator.Error![]Value {
++fn withoutBuiltIn(a: Allocator, specs: []Value, n: []const u8) Allocator.Error![]Value {
+     var out: std.ArrayList(Value) = .empty;
+-    for (specs) |t| if (!isBuiltIn(t)) try out.append(a, t);
++    for (specs) |t| if (!isBuiltInAs(t, n)) try out.append(a, t);
+     return out.items;
+ }
+ 
+@@ -135,28 +145,33 @@ fn toolName(t: Value) []const u8 {
+     return f.strField("name") orelse "";
+ }
+ 
+-/// Whether `t` is the built-in tool (its name and our description), as `tools` added it.
++/// Whether `t` is the default binding's built-in tool, as `tools` added it.
+ pub fn isBuiltIn(t: Value) bool {
++    return isBuiltInAs(t, name);
++}
++
++/// Whether `t` is the built-in tool (its name `n` and our description), as `tools` added it.
++pub fn isBuiltInAs(t: Value, n: []const u8) bool {
+     const f = t.get("function") orelse return false;
+-    return std.mem.eql(u8, f.strField("name") orelse "", name) and std.mem.eql(u8, f.strField("description") orelse "", description);
++    return std.mem.eql(u8, f.strField("name") orelse "", n) and std.mem.eql(u8, f.strField("description") orelse "", description);
+ }
+ 
+ /// Whether `specs` hold the default's own built-in tool (no code_interpreter listed): its calls never reach the client.
+ pub fn ownedByServer(srv: *const Server, raw: ?Value, specs: []const Value) bool {
+     if (!forced(srv)) return false;
+     if (raw) |list| if (list == .array) for (list.array) |t| {
+-        if (t == .object and std.mem.eql(u8, t.strField("type") orelse "", opt_in)) return false;
++        if (t == .object and std.mem.eql(u8, t.strField("type") orelse "", srv.info.compute_tool.opt_in)) return false;
+     };
+-    for (specs) |t| if (isBuiltIn(t)) return true;
++    for (specs) |t| if (isBuiltInAs(t, srv.info.compute_tool.name)) return true;
+     return false;
+ }
+ 
+-/// A reply's calls for its client (`own`: the default's tool, whose unrun calls end the reply at length, unseen).
+-pub fn ownCalls(a: Allocator, own: bool, reply: *chat.Reply, found: ?[]Value, prose: []const u8) Allocator.Error!?[]Value {
++/// A reply's calls for its client (`own`: the default's tool `n`, whose unrun calls end the reply at length, unseen).
++pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, found: ?[]Value, prose: []const u8) Allocator.Error!?[]Value {
+     if (!own) return found;
+     const all: []const Value = found orelse &.{};
+     var kept: std.ArrayList(Value) = .empty;
+-    for (all) |c| if (!isBuiltInCall(c)) try kept.append(a, c);
++    for (all) |c| if (!isCallTo(c, n)) try kept.append(a, c);
+     const dropped = kept.items.len < all.len;
+     // a call the lane could not run (no room left), or one max_tokens cut: the budget ended the reply
+     if (dropped or (found == null and std.mem.eql(u8, reply.finish_reason, "length"))) {
+@@ -166,9 +181,14 @@ pub fn ownCalls(a: Allocator, own: bool, reply: *chat.Reply, found: ?[]Value, pr
+     return if (kept.items.len > 0) kept.items else null;
+ }
+ 
+-/// Whether a call names the built-in tool.
++/// Whether a call names the default binding's built-in tool.
+ pub fn isBuiltInCall(call: Value) bool {
+-    return std.mem.eql(u8, toolName(call), name);
++    return isCallTo(call, name);
++}
++
++/// Whether a call names the built-in tool `n`.
++pub fn isCallTo(call: Value, n: []const u8) bool {
++    return std.mem.eql(u8, toolName(call), n);
+ }
+ 
+ /// Whether a prepared request holds at its EOS for the lane: offered the tool, nothing that forced rows would break.
+@@ -176,7 +196,7 @@ pub fn arms(srv: *const Server, input: chat.Input, r: *const api.Request) bool {
+     if (srv.compute == null or r.eos.len == 0 or r.background or r.max_tokens == 0) return false;
+     if (srv.text.vtable.format == .kimi) return false; // its native reader keeps calls apart from the text
+     if (r.structure != null or r.call != null or r.logprobs != null or r.prompt_logprobs != null) return false;
+-    for (input.tools) |t| if (isBuiltIn(t)) return true;
++    for (input.tools) |t| if (isBuiltInAs(t, srv.info.compute_tool.name)) return true;
+     return false;
+ }
+ 
+@@ -184,6 +204,7 @@ pub fn arms(srv: *const Server, input: chat.Input, r: *const api.Request) bool {
+ pub const Filter = struct {
+     a: Allocator,
+     inner: chat.Sink,
++    tool: []const u8 = name, // the built-in tool's name (srv.info.compute_tool)
+     base: i64 = 0, // client calls earlier segments showed
+     seen: i64 = 0, // client calls this segment showed
+     map: std.AutoHashMapUnmanaged(i64, ?i64) = .empty, // this segment's call index -> the client's (null: built-in)
+@@ -217,7 +238,7 @@ pub const Filter = struct {
+         for (list.?.array) |one| {
+             const at = (one.get("index") orelse continue).int64() orelse continue;
+             if (one.get("function")) |fun| if (fun.strField("name")) |n| if (!f.map.contains(at)) {
+-                const client: ?i64 = if (std.mem.eql(u8, n, name)) null else f.base + f.seen;
++                const client: ?i64 = if (std.mem.eql(u8, n, f.tool)) null else f.base + f.seen;
+                 if (client != null) f.seen += 1;
+                 f.map.put(f.a, at, client) catch return error.Closed;
+             };
+@@ -274,3 +295,19 @@ test "compute lane: the built-in definition parses and is recognized; another fu
+     const other = (try json.parse(arena.allocator(), "{\"type\":\"function\",\"function\":{\"name\":\"python\"}}")).ok;
+     try std.testing.expect(!isBuiltIn(other));
+ }
++
++test "compute lane: a binding's tool name renames the built-in definition; the default's bytes are as before" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    try std.testing.expectEqualStrings(definition, try definitionOf(a, name));
++    try std.testing.expect(std.mem.startsWith(u8, definition, "{\"type\":\"function\",\"function\":{\"name\":\"python\",\"description\":\"Run Python 3 code"));
++    const t: lane.Tool = .{};
++    try std.testing.expectEqualStrings(name, t.name);
++    try std.testing.expectEqualStrings(opt_in, t.opt_in);
++    try std.testing.expectEqual(@as(i64, default_min_tokens), t.min_tokens);
++    const run = (try json.parse(a, try definitionOf(a, "run_code"))).ok;
++    try std.testing.expect(isBuiltInAs(run, "run_code") and !isBuiltIn(run));
++    const call = try json.parse(a, "{\"function\":{\"name\":\"run_code\",\"arguments\":\"{}\"}}");
++    try std.testing.expect(isCallTo(call.ok, "run_code") and !isBuiltInCall(call.ok));
++}
+diff --git a/zig/src/server/openai_calls.zig b/zig/src/server/openai_calls.zig
+index f3ba6d21c..22fcec3db 100644
+--- a/zig/src/server/openai_calls.zig
++++ b/zig/src/server/openai_calls.zig
+@@ -16,7 +16,7 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
+     const tools = r.plan.input.tools;
+     if (tools.len == 0) return null;
+     if (reply.native_tool_format) {
+-        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, reply, reply.native_calls, reply.content);
++        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, reply.native_calls, reply.content);
+         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse return null;
+         reply.content = try r.plan.policy.parsedContent(r.a, reply.content);
+         reply.finish_reason = "tool_calls";
+@@ -28,7 +28,7 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
+     // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
+     const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
+     if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
+-    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content);
++    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content);
+     const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
+         if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+         return null;

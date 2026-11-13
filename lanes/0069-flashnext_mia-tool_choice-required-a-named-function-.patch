@@ -1,0 +1,1088 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:15:52 +0700
+Subject: [PATCH 69/79] flashnext_mia: tool_choice required, a named function
+ and Anthropic any force a call (ported from MiaAI-Lab patch 0007)
+
+The lane engine has no grammar hook (and TP2 serves without structures), so checkFeatures refused these with a 400.
+Ported from MiaAI-Lab patch 0007: a host-side call gate. Outside a think block, a non-blank answer token is
+replaced by the call opener and the lead after it is forced; the name is completed to an offered name and its tail;
+a think block the reply opens disarms the gate until it closes. Rank 1 follows rank 0's corrected tokens.
+
+lanes/call_gate.zig holds the gate (Spec, Gate, first, correct). Each stream with Spec.call checks its first
+token at the three draw sites (open, open_first, join_batch) and every verify window (gated streams run windowed,
+as grammars do); round_cut.zig weighs the gate's cut against the loop guard and the budget (moved out of
+engine.zig). The server reads the call form from a probe render of the template (server/tool_call_gate.zig) and
+gates only when the backend declares call_gates (flashnext_mia) and has no structures. auto and none are
+unchanged; the runner and hold_eos stay off for a gated request, as for a grammar.
+
+Tests (test-call-gate-host): the gate's steps (her two tests among them), and the server's gate for required,
+named and any on the chat, responses and messages routes; auto and none get no gate; an engine witness forces
+the call from a plain, a thinking and a pipelined reply, and leaves a model's own call byte for byte.
+---
+ zig/build/cuda_server_host.zig                |   3 +
+ zig/src/core/engine_request_controls.zig      |  11 +-
+ zig/src/core/lane_stream.zig                  |   7 +-
+ zig/src/core/lanes/call_gate.zig              | 178 ++++++++++
+ zig/src/core/lanes/call_gate_test.zig         | 106 ++++++
+ zig/src/core/lanes/engine.zig                 |  19 +-
+ zig/src/core/lanes/join_batch.zig             |   3 +-
+ zig/src/core/lanes/lanes.zig                  |   1 +
+ zig/src/core/lanes/open.zig                   |   5 +-
+ zig/src/core/lanes/open_first.zig             |   3 +-
+ zig/src/core/lanes/round_cut.zig              |  33 ++
+ zig/src/core/lanes/stream.zig                 |   6 +
+ .../families/flashnext_mia/cuda_native.zig    |   2 +
+ zig/src/native/cuda.zig                       |   1 +
+ zig/src/server/root.zig                       |   1 +
+ zig/src/server/server.zig                     |   4 +-
+ zig/src/server/tool_call_gate.zig             | 102 ++++++
+ zig/src/server/tool_call_gate_test.zig        | 319 ++++++++++++++++++
+ 18 files changed, 770 insertions(+), 34 deletions(-)
+ create mode 100644 zig/src/core/lanes/call_gate.zig
+ create mode 100644 zig/src/core/lanes/call_gate_test.zig
+ create mode 100644 zig/src/core/lanes/round_cut.zig
+ create mode 100644 zig/src/server/tool_call_gate.zig
+ create mode 100644 zig/src/server/tool_call_gate_test.zig
+
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+index ee6a76036..66d9dceb7 100644
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -23,6 +23,9 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     eos_policy.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"EOS policy:"} })).step);
+     eos_policy.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.tokenizer, .filters = &.{"EOS policy:"} })).step);
+     eos_policy.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), .filters = &.{"EOS policy:"} })).step);
++    const call_gate = b.step("test-call-gate-host", "tool_choice required, named and any through the lane core's call gate (patch 0007), no GPU");
++    call_gate.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"call gate:"} })).step);
++    call_gate.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"call gate:"} })).step);
+     b.step("test-dory-cli-host", "Dory CUDA loop option forwarding and invalid-value refusals").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"--device and --segments:"} })).step);
+     b.step("test-dory-chat-host", "Dory chat template, EOS, reasoning split and qwen3_coder call on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Dory chat:"} })).step);
+     b.step("test-embeddings-protocol-host", "Embedding request and response contracts without an admitted model or GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"embeddings protocol:"} })).step);
+diff --git a/zig/src/core/engine_request_controls.zig b/zig/src/core/engine_request_controls.zig
+index 74b48a1ef..bc4f69a11 100644
+--- a/zig/src/core/engine_request_controls.zig
++++ b/zig/src/core/engine_request_controls.zig
+@@ -2,16 +2,7 @@
+ const grammar = @import("lanes").grammar;
+ 
+ /// tool_choice "required" or a named function: outside a think block the answer opens a call to an offered tool.
+-pub const CallGate = struct {
+-    /// The token that opens a call, the template text before the name, and the mark that ends the name.
+-    opener: u32,
+-    lead: []const u8 = "",
+-    tail: []const u8 = "",
+-    /// Offered names (empty: any); the gate completes a name its prefix starts.
+-    names: []const []const u8 = &.{},
+-    think_open: ?u32 = null,
+-    think_end: ?u32 = null,
+-};
++pub const CallGate = @import("lanes").call_gate.Spec;
+ 
+ /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
+ pub const Structure = struct {
+diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
+index ead89cbe1..dae342d58 100644
+--- a/zig/src/core/lane_stream.zig
++++ b/zig/src/core/lane_stream.zig
+@@ -37,8 +37,8 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
+     } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
+     const recall = recalls.reader(h, job);
+-    // forced result rows would leave a grammar, and logprob rows would rank tokens the model never drew
+-    if (h.runner) |rn| if (r.run_cells and r.structure == null and r.logprobs == null) {
++    // forced result rows would leave a grammar or a call gate, and logprob rows would rank tokens never drawn
++    if (h.runner) |rn| if (r.run_cells and r.structure == null and r.call == null and r.logprobs == null) {
+         job.runner = rn.session(r.run_trace) catch return !h.drop(job, "out of memory");
+         if (job.runner) |s| s.commit.ask = r.run_commit;
+     };
+@@ -79,7 +79,8 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+         .untaught = r.untaught,
+         .images = r.images,
+         .key = r.cache_key,
+-        .hold_eos = r.hold_eos and r.structure == null and r.logprobs == null, // forced rows would leave the grammar
++        .hold_eos = r.hold_eos and r.structure == null and r.call == null and r.logprobs == null, // forced rows would leave them
++        .call = r.call,
+         .runner = if (job.runner) |s| s.hook() else null,
+     }) catch {
+         freeProposer(h, job);
+diff --git a/zig/src/core/lanes/call_gate.zig b/zig/src/core/lanes/call_gate.zig
+new file mode 100644
+index 000000000..93c454aed
+--- /dev/null
++++ b/zig/src/core/lanes/call_gate.zig
+@@ -0,0 +1,178 @@
++//! The tool_choice call gate (ported from MiaAI-Lab patch 0007): outside a think block the answer opens a call.
++const std = @import("std");
++const be = @import("backend.zig");
++const Stream = @import("stream.zig").Stream;
++const Allocator = std.mem.Allocator;
++
++/// Where the answer is: before the call, in the text between the opener and the name, in the name, or past it.
++pub const Phase = enum { answer, lead, name, done };
++
++/// The tokenizer the gate asks while a round is decided; `text` and `encode` return slices of the allocator given.
++pub const Lex = struct {
++    ctx: *anyopaque,
++    blank: *const fn (ctx: *anyopaque, token: u32) bool,
++    text: *const fn (ctx: *anyopaque, a: Allocator, token: u32) anyerror![]const u8,
++    encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32,
++};
++
++/// tool_choice "required" or a named function, as the server read the template's call form.
++pub const Spec = struct {
++    /// The token that opens a call, the template text before the name, and the mark that ends the name.
++    opener: u32,
++    lead: []const u8 = "",
++    tail: []const u8 = "",
++    /// Offered names (empty: the opener alone is forced); the gate completes a name its prefix starts.
++    names: []const []const u8 = &.{},
++    think_open: ?u32 = null,
++    think_end: ?u32 = null,
++    lex: Lex,
++};
++
++fn is(marker: ?u32, token: u32) bool {
++    return if (marker) |m| m == token else false;
++}
++
++pub const Gate = struct {
++    spec: Spec,
++    armed: bool = true, // false while a think block is open
++    phase: Phase = .answer,
++    seen: std.ArrayList(u8) = .empty, // the lead or name text written so far
++
++    /// The gate after `prompt`: it waits while the prompt leaves a think block open.
++    pub fn afterPrompt(spec: Spec, prompt: []const u32) Gate {
++        var open_at: ?usize = null;
++        var end_at: ?usize = null;
++        for (prompt, 0..) |t, i| {
++            if (is(spec.think_open, t)) open_at = i;
++            if (is(spec.think_end, t)) end_at = i;
++        }
++        const held = spec.think_end != null and open_at != null and (end_at == null or open_at.? > end_at.?);
++        return .{ .spec = spec, .armed = !held };
++    }
++
++    pub fn deinit(g: *Gate, a: Allocator) void {
++        g.seen.deinit(a);
++    }
++
++    pub fn done(g: *const Gate) bool {
++        return g.phase == .done;
++    }
++
++    const Snap = struct { armed: bool, phase: Phase, seen: []const u8 };
++    const Step = struct { snap: Snap, fix: ?[]const u32 };
++
++    fn ends(g: *const Gate, char: u8) bool {
++        if (std.ascii.isWhitespace(char)) return true;
++        if (g.spec.tail.len > 0) return char == g.spec.tail[0];
++        return switch (char) {
++            '<', '>', '{', '}', '"', '\'', '(', ')', ',' => true,
++            else => false,
++        };
++    }
++
++    fn gaveUp(snap: Snap) Step {
++        return .{ .snap = .{ .armed = snap.armed, .phase = .done, .seen = "" }, .fix = null };
++    }
++
++    /// The gate after `token`, or the tokens that replace it (the first in its place, the rest forced after it).
++    fn step(g: *const Gate, a: Allocator, snap: Snap, token: u32) !Step {
++        const sp = &g.spec;
++        if (snap.phase == .answer) {
++            if (!snap.armed) return .{ .snap = .{ .armed = is(sp.think_end, token), .phase = .answer, .seen = "" }, .fix = null };
++            if (is(sp.think_open, token)) return .{ .snap = .{ .armed = false, .phase = .answer, .seen = "" }, .fix = null };
++            if (token == sp.opener) return .{ .snap = .{ .armed = true, .phase = .lead, .seen = "" }, .fix = null };
++            if (sp.lex.blank(sp.lex.ctx, token)) return .{ .snap = snap, .fix = null };
++            var fix: std.ArrayList(u32) = .empty;
++            try fix.append(a, sp.opener);
++            if (sp.names.len > 0 and sp.lead.len > 0) try fix.appendSlice(a, try sp.lex.encode(sp.lex.ctx, a, sp.lead));
++            return .{ .snap = snap, .fix = fix.items };
++        }
++        if (snap.phase == .done or sp.names.len == 0) return gaveUp(snap);
++        const written = try std.mem.concat(a, u8, &.{ snap.seen, try sp.lex.text(sp.lex.ctx, a, token) });
++        var owed: []const u8 = "";
++        var seen = snap.seen;
++        var body = written;
++        if (snap.phase == .lead) {
++            if (std.mem.startsWith(u8, sp.lead, written)) {
++                const full = written.len == sp.lead.len;
++                return .{ .snap = .{ .armed = snap.armed, .phase = if (full) .name else .lead, .seen = if (full) "" else written }, .fix = null };
++            }
++            if (!std.mem.startsWith(u8, written, sp.lead)) {
++                const ids = try sp.lex.encode(sp.lex.ctx, a, sp.lead[seen.len..]);
++                return if (ids.len == 0) gaveUp(snap) else .{ .snap = snap, .fix = ids };
++            }
++            owed = sp.lead[seen.len..];
++            seen = "";
++            body = written[sp.lead.len..];
++        }
++        var end: usize = body.len;
++        for (body, 0..) |c, i| if (g.ends(c)) {
++            end = i;
++            break;
++        };
++        if (end == body.len) for (sp.names) |n| if (std.mem.startsWith(u8, n, body)) {
++            return .{ .snap = .{ .armed = snap.armed, .phase = .name, .seen = body }, .fix = null };
++        };
++        if (end < body.len) for (sp.names) |n| if (std.mem.eql(u8, n, body[0..end])) return gaveUp(snap);
++        const name = for (sp.names) |n| {
++            if (std.mem.startsWith(u8, n, seen)) break n;
++        } else return gaveUp(snap);
++        const ids = try sp.lex.encode(sp.lex.ctx, a, try std.mem.concat(a, u8, &.{ owed, name[seen.len..], sp.tail }));
++        return if (ids.len == 0) gaveUp(snap) else .{ .snap = snap, .fix = ids };
++    }
++
++    pub const Hit = struct { at: usize, fix: []const u32 };
++
++    /// The first of `tokens` that breaks the call, with its fix; null when they all keep it (the gate is unchanged).
++    pub fn cut(g: *const Gate, a: Allocator, tokens: []const u32) !?Hit {
++        var snap: Snap = .{ .armed = g.armed, .phase = g.phase, .seen = g.seen.items };
++        for (tokens, 0..) |token, i| {
++            if (snap.phase == .done) return null;
++            const next = try g.step(a, snap, token);
++            if (next.fix) |fix| return .{ .at = i, .fix = fix };
++            snap = next.snap;
++        }
++        return null;
++    }
++
++    /// A committed token: the gate moves on (a token that breaks the call ends it, as nothing then corrects it).
++    pub fn observe(g: *Gate, a: Allocator, token: u32) !void {
++        if (g.done()) return;
++        var scratch: std.heap.ArenaAllocator = .init(a);
++        defer scratch.deinit();
++        const next = try g.step(scratch.allocator(), .{ .armed = g.armed, .phase = g.phase, .seen = g.seen.items }, token);
++        g.armed = next.snap.armed;
++        g.phase = if (next.fix != null) .done else next.snap.phase;
++        const seen = if (next.fix != null) "" else next.snap.seen;
++        var kept: std.ArrayList(u8) = .empty;
++        try kept.appendSlice(a, seen);
++        g.seen.deinit(a);
++        g.seen = kept;
++    }
++};
++
++/// The fix's rest goes out forced after its first token, in place of anything queued.
++pub fn queue(gpa: Allocator, s: *Stream, rest: []const u32) !void {
++    s.force.clearRetainingCapacity();
++    try s.force.appendSlice(gpa, rest);
++}
++
++/// A drawn token the gate replaces: the fix's first token (its rest forced), else the token itself.
++pub fn correct(e: anytype, s: *Stream, token: u32) !u32 {
++    const g = &(s.gate orelse return token);
++    const hit = (try g.cut(e.arena.allocator(), &.{token})) orelse return token;
++    try queue(e.gpa, s, hit.fix[1..]);
++    return hit.fix[0];
++}
++
++/// The first token under a gate: the draw is read and corrected before drafts or a queued step use it; the draw read.
++pub fn first(e: anytype, s: *Stream, feed: *be.Feed) !?u32 {
++    if (s.gate == null or feed.* == .value) return null; // a forced first token (a budget close) goes in as it is
++    const drawn = try e.readFeed(feed.*);
++    feed.* = .{ .value = try correct(e, s, drawn) };
++    return drawn;
++}
++
++test {
++    _ = @import("call_gate_test.zig");
++}
+diff --git a/zig/src/core/lanes/call_gate_test.zig b/zig/src/core/lanes/call_gate_test.zig
+new file mode 100644
+index 000000000..fdaff1a3c
+--- /dev/null
++++ b/zig/src/core/lanes/call_gate_test.zig
+@@ -0,0 +1,106 @@
++//! The call gate's steps on a toy lexicon (the first two tests are MiaAI-Lab's, from patch 0007).
++const std = @import("std");
++const call_gate = @import("call_gate.zig");
++const Gate = call_gate.Gate;
++const Allocator = std.mem.Allocator;
++const t = std.testing;
++
++const Lex = struct {
++    fn blank(_: *anyopaque, token: u32) bool {
++        return token == 1;
++    }
++    fn text(_: *anyopaque, _: Allocator, token: u32) anyerror![]const u8 {
++        return switch (token) {
++            2 => "=",
++            3 => "ab",
++            4 => "ac>",
++            5 => "zz",
++            6 => "\x00", // an end token, as the server's lexicon spells it
++            else => "?",
++        };
++    }
++    fn encode(_: *anyopaque, a: Allocator, s: []const u8) anyerror![]const u32 {
++        if (std.mem.eql(u8, s, "=")) return a.dupe(u32, &.{2});
++        if (std.mem.eql(u8, s, "ab>")) return a.dupe(u32, &.{ 3, 4 });
++        if (std.mem.eql(u8, s, "c>")) return a.dupe(u32, &.{4});
++        return a.dupe(u32, &.{});
++    }
++    fn lex() call_gate.Lex {
++        return .{ .ctx = undefined, .blank = blank, .text = text, .encode = encode };
++    }
++};
++
++fn spec(think_open: ?u32, think_end: ?u32, lead: []const u8, names: []const []const u8, tail: []const u8) call_gate.Spec {
++    return .{ .opener = 9, .think_open = think_open, .think_end = think_end, .lead = lead, .names = names, .tail = tail, .lex = Lex.lex() };
++}
++
++test "call gate: a required call replaces a plain answer with the opener and finishes the offered name" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    var g = Gate.afterPrompt(spec(null, null, "=", &.{ "ab", "ac" }, ">"), &.{});
++    defer g.deinit(t.allocator);
++    const hit = (try g.cut(arena.allocator(), &.{ 7, 8 })).?;
++    try t.expectEqual(@as(usize, 0), hit.at);
++    try t.expectEqualSlices(u32, &.{ 9, 2 }, hit.fix);
++    try g.observe(t.allocator, 9);
++    try g.observe(t.allocator, 2);
++    try t.expect(g.phase == .name);
++    try g.observe(t.allocator, 3);
++    try t.expect(g.phase == .name);
++    try g.observe(t.allocator, 4);
++    try t.expect(g.done());
++}
++
++test "call gate: whitespace before the call is kept and an open think block waits" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var g = Gate.afterPrompt(spec(8, 4, "", &.{}, ""), &.{ 4, 8 });
++    defer g.deinit(t.allocator);
++    try t.expect(!g.armed);
++    try t.expect((try g.cut(a, &.{7})) == null);
++    try g.observe(t.allocator, 4);
++    try t.expect(g.armed);
++    try t.expect((try g.cut(a, &.{1})) == null);
++    // armed, a plain token is the opener (no names: the opener alone)
++    const hit = (try g.cut(a, &.{ 1, 7 })).?;
++    try t.expectEqual(@as(usize, 1), hit.at);
++    try t.expectEqualSlices(u32, &.{9}, hit.fix);
++}
++
++test "call gate: a prompt that closed its think block is armed, and a think block the reply opens disarms it" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var closed = Gate.afterPrompt(spec(8, 4, "", &.{}, ""), &.{ 8, 7, 4 });
++    defer closed.deinit(t.allocator);
++    try t.expect(closed.armed);
++    try t.expect((try closed.cut(a, &.{ 8, 7, 7 })) == null); // the reply's own think block: no cut inside it
++    try t.expectEqual(@as(usize, 3), (try closed.cut(a, &.{ 8, 7, 4, 7 })).?.at); // and the answer after it is cut
++}
++
++test "call gate: a name the model starts is finished, an end token in the name is replaced, the cut is found in a window" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var g = Gate.afterPrompt(spec(null, null, "=", &.{ "ab", "ac" }, ">"), &.{});
++    defer g.deinit(t.allocator);
++    // a drafted window: the opener and lead hold, then a token no offered name starts
++    const hit = (try g.cut(a, &.{ 9, 2, 5 })).?;
++    try t.expectEqual(@as(usize, 2), hit.at);
++    try t.expectEqualSlices(u32, &.{ 3, 4 }, hit.fix); // the first offered name and its tail
++    try t.expect(g.phase == .answer); // cut changes nothing: commit's observe moves the gate
++    for ([_]u32{ 9, 2 }) |tok| try g.observe(t.allocator, tok);
++    const eos = (try g.cut(a, &.{6})).?;
++    try t.expectEqualSlices(u32, &.{ 3, 4 }, eos.fix);
++}
++
++test "call gate: a committed token that breaks the call ends the gate, and a done gate cuts nothing" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    var g = Gate.afterPrompt(spec(null, null, "=", &.{"ab"}, ">"), &.{});
++    defer g.deinit(t.allocator);
++    try g.observe(t.allocator, 7); // a plain token committed past the gate (nothing corrected it)
++    try t.expect(g.done());
++    try t.expect((try g.cut(arena.allocator(), &.{ 7, 7 })) == null);
++}
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 062e02f7d..b850457f3 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -150,8 +150,8 @@ pub const Engine = struct {
+             try e.roundStreams(chosen);
+         } else {
+             for (live.items) |s| {
+-                // logprobs and grammars take verify windows: rows' logits are read, or bits made, before a forward
+-                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null;
++                // logprobs, grammars and call gates take verify windows: rows read, bits made, tokens fixed first
++                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null or s.gate != null;
+                 const r = if (windowed) try e.familyRound(s, null) else try e.pipelinedRound(s);
+                 s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
+             }
+@@ -399,20 +399,7 @@ pub const Engine = struct {
+             try t.commit(.{ .stream = s, .drafted = p.kind == .head, .rows = @intCast(rows), .parents = if (chain) null else parents, .path = path, .bonus = sampled[path[path.len - 1]] });
+         };
+         if (e.cfg.root_copies) s.root_copy_miss = p.kind == .copy and path.len < rows;
+-        const budget_cut = s.thinkCut(committed.items);
+-        const loop_cut = sm.loopCut(s, committed.items);
+-        const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
+-        var cut: ?usize = null;
+-        if (loop_wins) {
+-            cut = loop_cut;
+-            path = path[0 .. loop_cut.? + 1];
+-            committed.shrinkRetainingCapacity(loop_cut.? + 1);
+-        } else if (budget_cut) |c| {
+-            cut = c;
+-            path = path[0 .. c + 1];
+-            committed.shrinkRetainingCapacity(c);
+-            try committed.append(a, try s.startClose(e.gpa));
+-        }
++        const cut = try @import("round_cut.zig").apply(e, s, &committed, &path); // loop guard, budget or call gate
+         s.rounds += 1;
+         var committed_rows: []LogRow = &.{};
+         if (rows_lp.len > 0) {
+diff --git a/zig/src/core/lanes/join_batch.zig b/zig/src/core/lanes/join_batch.zig
+index ce4c78cd5..cf5b32bc7 100644
+--- a/zig/src/core/lanes/join_batch.zig
++++ b/zig/src/core/lanes/join_batch.zig
+@@ -31,9 +31,10 @@ pub fn opened(e: *Engine, s: *Stream, hook: ?be.Committed) !void {
+     const drawn = try e.drawFirst(s, position);
+     var feed: be.Feed = .{ .handle = drawn };
+     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
++    const drew = try @import("call_gate.zig").first(e, s, &feed); // a call gate reads and fixes the draw first
+     const value = try e.readFeed(feed);
+     if (e.log != null) {
+-        const actual = if (feed == .handle) value else try e.backend.read(drawn);
++        const actual = if (feed == .handle) value else drew orelse try e.backend.read(drawn);
+         try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(actual)), f("token", int(value)) });
+     }
+     var row: [1]LogRow = undefined;
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 59c575548..f0d9ef0a9 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -46,6 +46,7 @@ pub const drafted = @import("drafted.zig");
+ pub const recorder = @import("recorder.zig");
+ pub const logprob = @import("logprob.zig");
+ pub const grammar = @import("grammar.zig");
++pub const call_gate = @import("call_gate.zig"); // tool_choice required or named without a grammar (patch 0007)
+ pub const grammar_time = @import("grammar_time.zig");
+ pub const grammar_fake = @import("grammar_fake.zig"); // a stand-in libtfgrammar for tests
+ 
+diff --git a/zig/src/core/lanes/open.zig b/zig/src/core/lanes/open.zig
+index 8ba692d33..fc9ddeb32 100644
+--- a/zig/src/core/lanes/open.zig
++++ b/zig/src/core/lanes/open.zig
+@@ -105,6 +105,7 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
+     const drawn = try e.drawFirst(s, position);
+     var feed: Feed = .{ .handle = drawn };
+     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
++    const drew = try @import("call_gate.zig").first(e, s, &feed); // a call gate reads and fixes the draw first
+     var asked: ?u32 = null;
+     if (e.cfg.family_mtp and s.drafts) {
+         // the head reads the prompt's last row and the first token, and drafts the one after it
+@@ -119,13 +120,13 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
+         if (d > 0) if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
+             s.next = held; // a tree head's first drafts as host tokens, as every later round's
+         };
+-    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
++    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null and s.gate == null) {
+         try e.queueNext(s, feed);
+     }
+     const value = try e.readFeed(feed);
+     if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+     if (e.log != null) {
+-        const first = if (feed == .handle) value else try e.backend.read(drawn);
++        const first = if (feed == .handle) value else drew orelse try e.backend.read(drawn);
+         try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
+     }
+     var first_row: [1]LogRow = undefined;
+diff --git a/zig/src/core/lanes/open_first.zig b/zig/src/core/lanes/open_first.zig
+index efb79d5bf..1fa2afd32 100644
+--- a/zig/src/core/lanes/open_first.zig
++++ b/zig/src/core/lanes/open_first.zig
+@@ -24,10 +24,11 @@ pub fn opened(e: *Engine, s: *Stream, reach: open.Reach, hook: ?be.Committed) !v
+     const drawn = try e.drawFirst(s, position);
+     var feed: be.Feed = .{ .handle = drawn };
+     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
++    const drew = try @import("call_gate.zig").first(e, s, &feed); // a call gate reads and fixes the draw first
+     const depth = try open.firstDepth(e, s, reach);
+     const value = try e.readFeed(feed);
+     if (e.log != null) {
+-        const actual = if (feed == .handle) value else try e.backend.read(drawn);
++        const actual = if (feed == .handle) value else drew orelse try e.backend.read(drawn);
+         try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(actual)), f("token", int(value)) });
+     }
+     var row: [1]LogRow = undefined;
+diff --git a/zig/src/core/lanes/round_cut.zig b/zig/src/core/lanes/round_cut.zig
+new file mode 100644
+index 000000000..270b97b79
+--- /dev/null
++++ b/zig/src/core/lanes/round_cut.zig
+@@ -0,0 +1,33 @@
++//! A round's committed tokens cut where the loop guard, the thinking budget or a tool_choice call gate takes over.
++const std = @import("std");
++const sm = @import("stream.zig");
++const call_gate = @import("call_gate.zig");
++const Stream = sm.Stream;
++
++/// Cut `committed` and `path` at the earliest taker: its token goes in last and its rest is forced; the cut row.
++pub fn apply(e: anytype, s: *Stream, committed: *std.ArrayList(u32), path: *[]u32) !?usize {
++    const a = e.arena.allocator();
++    const budget_cut = s.thinkCut(committed.items);
++    const loop_cut = sm.loopCut(s, committed.items);
++    const never = std.math.maxInt(usize);
++    // the gate wins ties with the loop guard and yields to the budget (patch 0007's order)
++    if (s.gate) |*g| if (try g.cut(a, committed.items)) |hit| if (hit.at <= (loop_cut orelse never) and hit.at < (budget_cut orelse never)) {
++        path.* = path.*[0 .. hit.at + 1];
++        committed.shrinkRetainingCapacity(hit.at);
++        try committed.append(a, hit.fix[0]);
++        try call_gate.queue(e.gpa, s, hit.fix[1..]);
++        return hit.at;
++    };
++    if (loop_cut) |c| if (budget_cut == null or c < budget_cut.?) {
++        path.* = path.*[0 .. c + 1];
++        committed.shrinkRetainingCapacity(c + 1);
++        return c;
++    };
++    if (budget_cut) |c| {
++        path.* = path.*[0 .. c + 1];
++        committed.shrinkRetainingCapacity(c);
++        try committed.append(a, try s.startClose(e.gpa));
++        return c;
++    }
++    return null;
++}
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 2f524e292..6bfee0fc3 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -1,6 +1,7 @@
+ //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
+ const std = @import("std");
+ const grammar = @import("grammar.zig");
++const call_gate = @import("call_gate.zig");
+ const shape = @import("shape.zig");
+ const plan_lanes = @import("plan_lanes.zig");
+ const Allocator = std.mem.Allocator;
+@@ -125,6 +126,7 @@ pub const Spec = struct {
+     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
+     hold_eos: bool = false, // an EOS holds the stream for a server tool's result (hold.zig) instead of ending it
+     runner: ?RunnerHook = null, // committed tokens go to the in-model runner, which may hold the stream at a token
++    call: ?call_gate.Spec = null, // tool_choice required or named: the answer opens an offered call (call_gate.zig)
+ };
+ 
+ pub const Stream = struct {
+@@ -234,6 +236,7 @@ pub const Stream = struct {
+     grant_gain: ?f64 = null, // the drafts its last grant expected to keep (the chances it was priced by)
+     draft_chances: std.ArrayList(f64) = .empty, // last full head prices, retained through zero-row rounds
+     copy_width: ?u32 = null,
++    gate: ?call_gate.Gate = null, // Spec.call's gate, moved on by each committed token
+ 
+     pub fn init(gpa: Allocator, spec: Spec) !Stream {
+         var s: Stream = .{
+@@ -282,11 +285,13 @@ pub const Stream = struct {
+         if (spec.grammar) |g| if (g.budget) |*b| {
+             b.* = .{ .max_new = spec.max_new, .answer_max = spec.answer_max, .think_end = spec.think_end };
+         };
++        if (spec.call) |c| s.gate = call_gate.Gate.afterPrompt(c, spec.prompt);
+         try s.context.appendSlice(gpa, spec.prompt);
+         return s;
+     }
+ 
+     pub fn deinit(s: *Stream, gpa: Allocator) void {
++        if (s.gate) |*g| g.deinit(gpa);
+         s.context.deinit(gpa);
+         s.rows.deinit(gpa);
+         s.prompt_rows.deinit(gpa);
+@@ -471,6 +476,7 @@ pub const Stream = struct {
+             s.context.appendAssumeCapacity(t);
+             if (rows.len > 0) s.rows.appendAssumeCapacity(rows[i]);
+             landed += 1;
++            if (s.gate) |*g| try g.observe(gpa, t);
+             s.forced_out -|= 1;
+             const ended_think = s.think_open and @as(i64, t) == s.think_end;
+             if (@as(i64, t) == s.think_end) {
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index ffcfeda56..3a95c5f0b 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -22,6 +22,8 @@ pub const prompt_rows: u32 = 2048;
+ /// The compute lane and in-model runner as upstream's flashnext binds them: one checkpoint, so one ChatML markup.
+ pub const compute = @import("flashnext").native.compute; // TF_COMPUTE_LANE*: native/cuda.zig's openWith boots it
+ pub const runner = @import("flashnext").native.runner; // TF_RUNNER*: openWith opens it for the lane host
++/// tool_choice required, a named function and Anthropic any: the lane core's call gate (her 0007), no grammar hook.
++pub const call_gates = true;
+ 
+ /// f212's contract (cuda_options.zig): lanes is --parallel, kv8 --kv-cache fp8 (her --kv-dtype fp8); segments ignored.
+ pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: ?[]const u8 = null, master_port: u16 = 29551, kv8: bool = false };
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 1bebb6951..73cfd70ee 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -465,6 +465,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .prompt_logprobs = served.backend.vtable.prompt_rows,
+         .penalties = served.backend.penalties,
+         .structures = served.backend.vtable.first_masked != null,
++        .call_gates = @hasDecl(F, "call_gates") and F.call_gates, // the lane core forces the call (lanes/call_gate.zig)
+         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
+         .admit = admit,
+         .ledger = @import("cuda_ledger.zig").info(if (h.kv_plan) |*p| p else null),
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 75f40fb8c..725f2b43e 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -65,6 +65,7 @@ test {
+     _ = @import("tool_grammar_lfm2.zig");
+     _ = @import("tool_grammar_lfm2_test.zig");
+     _ = @import("tool_required_test.zig");
++    _ = @import("tool_call_gate.zig");
+     _ = @import("structure_field_test.zig");
+     _ = @import("grammar.zig");
+     _ = @import("pyrepr.zig");
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 7ed362403..e900aea9c 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -349,7 +349,9 @@ pub const Server = struct {
+         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
+         const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
+         const all = has_tools and !required and (tool_grammar.autoAllEnv() catch return cx.fail(.server, "invalid TF_DSV41_TOOL_GRAMMAR: expected 0 or 1", .{}));
+-        if (has_tools and required) {
++        if (has_tools and required and !srv.info.capability(.structures) and srv.info.capability(.call_gates)) {
++            request.call = try @import("tool_call_gate.zig").gate(srv, cx, tools); // the engine forces the call
++        } else if (has_tools and required) {
+             if (!srv.info.capability(.structures)) return cx.fail(.request, "backend '{s}' cannot enforce tool_choice \"required\" or a named function: it has no token grammar support; send \"auto\" or \"none\"", .{srv.backendName()});
+             request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
+         } else if (has_tools and srv.info.capability(.structures) and tool_grammar.autoWanted(tools, all) and srv.grammarCompiler() != null) {
+diff --git a/zig/src/server/tool_call_gate.zig b/zig/src/server/tool_call_gate.zig
+new file mode 100644
+index 000000000..97e7e8fa2
+--- /dev/null
++++ b/zig/src/server/tool_call_gate.zig
+@@ -0,0 +1,102 @@
++//! tool_choice required, a named function or Anthropic any as an engine call gate (ported from MiaAI-Lab patch 0007).
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json");
++const errors = @import("errors.zig");
++const prompt = @import("prompt.zig");
++const reply_text = @import("reply_text.zig");
++const tool_specs = @import("tool_specs.zig");
++const Server = @import("server.zig").Server;
++const Value = json.Value;
++const Cx = errors.Cx;
++const Allocator = std.mem.Allocator;
++
++const probe = "tfprobe_fn";
++
++/// The template's call: its opener, the text from it to the name and the mark after the name (null: unread).
++pub const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };
++
++/// The gate for a reply that must call one of `tools` (the named one alone for a named function).
++pub fn gate(srv: *Server, cx: *Cx, tools: []const Value) errors.Refused!api.CallGate {
++    const form = try formOf(srv, cx);
++    const opener = if (form) |fm| srv.text.tokenId(fm.opener) else null;
++    if (opener == null) return cx.fail(.request, "backend '{s}' cannot enforce tool_choice \"required\" or a named function: its chat template marks tool calls with no single opener token; send \"auto\" or \"none\"", .{srv.backendName()});
++    var names: std.ArrayList([]const u8) = .empty;
++    if (form.?.lead != null) for (tools) |t| try names.append(cx.a, try tool_specs.toolName(cx.a, t));
++    const think_open = if (srv.markers.open.len > 0) blk: {
++        const ids = srv.text.encode(cx.a, srv.markers.open, false) catch |e| switch (e) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Template => &[_]u32{},
++        };
++        break :blk if (ids.len > 0) ids[0] else null;
++    } else srv.text.tokenId("<think>");
++    return .{
++        .opener = opener.?,
++        .lead = form.?.lead orelse "",
++        .tail = form.?.tail orelse "",
++        .names = names.items,
++        .think_open = think_open,
++        .think_end = srv.text.tokenId(srv.markers.close),
++        .lex = .{ .ctx = srv, .blank = blank, .text = text, .encode = encode },
++    };
++}
++
++/// The call form of `rendered`, a turn that calls `probe` with no arguments; null when it marks no call.
++pub fn formIn(rendered: []const u8, opener_token: *const fn (ctx: *anyopaque, piece: []const u8) bool, ctx: *anyopaque) ?Form {
++    if (std.mem.lastIndexOf(u8, rendered, probe)) |at| {
++        var best: ?usize = null;
++        var opener: []const u8 = "";
++        for (reply_text.calls) |c| if (std.mem.lastIndexOf(u8, rendered[0..at], c[0])) |s| {
++            if (best == null or s > best.? or (s == best.? and std.mem.order(u8, c[0], opener) == .gt)) {
++                best = s;
++                opener = c[0];
++            }
++        };
++        if (best) |s| {
++            const end = at + probe.len;
++            return .{ .opener = opener, .lead = rendered[s + opener.len .. at], .tail = if (end < rendered.len) rendered[end .. end + 1] else "" };
++        }
++    }
++    for (reply_text.calls) |c| if (opener_token(ctx, c[0])) return .{ .opener = c[0], .lead = null, .tail = null };
++    return null;
++}
++
++fn formOf(srv: *Server, cx: *Cx) errors.Refused!?Form {
++    const turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {}}}]}]")).ok;
++    var scratch: Cx = .{ .a = cx.a };
++    const rendered = if (prompt.renderIds(srv, &scratch, turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |err| switch (err) {
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Refused => "",
++    };
++    return formIn(rendered, isToken, srv);
++}
++
++fn isToken(ctx: *anyopaque, piece: []const u8) bool {
++    const srv: *Server = @ptrCast(@alignCast(ctx));
++    return srv.text.tokenId(piece) != null;
++}
++
++fn blank(ctx: *anyopaque, token: u32) bool {
++    const srv: *Server = @ptrCast(@alignCast(ctx));
++    for (srv.text.eosIds()) |e| if (e == token) return false;
++    var buf: [256]u8 = undefined;
++    var fba = std.heap.FixedBufferAllocator.init(&buf);
++    const t = srv.text.decode(fba.allocator(), &.{token}) catch return false;
++    return std.mem.trim(u8, t, " \t\r\n").len == 0;
++}
++
++/// A token's text; an end token is a byte no lead or name holds, so the gate finishes the call instead of ending it.
++fn text(ctx: *anyopaque, a: Allocator, token: u32) anyerror![]const u8 {
++    const srv: *Server = @ptrCast(@alignCast(ctx));
++    for (srv.text.eosIds()) |e| if (e == token) return "\x00";
++    return srv.text.decode(a, &.{token});
++}
++
++fn encode(ctx: *anyopaque, a: Allocator, t: []const u8) anyerror![]const u32 {
++    const srv: *Server = @ptrCast(@alignCast(ctx));
++    return srv.text.encode(a, t, false);
++}
++
++test {
++    _ = @import("tool_call_gate_test.zig");
++}
+diff --git a/zig/src/server/tool_call_gate_test.zig b/zig/src/server/tool_call_gate_test.zig
+new file mode 100644
+index 000000000..671214fbb
+--- /dev/null
++++ b/zig/src/server/tool_call_gate_test.zig
+@@ -0,0 +1,319 @@
++//! tool_choice through an engine's call gate: each route's choice reaches the lane core, which forces the call.
++const std = @import("std");
++const api = @import("engine_api");
++const lanes = @import("lanes");
++const json = @import("json");
++const errors = @import("errors.zig");
++const mt = @import("model_text.zig");
++const Server = @import("server.zig").Server;
++const openai = @import("openai.zig");
++const responses = @import("responses_translate.zig");
++const anthropic = @import("anthropic_translate.zig");
++const parse = @import("tool_parse.zig");
++const gate = @import("tool_call_gate.zig");
++const a = std.testing.allocator;
++const t = std.testing;
++
++// one token each, in ids no text below spells: Qwen's call and think markers
++const opener: u32 = 94; // "~"
++const closer: u32 = 92; // "|"
++const think_open: u32 = 64; // "`"
++const think_end: u32 = 62; // "^"
++const eos: u32 = 96;
++const marks = [_]struct { u32, []const u8 }{ .{ opener, "<tool_call>" }, .{ closer, "</tool_call>" }, .{ think_open, "<think>" }, .{ think_end, "</think>" } };
++
++const Text = struct {
++    probe: []const u8 = "<tool_call>\n<function=tfprobe_fn>\n</function>\n</tool_call>",
++    fn text(x: *Text) mt.Text {
++        return .{ .ctx = x, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eosIds, .render = render, .template_source = source } };
++    }
++    fn encode(_: *anyopaque, g: std.mem.Allocator, s: []const u8, _: bool) mt.Error![]u32 {
++        var ids: std.ArrayList(u32) = .empty;
++        var i: usize = 0;
++        outer: while (i < s.len) {
++            for (marks) |m| if (std.mem.startsWith(u8, s[i..], m[1])) {
++                try ids.append(g, m[0]);
++                i += m[1].len;
++                continue :outer;
++            };
++            try ids.append(g, if (s[i] == '\n') 95 else @as(u32, s[i]) - 32);
++            i += 1;
++        }
++        return ids.items;
++    }
++    fn decode(_: *anyopaque, g: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
++        var out: std.ArrayList(u8) = .empty;
++        for (ids) |id| {
++            if (mark(id)) |m| try out.appendSlice(g, m) else if (id < 95) try out.append(g, @intCast(id + 32)) else if (id == 95) try out.append(g, '\n');
++        }
++        return out.items;
++    }
++    fn mark(id: u32) ?[]const u8 {
++        for (marks) |m| if (m[0] == id) return m[1];
++        return null;
++    }
++    fn tokenId(_: *anyopaque, s: []const u8) ?u32 {
++        for (marks) |m| if (std.mem.eql(u8, m[1], s)) return m[0];
++        return null;
++    }
++    fn tokenString(_: *anyopaque, g: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
++        return decode(undefined, g, &.{id});
++    }
++    fn vocab(_: *anyopaque) u32 {
++        return 97;
++    }
++    fn eosIds(_: *anyopaque) []const u32 {
++        return &.{eos};
++    }
++    fn source(_: *anyopaque) []const u8 {
++        return "";
++    }
++    fn render(ptr: *anyopaque, g: std.mem.Allocator, _: json.Value, _: mt.RenderOptions, _: *[]const u8) mt.Error!mt.Rendered {
++        const x: *Text = @ptrCast(@alignCast(ptr));
++        return .{ .text = try g.dupe(u8, x.probe) };
++    }
++};
++
++const Stub = struct {
++    fn engine(s: *Stub) api.Engine {
++        return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++    fn info(_: *anyopaque) api.Info {
++        return .{ .name = "flashnext_mia", .call_gates = true };
++    }
++    fn submit(_: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
++        unreachable;
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++fn value(g: std.mem.Allocator, s: []const u8) !json.Value {
++    return (try json.parse(g, s)).ok;
++}
++
++const Route = enum { chat, responses, messages };
++const specs = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}},{\"type\":\"function\",\"function\":{\"name\":\"now\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
++const anthropic_tools = "[{\"name\":\"lookup\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}},{\"name\":\"now\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}}]";
++
++/// A body on `route` offering lookup and now with `choice` (that route's spelling), translated for the chat route.
++fn body(cx: *errors.Cx, route: Route, choice: []const u8) !json.Value {
++    const History = struct {
++        pub fn conversation(_: @This(), c: *errors.Cx, _: json.Value) errors.Refused![]json.Value {
++            return c.refuse("this fixture has no stored response");
++        }
++    };
++    const b = try json.newObject(cx.a);
++    try b.put(cx.a, "model", .{ .string = "m" });
++    try b.put(cx.a, "tool_choice", try value(cx.a, choice));
++    switch (route) {
++        .chat => {
++            try b.put(cx.a, "messages", try value(cx.a, "[{\"role\":\"user\",\"content\":\"hi\"}]"));
++            try b.put(cx.a, "tools", try value(cx.a, specs));
++            return .{ .object = b };
++        },
++        .responses => {
++            try b.put(cx.a, "input", .{ .string = "hi" });
++            const offered = (try value(cx.a, specs)).array;
++            for (offered) |*tool| {
++                const f = tool.get("function").?.object;
++                try f.put(cx.a, "type", .{ .string = "function" });
++                tool.* = .{ .object = f };
++            }
++            try b.put(cx.a, "tools", .{ .array = offered });
++            return (try responses.translate(cx, .{ .object = b }, History{})).chat;
++        },
++        .messages => {
++            try b.put(cx.a, "max_tokens", try json.intValue(cx.a, 64));
++            try b.put(cx.a, "messages", try value(cx.a, "[{\"role\":\"user\",\"content\":\"hi\"}]"));
++            try b.put(cx.a, "tools", try value(cx.a, anthropic_tools));
++            return anthropic.translate(cx, .{ .object = b }, false);
++        },
++    }
++}
++
++/// The request `choice` on `route` makes on a call-gate engine with no grammar support.
++fn gated(srv: *Server, cx: *errors.Cx, route: Route, choice: []const u8) !struct { request: api.Request, tools: []const json.Value } {
++    const input = try openai.chatInput(srv, cx, try body(cx, route, choice));
++    var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
++    try srv.checkFeatures(cx, input.fields, input.tools.len > 0, false, &.{1}, input.tools, &request);
++    try t.expect(request.structure == null);
++    return .{ .request = request, .tools = input.tools };
++}
++
++const Choice = struct { route: Route, choice: []const u8, names: []const []const u8 };
++const required = [_]Choice{
++    .{ .route = .chat, .choice = "\"required\"", .names = &.{ "lookup", "now" } },
++    .{ .route = .chat, .choice = "{\"type\":\"function\",\"function\":{\"name\":\"now\"}}", .names = &.{"now"} },
++    .{ .route = .responses, .choice = "\"required\"", .names = &.{ "lookup", "now" } },
++    .{ .route = .responses, .choice = "{\"type\":\"function\",\"name\":\"now\"}", .names = &.{"now"} },
++    .{ .route = .messages, .choice = "{\"type\":\"any\"}", .names = &.{ "lookup", "now" } },
++    .{ .route = .messages, .choice = "{\"type\":\"tool\",\"name\":\"now\"}", .names = &.{"now"} },
++};
++
++test "call gate: required, a named function and Anthropic any reach the engine as a gate over the offered names" {
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    var text: Text = .{};
++    var stub: Stub = .{};
++    const srv = try Server.init(a, t.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
++    defer srv.deinit();
++    var cx: errors.Cx = .{ .a = arena.allocator() };
++    for (required) |c| {
++        const r = try gated(srv, &cx, c.route, c.choice);
++        const g = r.request.call orelse return error.TestExpectedGate;
++        try t.expectEqual(opener, g.opener);
++        try t.expectEqualStrings("\n<function=", g.lead);
++        try t.expectEqualStrings(">", g.tail);
++        try t.expectEqual(@as(usize, c.names.len), g.names.len);
++        for (c.names, g.names) |want, got| try t.expectEqualStrings(want, got);
++        try t.expectEqual(@as(?u32, think_open), g.think_open);
++        try t.expectEqual(@as(?u32, think_end), g.think_end);
++    }
++}
++
++test "call gate: auto and none make no gate and no grammar, on every route" {
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    var text: Text = .{};
++    var stub: Stub = .{};
++    const srv = try Server.init(a, t.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
++    defer srv.deinit();
++    var cx: errors.Cx = .{ .a = arena.allocator() };
++    for ([_]Route{ .chat, .responses, .messages }) |route| for ([_][]const u8{ "auto", "none" }) |kind| {
++        const choice = if (route == .messages) try std.fmt.allocPrint(cx.a, "{{\"type\":\"{s}\"}}", .{kind}) else try std.fmt.allocPrint(cx.a, "\"{s}\"", .{kind});
++        const r = try gated(srv, &cx, route, choice);
++        try t.expect(r.request.call == null);
++        try t.expectEqual(std.mem.eql(u8, kind, "none"), r.tools.len == 0);
++    };
++}
++
++test "call gate: an engine without gates or grammars still refuses required, naming the backend" {
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    var text: Text = .{};
++    var stub: Stub = .{};
++    const srv = try Server.init(a, t.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
++    defer srv.deinit();
++    srv.info.call_gates = false;
++    var cx: errors.Cx = .{ .a = arena.allocator() };
++    try t.expectError(error.Refused, gated(srv, &cx, .chat, "\"required\""));
++    try t.expectEqual(@as(u16, 400), cx.status());
++    try t.expect(std.mem.indexOf(u8, cx.message, "flashnext_mia") != null);
++}
++
++test "call gate: a probe call with no form forces the opener alone, and no opener token means no form" {
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    var text: Text = .{ .probe = "[[call tfprobe_fn]]" };
++    var stub: Stub = .{};
++    const srv = try Server.init(a, t.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
++    defer srv.deinit();
++    var cx: errors.Cx = .{ .a = arena.allocator() };
++    // no opener in the probe: the first marker that is one token (Qwen's) is forced alone, without a name
++    const r = try gated(srv, &cx, .chat, "\"required\"");
++    try t.expectEqual(opener, r.request.call.?.opener);
++    try t.expectEqual(@as(usize, 0), r.request.call.?.names.len);
++    try t.expect(gate.formIn("[[call tfprobe_fn]]", never, undefined) == null);
++}
++
++fn never(_: *anyopaque, _: []const u8) bool {
++    return false;
++}
++
++/// A model that writes `plan`, but once a call header it opened closed, ends the call (as a model would).
++const Model = struct {
++    prompt_len: usize,
++    plan: []const u32,
++    close: []const u32, // "\n</function>\n</tool_call>"
++    fn next(ctx: *anyopaque, history: []const u32) u32 {
++        const m: *Model = @ptrCast(@alignCast(ctx));
++        const reply = history[m.prompt_len..];
++        if (std.mem.lastIndexOfScalar(u32, reply, opener)) |at| {
++            const call = reply[at + 1 ..];
++            if (std.mem.indexOfScalar(u32, call, closer) != null) return eos;
++            if (std.mem.indexOfScalar(u32, call, '>' - 32)) |header| {
++                const rest = call[header + 1 ..];
++                return if (rest.len < m.close.len) m.close[rest.len] else eos;
++            }
++        }
++        return if (reply.len < m.plan.len) m.plan[reply.len] else eos;
++    }
++};
++
++/// The reply the lane engine decodes from `prompt` under `call` (null: ungated), drafted `depth` deep (0: plain).
++fn decodeWith(g: std.mem.Allocator, prompt: []const u32, plan: []const u8, call: ?api.CallGate, depth: u32) ![]const u8 {
++    return decodeOn(g, prompt, plan, call, depth, false);
++}
++
++/// decodeWith on a target whose one-token rounds run a step ahead (`piped`, Config.pipelined) or in windows.
++fn decodeOn(g: std.mem.Allocator, prompt: []const u32, plan: []const u8, call: ?api.CallGate, depth: u32, piped: bool) ![]const u8 {
++    var model: Model = .{ .prompt_len = prompt.len, .plan = try Text.encode(undefined, g, plan, false), .close = try Text.encode(undefined, g, "\n</function>\n</tool_call>", false) };
++    var cfg = try lanes.Config.init(a, .{ .exact_width = 8, .mtp = true, .speculate = true, .drafts = depth, .hidden_rows = true, .streams_exact = true, .batch_rows = 8, .max_streams = 2, .draft_streams = true, .gpu_tokens = piped }, 8, 7);
++    defer cfg.deinit(a);
++    var target: lanes.fake.Fake = .{ .gpa = a, .script = .{ .ctx = &model, .next = Model.next } };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var engine = lanes.Engine.init(a, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    var s = try lanes.Stream.init(a, .{ .id = "gate", .prompt = prompt, .max_new = 200, .drafts = depth > 0, .eos = &.{eos}, .call = call, .think_end = think_end });
++    defer s.deinit(a);
++    try engine.addStream(&s);
++    var steps: usize = 0;
++    while (engine.activeCount() > 0 and steps < 1000) : (steps += 1) try engine.step();
++    try t.expect(s.finished and s.reason == .stop);
++    return Text.decode(undefined, g, s.emitted());
++}
++
++test "call gate: the lane engine forces the call a plain answer skipped, drafted equal to plain, and it parses" {
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const g = arena.allocator();
++    var text: Text = .{};
++    var stub: Stub = .{};
++    const srv = try Server.init(a, t.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
++    defer srv.deinit();
++    var cx: errors.Cx = .{ .a = g };
++    const prompt = try Text.encode(undefined, g, "user: hi\nassistant:", false);
++    for (required) |c| {
++        const r = try gated(srv, &cx, c.route, c.choice);
++        const plain = try decodeWith(g, prompt, "Sure.", r.request.call, 0);
++        errdefer std.debug.print("CALL_GATE_REPLY {s} [{s}]\n", .{ c.choice, plain });
++        try t.expectEqualStrings(try std.fmt.allocPrint(g, "<tool_call>\n<function={s}>\n</function>\n</tool_call>", .{c.names[0]}), plain);
++        for ([_]u32{ 1, 4 }) |depth| try t.expectEqualStrings(plain, try decodeWith(g, prompt, "Sure.", r.request.call, depth));
++        try t.expectEqualStrings(plain, try decodeOn(g, prompt, "Sure.", r.request.call, 0, true)); // a step ahead, gated in windows
++        const result = try parse.parse(g, plain, r.tools, null);
++        try t.expectEqualStrings("", result.content);
++        try t.expectEqual(@as(usize, 1), result.calls.?.len);
++        try t.expectEqualStrings(c.names[0], result.calls.?[0].get("function").?.strField("name").?);
++        // at the name this plan writes "noo": the offered name it starts is finished (drafted or not)
++        for ([_]u32{ 0, 4 }) |depth| try t.expectEqualStrings("<tool_call>\n<function=now>\n</function>\n</tool_call>", try decodeWith(g, prompt, "Sure, it is noon.", r.request.call, depth));
++    }
++}
++
++test "call gate: a reply that makes the call itself and a reply that thinks first keep every token the model chose" {
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const g = arena.allocator();
++    var text: Text = .{};
++    var stub: Stub = .{};
++    const srv = try Server.init(a, t.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
++    defer srv.deinit();
++    var cx: errors.Cx = .{ .a = g };
++    const r = try gated(srv, &cx, .chat, "\"required\"");
++    const prompt = try Text.encode(undefined, g, "user: hi\nassistant:", false);
++    // a call the model writes itself (with a blank first) is the same reply gated or not
++    const own = "\n<tool_call>\n<function=now>\n</function>\n</tool_call>";
++    for ([_]u32{ 0, 4 }) |depth| try t.expectEqualStrings(try decodeWith(g, prompt, own, null, depth), try decodeWith(g, prompt, own, r.request.call, depth));
++    try t.expectEqualStrings(own, try decodeWith(g, prompt, own, r.request.call, 0));
++    // thinking: the open think block is the model's; the gate takes the answer after it
++    const thinking = try Text.encode(undefined, g, "user: hi\nassistant:<think>", false);
++    const reply = try decodeWith(g, thinking, "noon, so now</think>Sure.", r.request.call, 4);
++    try t.expectEqualStrings("noon, so now</think><tool_call>\n<function=lookup>\n</function>\n</tool_call>", reply);
++    try t.expectEqualStrings(reply, try decodeWith(g, thinking, "noon, so now</think>Sure.", r.request.call, 0));
++}

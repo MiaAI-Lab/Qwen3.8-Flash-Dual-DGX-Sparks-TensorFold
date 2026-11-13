@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:27:16 +0700
+Subject: [PATCH 60/79] flashnext_mia: her store's short-prompt rule, no
+ prompt-cache state under 4096 tokens
+
+The port's CUDA families keep a state for every prompt (cuda_snaps
+min_prompt 0), so after a long-prompt history her family's cache filled
+with short chat states (43 states, 9.0 of 9.4 GiB) and c16 time to first
+token rose from 0.58 to 1.48 s. Her store kept nothing below 4096 tokens.
+
+- A family may declare snap_min_prompt; cuda_snaps.cacheRules takes it as
+  Rules.min_prompt, and passRules then sets chunk 0, so a shorter prompt
+  keeps no state at all (not even a chunk end's mark), as db281878's store.
+- Her family declares it as 4096 (burst_short, the same length). Other
+  families declare nothing and keep their rules unchanged.
+- burst_short still only drops a short prompt's resume in a burst; with no
+  short states kept it can only drop a hit on a long prompt's state, which
+  leaves the tokens unchanged.
+
+Tests: "flashnext_mia family: her cache rules keep no state for 47- or
+3000-token prompts and one at 4200 tokens" (the real store and lane host
+over her toy lanes). The burst test now builds its store from f212's rules
+with her lookahead, where a short prompt still keeps its 3-token state.
+
+Port: her prompt cache rules (db281878 Rules.min_prompt 4096, lookahead 0) as her family's (MiaAI-Lab)
+---
+ .../families/flashnext_mia/cuda_native.zig    |  2 +
+ .../native/cuda_flashnext_mia_sched_test.zig  | 50 ++++++++++++++++++-
+ zig/src/native/cuda_snaps.zig                 |  6 ++-
+ 3 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index dcde9130c..cf7303b17 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -28,6 +28,8 @@ pub const Options = struct { context: usize, drafts: bool, segments: usize = 1,
+ /// The prompt cache's copies over `Loaded.target` (her lanes); a kept state depends on its tokens alone: lookahead 0.
+ const Served = lane_backend.Lanes(@import("cuda_engine.zig").Engine);
+ pub const snap_lookahead: u32 = 0;
++/// Her store's rule (db281878 Rules.min_prompt): a shorter prompt keeps no state; burst_short is the same length.
++pub const snap_min_prompt: u32 = lane_backend.burst_short;
+ pub const snap_bytes = Served.bytesFn;
+ pub const snap_save = Served.saveFn;
+ pub const snap_restore = Served.restoreFn;
+diff --git a/zig/src/native/cuda_flashnext_mia_sched_test.zig b/zig/src/native/cuda_flashnext_mia_sched_test.zig
+index 601e23485..bb4568b58 100644
+--- a/zig/src/native/cuda_flashnext_mia_sched_test.zig
++++ b/zig/src/native/cuda_flashnext_mia_sched_test.zig
+@@ -27,6 +27,52 @@ fn served(toy: *Toy, streams: usize) L.Lanes(Toy) {
+     return b;
+ }
+ 
++/// f212's store rules with her lookahead: a short prompt keeps its history's state (her own rules keep none).
++const F212Store = struct {
++    pub const snap_lookahead: u32 = 0;
++};
++
++/// One request through a lane host over `store`, served to its end.
++fn serveOne(core: *lanes.Engine, store: *api.prompt_cache.Store, id: api.Id, prompt: []const u32, history_len: u32) !void {
++    var host = api.LaneHost.init(gpa, t.io, core, .{ .lanes = 16 });
++    host.cache = store;
++    var req: api.Request = .{ .prompt = prompt, .max_tokens = 4, .history_len = history_len };
++    var box: Box = .{};
++    defer box.tokens.deinit(gpa);
++    try host.engine().submit(id, &req, .{ .ctx = &box, .event = Box.event });
++    try host.start();
++    defer host.stop();
++    _ = try box.wait();
++}
++
++test "flashnext_mia family: her cache rules keep no state for 47- or 3000-token prompts and one at 4200 tokens" {
++    var toy: Toy = .{ .gpa = gpa };
++    var b = served(&toy, 16);
++    defer b.deinit();
++    var cfg = try lanes.Config.init(gpa, b.facts(), L.max_rows, L.max_rows - 1);
++    defer cfg.deinit(gpa);
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
++    defer core.deinit();
++    // the server's store over her lanes with her family's own pass rules (native/cuda.zig)
++    const pc = api.prompt_cache;
++    const vt: pc.Snapshots.VTable = .{ .bytes = L.Lanes(Toy).bytesFn, .save = L.Lanes(Toy).saveFn, .restore = L.Lanes(Toy).restoreFn, .drop = L.Lanes(Toy).dropFn };
++    var store = pc.Store.init(gpa, .{ .ptr = &b, .vtable = &vt }, @import("cuda_snaps.zig").passRules(family, family.prompt_rows), 1 << 30);
++    defer store.deinit();
++    const text = try gpa.alloc(u32, 4200);
++    defer gpa.free(text);
++    for (text, 0..) |*x, i| x.* = @intCast(i % 50);
++    // a chat prompt (its 3-token opening is the history), then one whose history passes a 2048-row chunk end
++    try serveOne(&core, &store, 1, text[0..47], 3);
++    try t.expectEqual(@as(usize, 0), store.entries.items.len);
++    try serveOne(&core, &store, 2, text[0..3000], 2900);
++    try t.expectEqual(@as(usize, 0), store.entries.items.len);
++    // at her min_prompt (4096) and past it: the history's state is kept
++    try serveOne(&core, &store, 3, text, 4150);
++    try t.expectEqual(@as(usize, 1), store.entries.items.len);
++    try t.expectEqual(@as(u32, 4150), store.entries.items[0].at);
++}
++
+ test "flashnext_mia family: sixteen queued prompts with a 3-token cache hit prefill in one burst" {
+     var toy: Toy = .{ .gpa = gpa };
+     var b = served(&toy, 16);
+@@ -36,10 +82,10 @@ test "flashnext_mia family: sixteen queued prompts with a 3-token cache hit pref
+     var clock: lanes.fake.FixedClock = .{};
+     var core = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
+     defer core.deinit();
+-    // the server's store over her lanes (native/cuda.zig: her snap_* calls, f212's pass rules)
++    // the server's store over her lanes (native/cuda.zig: her snap_* calls) under f212's rules, where short states keep
+     const pc = api.prompt_cache;
+     const vt: pc.Snapshots.VTable = .{ .bytes = L.Lanes(Toy).bytesFn, .save = L.Lanes(Toy).saveFn, .restore = L.Lanes(Toy).restoreFn, .drop = L.Lanes(Toy).dropFn };
+-    var store = pc.Store.init(gpa, .{ .ptr = &b, .vtable = &vt }, @import("cuda_snaps.zig").passRules(family, family.prompt_rows), 1 << 30);
++    var store = pc.Store.init(gpa, .{ .ptr = &b, .vtable = &vt }, @import("cuda_snaps.zig").passRules(F212Store, family.prompt_rows), 1 << 30);
+     defer store.deinit();
+ 
+     // one request keeps the state at its 3-token history (the chat template's opening, as in the c16 wave)
+diff --git a/zig/src/native/cuda_snaps.zig b/zig/src/native/cuda_snaps.zig
+index 7e883e53f..b407eec72 100644
+--- a/zig/src/native/cuda_snaps.zig
++++ b/zig/src/native/cuda_snaps.zig
+@@ -2,10 +2,11 @@
+ const std = @import("std");
+ const api = @import("engine_api");
+ 
+-/// Any row, the head one token on (Nemotron's); a family's snap_grid, snap_lookahead, warm_quiet, snap_fork, snap_tail.
++/// Any row, the head one token on (Nemotron's); a family's snap_grid, _lookahead, _min_prompt, _fork, _tail, warm_quiet
+ pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
+     var rules: api.prompt_cache.Rules = .{ .lookahead = 1, .min_prompt = 0 };
+     if (@hasDecl(F, "snap_lookahead")) rules.lookahead = F.snap_lookahead;
++    if (@hasDecl(F, "snap_min_prompt")) rules.min_prompt = F.snap_min_prompt; // shorter prompts: see passRules
+     if (@hasDecl(F, "warm_quiet")) rules.warm = .waits;
+     if (@hasDecl(F, "snap_fork")) rules.fork = F.snap_fork; // opt-in, a family at a time after its device check
+     if (@hasDecl(F, "snap_tail")) rules.tail = if (@import("core").profile.lookup(F.snap_tail)) |v| std.mem.eql(u8, v, "1") else false;
+@@ -19,7 +20,8 @@ pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
+ /// Native CUDA families own their grid, independently of the server's template chunk starts.
+ pub fn passRules(comptime F: type, prompt_rows: u32) api.prompt_cache.Rules {
+     var rules = cacheRules(F);
+-    rules.chunk = prompt_rows;
++    // a family's own min_prompt keeps nothing below it, not even a chunk end's mark (chunk 0), as db281878's store
++    rules.chunk = if (@hasDecl(F, "snap_min_prompt")) 0 else prompt_rows;
+     if (@hasDecl(F, "snap_repeat_min")) rules.repeat_min = if (std.c.getenv("TF_FLASHNEXT_REPEAT_CACHE")) |v| (if (std.mem.eql(u8, std.mem.span(v), "0")) 0 else F.snap_repeat_min) else F.snap_repeat_min;
+     rules.chunk_starts = false;
+     return rules;

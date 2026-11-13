@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 16:07:35 +0700
+Subject: [PATCH 57/79] compute lane: a resumed segment that ends inside its
+ reopened think block answers with that text
+
+With thinking on, the turn after a tool result opens a new think block. When the model answered
+there and stopped without closing it, the whole answer went out as reasoning_content and the
+reply's content was empty (Qwen3.8-Flash-Next: 3 of ~360 lane replies). A resumed segment
+(compute_segments.next) that ends at its EOS with no think close and no content now reports its
+text as the content, streamed or not.
+
+(cherry picked from commit 751b92d4d5b569bce42fe2170064f8241bf2b6b6)
+---
+ zig/src/server/chat_generation.zig          |   7 +
+ zig/src/server/compute_lane_chatml_test.zig | 150 +++++++++++++++-----
+ zig/src/server/compute_segments.zig         |   2 +-
+ 3 files changed, 126 insertions(+), 33 deletions(-)
+
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index 9eedb92ad..bf3944f88 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -68,6 +68,7 @@ pub const Generation = struct {
+     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
+     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
+     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
++    resumed: bool = false, // a segment after an inserted tool result (compute_segments.next)
+ 
+     fn eos(g: *const Generation, t: u32) bool {
+         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
+@@ -311,6 +312,12 @@ pub const Generation = struct {
+             const split = try reply_text.splitThinkingAt(a, text, true, g.srv.markers, close_at);
+             r.reasoning = nonEmpty(reply_text.pyStrip(split.reasoning));
+             r.content = split.answer;
++            // a resumed segment that ended at its EOS inside the think block the result turn reopened: its text answers
++            const t = g.collected.items;
++            if (g.resumed and close_at != .token and r.reasoning != null and reply_text.pyStrip(r.content).len == 0 and t.len > 0 and g.eos(t[t.len - 1])) {
++                r.content = r.reasoning.?;
++                r.reasoning = null;
++            }
+         } else if (g.srv.info.capability(.reasoning)) {
+             const h = reply_text.parseHarmony(text);
+             r.content = h.content;
+diff --git a/zig/src/server/compute_lane_chatml_test.zig b/zig/src/server/compute_lane_chatml_test.zig
+index b9e56d300..0768200f8 100644
+--- a/zig/src/server/compute_lane_chatml_test.zig
++++ b/zig/src/server/compute_lane_chatml_test.zig
+@@ -8,64 +8,150 @@ const lane = @import("engine_api").hold.compute_lane;
+ const t = std.testing;
+ 
+ const template = @embedFile("fixtures/dory/chat_template.jinja");
++const python = "/usr/bin/python3";
++const call_text = "<tool_call>\n<function=python>\n<parameter=code>\nprint(6*7)\n</parameter>\n</function>\n</tool_call>\n";
+ 
+-test "compute lane: a ChatML turn close after the held EOS goes in with the result turn, not instead of it" {
+-    var arena = std.heap.ArenaAllocator.init(t.allocator);
+-    defer arena.deinit();
+-    const a = arena.allocator();
+-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // the lane's executor runs on Linux only
+-    const python = "/usr/bin/python3";
+-    std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
+-    var tmp = t.tmpDir(.{});
+-    defer tmp.cleanup();
+-    // the byte-level mini vocabulary; the call and think markers are text, as in a Qwen tokenizer
++/// A streamed reply's deltas, joined: what a streaming client shows as content and as reasoning.
++const Streamed = struct {
++    a: std.mem.Allocator,
++    content: std.ArrayList(u8) = .empty,
++    reasoning: std.ArrayList(u8) = .empty,
++    code: u16 = 0,
++    fn out(r: *@This()) @import("openai.zig").Out {
++        return .{ .ctx = r, .vt = &.{ .open = open, .event = event, .reply = reply } };
++    }
++    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
++    fn event(ctx: *anyopaque, v: ?json.Value) error{Closed}!void {
++        const r: *@This() = @ptrCast(@alignCast(ctx));
++        const choices = (v orelse return).get("choices") orelse return;
++        for (choices.array) |c| if (c.get("delta")) |d| {
++            if (d.strField("content")) |x| r.content.appendSlice(r.a, x) catch return error.Closed;
++            if (d.strField("reasoning_content")) |x| r.reasoning.appendSlice(r.a, x) catch return error.Closed;
++        };
++    }
++    fn reply(ctx: *anyopaque, code: u16, _: json.Value) void {
++        const r: *@This() = @ptrCast(@alignCast(ctx));
++        r.code = code;
++    }
++};
++
++const Run = struct {
++    reply: h.Reply,
++    streamed: *Streamed,
++    script: *h.Script,
++    text: @import("model_text.zig").Text,
++    hf: *HfText,
++    srv: *@import("server.zig").Server,
++    conn: *@import("http_conn.zig").Conn,
++
++    fn deinit(r: *Run) void {
++        r.conn.deinit();
++        r.srv.deinit();
++        r.hf.deinit();
++    }
++};
++
++/// One lane chat on the dory template (markers are text, as in Qwen): a held call segment, then `answer_text`.
++fn run(a: std.mem.Allocator, dir_out: *std.testing.TmpDir, thinking: bool, stream: bool, answer_text: []const u8) !Run {
+     const tok = try h.obj(a, @embedFile("fixtures/control_tokens/mini_tokenizer.json"));
+     for (tok.get("added_tokens").?.array) |added| {
+         const name = added.strField("content").?;
+         if (!std.mem.startsWith(u8, name, "<|")) try added.object.put(a, "special", .{ .bool = false });
+     }
+     try tok.object.put(a, "pre_tokenizer", try h.obj(a, "{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":false,\"use_regex\":false}"));
+-    try tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer.json", .data = try json.stringify(a, tok, .{}) });
+-    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"dory\",\"vocab_size\":2048}" });
+-    try tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\":\"<|im_end|>\"}" });
+-    try tmp.dir.writeFile(t.io, .{ .sub_path = "chat_template.jinja", .data = template });
+-    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
++    try dir_out.dir.writeFile(t.io, .{ .sub_path = "tokenizer.json", .data = try json.stringify(a, tok, .{}) });
++    try dir_out.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"dory\",\"vocab_size\":2048}" });
++    try dir_out.dir.writeFile(t.io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\":\"<|im_end|>\"}" });
++    try dir_out.dir.writeFile(t.io, .{ .sub_path = "chat_template.jinja", .data = template });
++    const dir = try dir_out.dir.realPathFileAlloc(t.io, ".", a);
+     var problem: []const u8 = "";
+     const hf = try HfText.load(a, t.io, dir, null, a, &problem);
+-    defer hf.deinit();
+     const text = hf.text();
+     const eos = text.tokenId("<|im_end|>").?;
+-    // the model's segments: a Qwen XML call held at its EOS, then the answer
+-    const call_text = "<tool_call>\n<function=python>\n<parameter=code>\nprint(6*7)\n</parameter>\n</function>\n</tool_call>\n";
+     const call = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, call_text), &.{eos} });
+-    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, "It is 42."), &.{eos} });
+-    var script: h.Script = .{ .a = a, .call = call, .answer = answer };
+-    const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
+-    defer srv.deinit();
++    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, answer_text), &.{eos} });
++    const script = try a.create(h.Script);
++    script.* = .{ .a = a, .call = call, .answer = answer };
++    const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = thinking, .use_drafts = false }, null);
+     const cfg: lane.Config = .{ .python = python };
+     srv.info.compute = cfg;
+     srv.compute = lane.Pool.init(cfg, &.{ "/bin/sh", "-c", "exec \"$0\" -I -B -u -c \"$1\"", python, lane.runner.runner });
+     var reply: h.Reply = .{ .a = a };
+-    var conn = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
+-    defer conn.deinit();
++    const conn = try a.create(@import("http_conn.zig").Conn);
++    conn.* = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
+     const body = try json.newObject(a);
+     try body.put(a, "model", .{ .string = "m" });
+     try body.put(a, "max_tokens", try json.intValue(a, 400));
+     try body.put(a, "messages", try tf.messages(a, "What is 6*7?"));
+     try body.put(a, "tools", try h.obj(a, "[{\"type\":\"code_interpreter\"}]"));
+-    @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
+-    const said = try json.stringify(a, reply.body, .{});
++    if (thinking) try body.put(a, "chat_template_kwargs", try h.obj(a, "{\"enable_thinking\":true}"));
++    const streamed = try a.create(Streamed);
++    streamed.* = .{ .a = a };
++    if (stream) try body.put(a, "stream", .{ .bool = true });
++    @import("openai.zig").run(srv, a, if (stream) streamed.out() else reply.out(), .{ .conn = conn }, true, .{ .object = body });
++    return .{ .reply = reply, .streamed = streamed, .script = script, .text = text, .hf = hf, .srv = srv, .conn = conn };
++}
++
++fn skipUnlessLinux() !void {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // the lane's executor runs on Linux only
++    std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
++}
++
++test "compute lane: a ChatML turn close after the held EOS goes in with the result turn, not instead of it" {
++    try skipUnlessLinux();
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    var r = try run(a, &tmp, false, false, "It is 42.");
++    defer r.deinit();
++    const said = try json.stringify(a, r.reply.body, .{});
+     errdefer std.debug.print("COMPUTE_LANE_CHATML_REPLY {s}\n", .{said});
+-    try t.expectEqual(@as(u16, 200), reply.code);
++    try t.expectEqual(@as(u16, 200), r.reply.code);
+     // the result went in (not an empty resume ending the reply at the call), then the answer's EOS ended it
+-    try t.expectEqual(@as(usize, 2), script.resumes.items.len);
+-    try t.expectEqual(@as(usize, 0), script.resumes.items[1].len);
++    try t.expectEqual(@as(usize, 2), r.script.resumes.items.len);
++    try t.expectEqual(@as(usize, 0), r.script.resumes.items[1].len);
+     // the forced rows: the template's own close after the EOS, the result turn, the next generation prompt
+-    try t.expectEqualStrings("\n<|im_start|>user\n<tool_response>\n42\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think></think>", try text.decode(a, script.resumes.items[0]));
+-    const choice = reply.body.get("choices").?.array[0];
++    try t.expectEqualStrings("\n<|im_start|>user\n<tool_response>\n42\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think></think>", try r.text.decode(a, r.script.resumes.items[0]));
++    const choice = r.reply.body.get("choices").?.array[0];
+     try t.expectEqualStrings("stop", choice.get("finish_reason").?.string);
+     try t.expect(std.mem.indexOf(u8, choice.get("message").?.strField("content").?, "It is 42.") != null);
+-    const report = reply.body.get("tensorfold").?.get("compute").?.get("calls").?.array[0];
++    const report = r.reply.body.get("tensorfold").?.get("compute").?.get("calls").?.array[0];
+     try t.expectEqualStrings("42", report.strField("output").?);
+     try t.expect(report.get("inserted").?.bool);
+ }
++
++test "compute lane: an answer after the result, ended inside the think block the result turn reopened, is the content" {
++    try skipUnlessLinux();
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    // thinking on: the generation prompt after the tool turn opens a think block; the model answers and stops in it
++    var r = try run(a, &tmp, true, false, "The product is 42.");
++    defer r.deinit();
++    const said = try json.stringify(a, r.reply.body, .{});
++    errdefer std.debug.print("COMPUTE_LANE_CHATML_THINK_REPLY {s}\n", .{said});
++    try t.expectEqual(@as(u16, 200), r.reply.code);
++    try t.expectEqual(@as(usize, 2), r.script.resumes.items.len);
++    try t.expect(std.mem.endsWith(u8, try r.text.decode(a, r.script.resumes.items[0]), "<|im_start|>assistant\n<think>\n"));
++    const choice = r.reply.body.get("choices").?.array[0];
++    try t.expectEqualStrings("stop", choice.get("finish_reason").?.string);
++    try t.expect(std.mem.indexOf(u8, choice.get("message").?.strField("content").?, "The product is 42.") != null);
++}
++
++test "compute lane: streamed, that answer arrives as content too" {
++    try skipUnlessLinux();
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var tmp = t.tmpDir(.{});
++    defer tmp.cleanup();
++    var r = try run(a, &tmp, true, true, "The product is 42.");
++    defer r.deinit();
++    errdefer std.debug.print("COMPUTE_LANE_CHATML_STREAM content [{s}] reasoning [{s}]\n", .{ r.streamed.content.items, r.streamed.reasoning.items });
++    try t.expectEqual(@as(usize, 2), r.script.resumes.items.len);
++    try t.expect(std.mem.indexOf(u8, r.streamed.content.items, "The product is 42.") != null);
++}
+diff --git a/zig/src/server/compute_segments.zig b/zig/src/server/compute_segments.zig
+index ab572884c..217f7c524 100644
+--- a/zig/src/server/compute_segments.zig
++++ b/zig/src/server/compute_segments.zig
+@@ -94,7 +94,7 @@ fn finish(g: *Generation, cx: *Cx, p: chat.Prepared) chat.Failure!chat.Reply {
+ /// The segment after an inserted result: the same reply, its first tokens the result's, its own text and calls.
+ fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Generation {
+     const n = try g.a.create(Generation);
+-    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .cells_sent = g.cells_sent, .cells_sig = g.cells_sig, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
++    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .resumed = true, .consumed = g.consumed, .chunk_index = g.chunk_index, .cells_sent = g.cells_sent, .cells_sig = g.cells_sig, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit, .lane_own = g.lane_own };
+     if (g.calls != null) n.calls = try tool_stream.Streamer.init(g.a, g.tools);
+     return n;
+ }

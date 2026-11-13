@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:10:41 +0700
+Subject: [PATCH 40/79] flashnext_mia: zig fmt
+
+zig fmt on every Zig file the branch adds or changes: alignment, doubled
+blank lines, and the builtins it rewrites (@backingInt, @fromBackingInt).
+---
+ zig/src/cli/flashnext_cuda.zig                     | 2 +-
+ zig/src/families/flashnext_mia/cuda_comm.zig       | 2 +-
+ zig/src/families/flashnext_mia/cuda_engine.zig     | 8 ++++----
+ zig/src/families/flashnext_mia/cuda_forward.zig    | 1 -
+ zig/src/families/flashnext_mia/cuda_fp8.zig        | 6 +++---
+ zig/src/families/flashnext_mia/cuda_moe_prompt.zig | 1 -
+ zig/src/families/flashnext_mia/cuda_native.zig     | 1 -
+ zig/src/families/flashnext_mia/cuda_prof.zig       | 2 +-
+ zig/src/families/flashnext_mia/cuda_torch_ops.zig  | 2 +-
+ zig/src/families/flashnext_mia/cuda_weights.zig    | 2 +-
+ zig/src/platform/environment_test.zig              | 4 ++--
+ 11 files changed, 14 insertions(+), 17 deletions(-)
+
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index 817377fde..3589ea2f5 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -1301,7 +1301,7 @@ fn expertsCheck(gpa: Allocator, ctx: *const cuda.Context, o: Options) !u8 {
+     ok = (try flashnext.moe_prompt.checkWith(gpa, ctx, ops, &p, 320, rows.items, true, true)) and ok;
+     ok = (try flashnext.moe_prompt.check(gpa, ctx, ops, &p, 640, rows.items, false)) and ok;
+     p.gu2 = false;
+-        std.debug.print("{s} experts-check: the prompt expert kernel {s} Python's on 16-pair items\n", .{ if (ok) "PASS" else "FAIL", if (ok) "byte-equal to" else "DIFFER from" });
++    std.debug.print("{s} experts-check: the prompt expert kernel {s} Python's on 16-pair items\n", .{ if (ok) "PASS" else "FAIL", if (ok) "byte-equal to" else "DIFFER from" });
+     return if (ok) 0 else 1;
+ }
+ 
+diff --git a/zig/src/families/flashnext_mia/cuda_comm.zig b/zig/src/families/flashnext_mia/cuda_comm.zig
+index 376714663..cff263152 100644
+--- a/zig/src/families/flashnext_mia/cuda_comm.zig
++++ b/zig/src/families/flashnext_mia/cuda_comm.zig
+@@ -11,7 +11,7 @@ const Allocator = std.mem.Allocator;
+ pub const Prefetch = roce.Prefetch;
+ 
+ /// The control-link frame of the RoCE setup: one byte (1: opened) then the rank's connection blob.
+-const roce_tag: link_mod.Tag = @enumFromInt(0x524f4345);
++const roce_tag: link_mod.Tag = @fromBackingInt(@intCast(0x524f4345));
+ 
+ /// The RoCE all-gather, the L2 prefetch and the driver they were opened with (heap: Comm is copied by value).
+ const Extra = struct { driver: cuda.Driver, r: ?roce.Roce = null, l2: ?roce.L2 = null, prefetch: bool = false };
+diff --git a/zig/src/families/flashnext_mia/cuda_engine.zig b/zig/src/families/flashnext_mia/cuda_engine.zig
+index 9a143c1b4..e2d7232d4 100644
+--- a/zig/src/families/flashnext_mia/cuda_engine.zig
++++ b/zig/src/families/flashnext_mia/cuda_engine.zig
+@@ -1130,10 +1130,10 @@ pub const Engine = struct {
+         const v: u8 = if (e.rank == 0) 0xFF else 0x7F;
+         const qrow = g.heads * g.head_dim * 2;
+         const list = [_][2]u64{
+-            .{ b.h, g.wide() * 2 },                   .{ b.streams, g.wide() * 2 },          .{ b.mixed, g.hidden * 2 },
+-            .{ b.gout, g.nv * state.gdn_dv * 2 },     .{ b.gated, qrow },                     .{ b.attn_o, qrow },
+-            .{ b.moe_y, g.slots() * g.hidden * 2 },   .{ b.moe_wts, g.slots() * 4 },          .{ b.moe_act, g.slots() * g.moe_width * 2 },
+-            .{ b.inj_a, g.streams * 2 },              .{ b.inj_m, g.streams * 2 },            .{ b.pss, (g.hidden / 256) * g.streams * 4 },
++            .{ b.h, g.wide() * 2 },                 .{ b.streams, g.wide() * 2 },  .{ b.mixed, g.hidden * 2 },
++            .{ b.gout, g.nv * state.gdn_dv * 2 },   .{ b.gated, qrow },            .{ b.attn_o, qrow },
++            .{ b.moe_y, g.slots() * g.hidden * 2 }, .{ b.moe_wts, g.slots() * 4 }, .{ b.moe_act, g.slots() * g.moe_width * 2 },
++            .{ b.inj_a, g.streams * 2 },            .{ b.inj_m, g.streams * 2 },   .{ b.pss, (g.hidden / 256) * g.streams * 4 },
+         };
+         if (R >= b.rows) return;
+         for (list) |it| {
+diff --git a/zig/src/families/flashnext_mia/cuda_forward.zig b/zig/src/families/flashnext_mia/cuda_forward.zig
+index 7c3d85178..ad15302c3 100644
+--- a/zig/src/families/flashnext_mia/cuda_forward.zig
++++ b/zig/src/families/flashnext_mia/cuda_forward.zig
+@@ -1011,7 +1011,6 @@ pub const Forward = struct {
+         }
+     }
+ 
+-
+     // -- staging ----------------------------------------------------------------------------------------------
+ 
+     /// Grow a sequence's caches to `rows` rows within the budget (old and new fit together); drains the stream first.
+diff --git a/zig/src/families/flashnext_mia/cuda_fp8.zig b/zig/src/families/flashnext_mia/cuda_fp8.zig
+index 5b0884e67..fcde668b5 100644
+--- a/zig/src/families/flashnext_mia/cuda_fp8.zig
++++ b/zig/src/families/flashnext_mia/cuda_fp8.zig
+@@ -442,9 +442,9 @@ pub fn check(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir:
+         const wbytes: f64 = @floatFromInt(npad * kk + npad * (kk / 64) * 4);
+         const flops: f64 = 2.0 * @as(f64, @floatFromInt(max_m * n * kk));
+         std.debug.print("{s} {s}: n {d} k {d} split_k {d}: layouts w8 {s} bs {s}, outputs {d}/{d} equal, rows {s} one-row calls; 1 row {d:.1} us ({d:.0} GB/s weights), {d} rows {d:.0} us ({d:.1} TFLOP/s)\n", .{
+-            if (w8_ok and bs_ok and equal == total and inv_ok) "PASS" else "FAIL", name, n, kk, splitK(n, kk),
+-            if (w8_ok) "equal" else "DIFFER", if (bs_ok) "equal" else "DIFFER", equal, total, if (inv_ok) "equal" else "DIFFER",
+-            us[0], wbytes / us[0] / 1000.0, max_m, us[1], flops / us[1] / 1e6,
++            if (w8_ok and bs_ok and equal == total and inv_ok) "PASS" else "FAIL", name,                             n,     kk,    splitK(n, kk),
++            if (w8_ok) "equal" else "DIFFER",                                      if (bs_ok) "equal" else "DIFFER", equal, total, if (inv_ok) "equal" else "DIFFER",
++            us[0],                                                                 wbytes / us[0] / 1000.0,          max_m, us[1], flops / us[1] / 1e6,
+         });
+     }
+     return ok;
+diff --git a/zig/src/families/flashnext_mia/cuda_moe_prompt.zig b/zig/src/families/flashnext_mia/cuda_moe_prompt.zig
+index ebd3ccb5a..d6cd39305 100644
+--- a/zig/src/families/flashnext_mia/cuda_moe_prompt.zig
++++ b/zig/src/families/flashnext_mia/cuda_moe_prompt.zig
+@@ -94,7 +94,6 @@ pub const Prompt4 = struct {
+         return planTile(o, picks, pairs, experts, q.tile, p);
+     }
+ 
+-
+     fn run(p: *const Prompt4, s: cuda.Stream, f: Fn, x: u64, x_stride: usize, slots: usize, w: u64, scale: u64, kg: usize, nb: usize, pl: kern.Plan, out: u64, n: usize, limit: f32, skip: c_int, max_items: usize) !void {
+         return p.runG(s, f, x, x_stride, slots, w, scale, kg, nb, pl, out, n, limit, skip, max_items, null);
+     }
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index 6de00691c..9f1edb65e 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -344,7 +344,6 @@ fn yarnFor(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize)
+     return yarnOf(gpa, text, context, envs.get(rope.env_factor), envs.get(rope.env_ramp));
+ }
+ 
+-
+ fn yarnOf(gpa: std.mem.Allocator, config_text: []const u8, context: usize, factor_env: ?[]const u8, ramp_env: ?[]const u8) !?rope.Yarn {
+     const doc = try std.json.parseFromSlice(std.json.Value, gpa, config_text, .{});
+     defer doc.deinit();
+diff --git a/zig/src/families/flashnext_mia/cuda_prof.zig b/zig/src/families/flashnext_mia/cuda_prof.zig
+index 8036893c8..e63a8ba15 100644
+--- a/zig/src/families/flashnext_mia/cuda_prof.zig
++++ b/zig/src/families/flashnext_mia/cuda_prof.zig
+@@ -111,7 +111,7 @@ pub const Prof = struct {
+         try p.events[p.n - 1].synchronize();
+         for (1..p.n) |i| {
+             const ms = try cuda.Event.elapsedMs(p.events[i - 1], p.events[i]);
+-            p.sums[@intFromBool(p.in_mtp[i])][@intFromEnum(p.labels[i])] += ms;
++            p.sums[@intFromBool(p.in_mtp[i])][@backingInt(p.labels[i])] += ms;
+             if (p.in_mtp[i]) p.by_level[@min(p.levels[i], max_levels - 1)] += ms;
+         }
+         // keep the last event as the next interval's start
+diff --git a/zig/src/families/flashnext_mia/cuda_torch_ops.zig b/zig/src/families/flashnext_mia/cuda_torch_ops.zig
+index 41f2c60f8..c62486d5b 100644
+--- a/zig/src/families/flashnext_mia/cuda_torch_ops.zig
++++ b/zig/src/families/flashnext_mia/cuda_torch_ops.zig
+@@ -51,7 +51,7 @@ pub const Functions = struct {
+     pub fn resolve(m: []const cuda.Module) !Functions {
+         const i = struct {
+             fn at(e: Images) usize {
+-                return @intFromEnum(e);
++                return @backingInt(e);
+             }
+         }.at;
+         return .{
+diff --git a/zig/src/families/flashnext_mia/cuda_weights.zig b/zig/src/families/flashnext_mia/cuda_weights.zig
+index 2c65da13a..7d327a5e8 100644
+--- a/zig/src/families/flashnext_mia/cuda_weights.zig
++++ b/zig/src/families/flashnext_mia/cuda_weights.zig
+@@ -977,7 +977,7 @@ const Loader = struct {
+             const sc = try L.expect(try std.fmt.bufPrint(&b[1], "{s}.experts.{d}.{s}.scales", .{ name, x, proj }), .f16, &.{ kf / int4.checkpoint_group, nf });
+             const qz = try L.expect(try std.fmt.bufPrint(&b[2], "{s}.experts.{d}.{s}.qzeros", .{ name, x, proj }), .i32, &.{ kf / int4.checkpoint_group, nf / 8 });
+             if (!int4.zerosAreSymmetric(qz.bytes)) {
+-                std.log.err("{s}{s}: zero points other than 8 (AutoGPTQ v1 qzeros 7); the engine reads symmetric GPTQ", .{ L.prefix, b[2][0..std.mem.indexOfScalar(u8, &b[2], 0) orelse 0] });
++                std.log.err("{s}{s}: zero points other than 8 (AutoGPTQ v1 qzeros 7); the engine reads symmetric GPTQ", .{ L.prefix, b[2][0 .. std.mem.indexOfScalar(u8, &b[2], 0) orelse 0] });
+                 return error.UnsupportedQuantization;
+             }
+             const src: int4.Source = .{ .qweight = qw.bytes, .scales = sc.bytes, .n_full = nf, .k_full = kf };
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 5f4b36c59..8fa77b058 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -288,8 +288,8 @@ test "environment: MiaAI-Lab's engine's rows take 0 and her readers' own forms,
+         .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .raw = "10", .n = @bitCast(@as(f64, 10)) },
+     }) |c| try t.expectEqual(@as(?u64, c.n), try e.parse(c.name, c.raw));
+     for ([_][2][]const u8{
+-        .{ "TF_FLASHNEXT_ROCE", "off" },         .{ "TF_FLASHNEXT_DROP_PAGES", "false" },
+-        .{ "TF_FLASHNEXT_YARN", "1x" },          .{ "TF_FLASHNEXT_MTP_Q4", "fc,typo" },
++        .{ "TF_FLASHNEXT_ROCE", "off" },                   .{ "TF_FLASHNEXT_DROP_PAGES", "false" },
++        .{ "TF_FLASHNEXT_YARN", "1x" },                    .{ "TF_FLASHNEXT_MTP_Q4", "fc,typo" },
+         .{ "TF_FLASHNEXT_PROMPT_EXPERTS_ROWS", "4096,x" }, .{ "TF_FLASHNEXT_OVERLAP", "256" },
+     }) |c| try t.expectError(error.InvalidEnvironment, e.parse(c[0], c[1]));
+ }

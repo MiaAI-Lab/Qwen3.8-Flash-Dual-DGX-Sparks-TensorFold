@@ -1,0 +1,401 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 14:43:42 +0700
+Subject: [PATCH 64/79] runner: Flash-Next acts in thinking chats only, inside
+ the think block
+
+The in-model runner is in-thinking only. A runner binding's family may now default the scan spans to
+`reasoning` (PREFIX_SPANS still overrides; `all` keeps every span). Flash-Next's binding does; DeepSeek-V4.1's keeps
+every span, so its default is unchanged. With the spans `reasoning`, server/chat.zig opens no runner session for a
+non-thinking chat (no cells closed or run, no owned value, no runner guide), so its bytes are the runner-off server's.
+Before, a non-thinking reply closed cells speculatively and could own an inline value in the answer (TP2 miabench: 30
+non-thinking replies closed 75 cells, one owned; TP1 thinking-off set: tc-comp-09 owned one).
+
+Tests: through openai.run, a non-thinking chat gets no session, 0 cells and the runner-off server's bytes; a thinking
+chat keeps its session and owns only in the think block. Flash-Next's binding defaults to the think block, and a
+thinking reply's answer triggers nothing.
+
+(cherry picked from commit 1a7ed13bb4fac1cc440efd716655e35570bc134d)
+---
+ zig/build/cuda_server_host.zig                |   2 +-
+ zig/src/core/runner_binding.zig               |  12 +-
+ zig/src/families/flashnext/runner_binding.zig |  28 +++
+ zig/src/server/chat.zig                       |  10 +-
+ zig/src/server/root.zig                       |   1 +
+ zig/src/server/runner_thinking_only_test.zig  | 217 ++++++++++++++++++
+ 6 files changed, 263 insertions(+), 7 deletions(-)
+ create mode 100644 zig/src/server/runner_thinking_only_test.zig
+
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+index 13aa334d4..2a33644f2 100644
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -59,7 +59,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     b.step("test-server-recovery-host", "Incomplete replies, token allocation and bounded SSE storage without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Server recovery:"} })).step);
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+     b.step("test-compute-lane-http-host", "The compute lane through the chat route: a held python call's result forced in (S3 too)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "compute lane:", "compute runner:" } })).step);
+-    b.step("test-runner-server-host", "The in-model runner through the chat route: guide, live records, field anchors").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "runner guide:", "runner commit ask:", "runner projection:", "runner live records:" } })).step);
++    b.step("test-runner-server-host", "The in-model runner through the chat route: guide, live records, field anchors, thinking chats only").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "runner guide:", "runner commit ask:", "runner projection:", "runner live records:", "runner thinking only:" } })).step);
+     b.step("test-request-deadline-host", "deadline_s: the server ends a reply at its deadline with usage and ids").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request deadline:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     @import("request_starts_host.zig").steps(b, native_modules.engines, server_tests);
+diff --git a/zig/src/core/runner_binding.zig b/zig/src/core/runner_binding.zig
+index c21f676bd..78e09f516 100644
+--- a/zig/src/core/runner_binding.zig
++++ b/zig/src/core/runner_binding.zig
+@@ -9,6 +9,7 @@ pub const Family = struct {
+     quiet: []const [2][]const u8 = &.{}, // opener and closer of text no cell is read in: tool calls, tool results
+     never: []const []const u8 = &.{}, // markup an owned result may not spell (it would read as a call or a think end)
+     trust: ?[]const u8 = null, // the compute default's guide, measured on this family; null: none yet, chats get none
++    reasoning_only: bool = false, // with no PREFIX_SPANS: cells only in the think block, and thinking chats only (server/chat.zig)
+ 
+     /// Whether `out` spells any of the family's markup: such a result is the model's to write, never owned.
+     pub fn unsafe(f: Family, out: []const u8) bool {
+@@ -33,20 +34,22 @@ pub const Binding = struct {
+     /// The runner's config under the prefix whose switch the boot set; both switches set is error.BadKnob.
+     pub fn parse(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!?runner.Config {
+         // by the switch alone: TF_RUNNER_CIRCUIT, _CLANG and _LLD also name tools for tests and image checks
+-        const old = b.alias orelse return b.of(try runner.Config.parse(get, b.prefix));
+-        if (!set(get(old))) return b.of(try runner.Config.parse(get, b.prefix));
++        const old = b.alias orelse return b.of(get, b.prefix, try runner.Config.parse(get, b.prefix));
++        if (!set(get(old))) return b.of(get, b.prefix, try runner.Config.parse(get, b.prefix));
+         if (set(get(b.prefix))) {
+             log.warn("turn the in-model runner on with {s} or {s}, not both", .{ b.prefix, old });
+             return error.BadKnob;
+         }
+-        return b.of(try runner.Config.parse(get, old));
++        return b.of(get, old, try runner.Config.parse(get, old));
+     }
+ 
+-    fn of(comptime b: Binding, parsed: ?runner.Config) ?runner.Config {
++    fn of(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8, parsed: ?runner.Config) ?runner.Config {
+         comptime for (b.family.quiet) |s| std.debug.assert(s[0].len > 0 and s[0].len <= quiet_max and s[1].len <= quiet_max);
+         var c = parsed orelse return null;
+         c.family = b.family;
+         c.scan.quiet = b.family.quiet;
++        // the family's own scope unless the boot names one (PREFIX_SPANS=all keeps every span)
++        if (b.family.reasoning_only and !set(get(prefix ++ "_SPANS"))) c.scan.reasoning_only = true;
+         return c;
+     }
+ 
+@@ -107,6 +110,7 @@ test "runner binding: the generic names or the family's alias, never both switch
+     const generic = (try dsv41.parse(&Env.get)).?;
+     try t.expectEqualStrings("/g.tfpc", generic.circuit);
+     try t.expect(generic.scan.inline_math and !generic.scan.fence);
++    try t.expect(!generic.scan.reasoning_only and !old.scan.reasoning_only); // DeepSeek-V4.1 keeps every span by default
+     try t.expectEqualStrings("TF_RUNNER", dsv41.active(&Env.get));
+     const plain: Binding = .{ .family = .{ .quiet = &.{.{ "<a>", "</a>" }}, .never = &.{"</a>"} } };
+     const fam = (try plain.parse(&Env.get)).?;
+diff --git a/zig/src/families/flashnext/runner_binding.zig b/zig/src/families/flashnext/runner_binding.zig
+index 16766ed8e..43ed6264f 100644
+--- a/zig/src/families/flashnext/runner_binding.zig
++++ b/zig/src/families/flashnext/runner_binding.zig
+@@ -11,6 +11,8 @@ pub const binding: api.runner.Binding = .{
+         .never = &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>", "<function=", "</function>", "<parameter=", "</parameter>", "<|im_start|>", "<|im_end|>", "<|endoftext|>" },
+         // TODO(measure): no trust guide is measured on Flash-Next yet; DeepSeek-V4.1's AB3 text is not reused
+         .trust = null,
++        // The runner acts in thinking chats only, inside the think block (in-thinking, tool-full)
++        .reasoning_only = true,
+     },
+ };
+ 
+@@ -30,3 +32,29 @@ test "Flash Next runner: the generic knob names, Qwen's markup quiet and never o
+     try std.testing.expectEqualStrings("</tool_call>", cfg.scan.quiet[0][1]);
+     try std.testing.expect(cfg.family.unsafe("x</think>") and !cfg.family.unsafe("12 + 7 = 19"));
+ }
++
++test "Flash Next runner: the think block only by default, every span when the boot says TF_RUNNER_SPANS=all" {
++    knobs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/c.tfpc" } };
++    try std.testing.expect((try binding.parse(&lookup)).?.scan.reasoning_only);
++    knobs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/c.tfpc" }, .{ "TF_RUNNER_SPANS", "reasoning" } };
++    try std.testing.expect((try binding.parse(&lookup)).?.scan.reasoning_only);
++    knobs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/c.tfpc" }, .{ "TF_RUNNER_SPANS", "all" } };
++    try std.testing.expect(!(try binding.parse(&lookup)).?.scan.reasoning_only);
++}
++
++/// The runner's scanner, reached through the session it opens (Session.scan).
++const Scanner = @FieldType(std.meta.Child(std.meta.Child(@typeInfo(@typeInfo(@TypeOf(api.runner.Runner.session)).@"fn".return_type.?).error_union.payload)), "scan");
++
++test "Flash Next runner: a thinking reply's cells trigger in the think block, never in the answer, by default" {
++    const a = std.testing.allocator;
++    knobs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/c.tfpc" }, .{ "TF_RUNNER_FORMS", "inline" } };
++    var scan: Scanner = .{ .cfg = (try binding.parse(&lookup)).?.scan };
++    defer scan.deinit(a);
++    var triggers: [2]u32 = .{ 0, 0 };
++    for ([_][]const u8{ "So 12 + 7 =", " 19\n", "Answer: 3 + 4 =" }, [_]bool{ true, true, false }) |piece, think| {
++        for (piece) |b| if ((try scan.feed(a, &.{b}, think)).trigger != null) {
++            triggers[@intFromBool(!think)] += 1;
++        };
++    }
++    try std.testing.expectEqual([2]u32{ 1, 0 }, triggers);
++}
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index a544c6b18..7a7204af9 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -110,6 +110,12 @@ test "Server recovery: token staging allocation failure ends the loop without co
+     }
+ }
+ 
++/// Whether a reply gets a runner session (and the runner guide): with the spans `reasoning`, thinking chats only.
++fn runsCells(srv: *Server, thinking: bool) bool {
++    const rn = srv.info.runner orelse return false;
++    return thinking or !rn.cfg.scan.reasoning_only;
++}
++
+ /// Python's ``bool(fields.get(key))`` on the sampling fields.
+ fn flag(f: Value, key: []const u8) ?bool {
+     const v = f.get(key) orelse return null;
+@@ -142,7 +148,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
+     // the runner guide (runner_guide.zig) with the runner on: the request's, or the boot's under the compute default
+     const thinks = input.prompt == null and (flag(input.fields, "enable_thinking") orelse srv.config.enable_thinking);
+     const asked_guide = @import("compute_turns.zig").guideAsked(srv, input.fields, thinks);
+-    const guided = @import("runner_guide.zig").apply(a, if (srv.info.runner != null and input.prompt == null) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
++    const guided = @import("runner_guide.zig").apply(a, if (input.prompt == null and runsCells(srv, thinks)) &srv.guides else null, asked_guide, input.messages) catch |e| switch (e) {
+         error.BadGuide => return cx.refuse(try srv.guides.refusal(a)),
+         error.OutOfMemory => return error.OutOfMemory,
+     };
+@@ -228,7 +234,7 @@ pub fn prepare(srv: *Server, cx: *Cx, given: Input, gone: anytype) Failure!Prepa
+     // the compute lane: a reply offered the built-in tool holds at each EOS for its results (not with stop strings)
+     request.hold_eos = stops_opt.strings.len == 0 and @import("compute_turns.zig").arms(srv, input, &request);
+     // the in-model runner (runner_binding.zig): code cells this reply writes run, their results owned in place
+-    request.run_cells = srv.info.runner != null;
++    request.run_cells = runsCells(srv, thinking);
+     if (request.run_cells and thinking and srv.think_close.len > 0) request.think_end = srv.think_close_end;
+     if (request.run_cells) request.run_trace = @import("runner_guide.zig").traceAsk(f) catch
+         return cx.refuse("runner_trace must be a boolean, runner_trace_format one line of at most 128 bytes with {} once, runner_trace_check a boolean, runner_trace_repeat 0 to 3");
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index fc8786d47..75f40fb8c 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -37,6 +37,7 @@ test {
+     _ = @import("done_times_test.zig");
+     _ = @import("runner_live_test.zig");
+     _ = @import("runner_projection_http_test.zig");
++    _ = @import("runner_thinking_only_test.zig");
+     _ = @import("request_deadline_test.zig");
+     _ = @import("request_deadline_http_test.zig");
+     _ = @import("drain_test.zig");
+diff --git a/zig/src/server/runner_thinking_only_test.zig b/zig/src/server/runner_thinking_only_test.zig
+new file mode 100644
+index 000000000..4fe0ffac1
+--- /dev/null
++++ b/zig/src/server/runner_thinking_only_test.zig
+@@ -0,0 +1,217 @@
++//! The runner with spans `reasoning` through openai.run: a non-thinking chat gets no session, cells or changed bytes.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json");
++const openai = @import("openai.zig");
++const Server = @import("server.zig").Server;
++const Conn = @import("http_conn.zig").Conn;
++const Bytes = @import("runner_projection_http_test.zig").Bytes;
++const model_text = @import("model_text.zig");
++const Allocator = std.mem.Allocator;
++const t = std.testing;
++
++const close_id: u32 = 300;
++const eos_id: u32 = 301;
++
++/// The runner's scanner, reached through the session it opens (Session.scan).
++const Scanner = @FieldType(std.meta.Child(std.meta.Child(@typeInfo(@typeInfo(@TypeOf(api.runner.Runner.session)).@"fn".return_type.?).error_union.payload)), "scan");
++
++/// Gives its tokens in one round; with run_cells it scans them as a lane's session does and owns each trigger's sum.
++const Script = struct {
++    tokens: []const u32,
++    runner: ?*api.runner.Runner = null,
++    run_cells: bool = false,
++    think_end: bool = false,
++    closed: u32 = 0,
++    owned: u32 = 0,
++    fn engine(s: *Script) api.Engine {
++        return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++    fn info(ctx: *anyopaque) api.Info {
++        const s: *Script = @ptrCast(@alignCast(ctx));
++        return .{ .context_window = 8192, .runner = s.runner };
++    }
++    fn submit(ctx: *anyopaque, id: api.Id, r: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const s: *Script = @ptrCast(@alignCast(ctx));
++        s.run_cells = r.run_cells;
++        s.think_end = r.think_end != null;
++        var out: std.ArrayList(u32) = .empty;
++        defer out.deinit(t.allocator);
++        s.play(r, &out) catch return error.MemoryPressure;
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        sink.event(sink.ctx, id, &.{ .tokens = out.items });
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
++    }
++    fn play(s: *Script, r: *const api.Request, out: *std.ArrayList(u32)) Allocator.Error!void {
++        const a = t.allocator;
++        var codes: std.ArrayList([]u8) = .empty;
++        defer {
++            for (codes.items) |c| a.free(c);
++            codes.deinit(a);
++        }
++        var scan: Scanner = .{ .cfg = if (s.runner) |rn| rn.cfg.scan else .{} };
++        defer scan.deinit(a);
++        var think = r.think_end != null;
++        var skip = false;
++        for (s.tokens) |tok| {
++            if (skip and tok != '\n') continue;
++            skip = false;
++            try out.append(a, tok);
++            if (!r.run_cells) continue;
++            if (tok == close_id) {
++                think = false;
++                continue;
++            }
++            if (tok >= 256) continue;
++            const ev = try scan.feed(a, &.{@intCast(tok)}, think);
++            if (ev.closed) |c| {
++                s.closed += 1;
++                try codes.append(a, try a.dupe(u8, c.code));
++            }
++            const w = ev.trigger orelse continue;
++            s.owned += 1;
++            var buf: [24]u8 = undefined;
++            const value = std.fmt.bufPrint(&buf, "{s}{d}", .{ if (w.inline_space orelse false) " " else "", sum(codes.items[w.index]) }) catch unreachable;
++            for (value) |b| try out.append(a, b);
++            skip = true;
++        }
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++/// `a + b` (a cell's code, spaces and all): the value the runner would own.
++fn sum(code: []const u8) i64 {
++    var total: i64 = 0;
++    var it = std.mem.tokenizeAny(u8, code, "+ \n");
++    while (it.next()) |n| total += std.fmt.parseInt(i64, n, 10) catch 0;
++    return total;
++}
++
++/// Bytes' text with a template that has a thinking switch, so a chat may turn thinking off (server.zig's check).
++fn switchable(b: *Bytes) model_text.Text {
++    const S = struct {
++        var vt: @typeInfo(@FieldType(model_text.Text, "vtable")).pointer.child = undefined;
++        fn source(_: *anyopaque) []const u8 {
++            return "{% if enable_thinking %}<think>{% endif %}";
++        }
++    };
++    const base = b.text();
++    S.vt = base.vtable.*;
++    S.vt.template_source = S.source;
++    return .{ .ctx = base.ctx, .vtable = &S.vt };
++}
++
++const Got = struct { reasoning: []const u8, content: []const u8 };
++
++/// One chat through openai.run: `reasoning`, the think close and `content` when `thinking`, else `content` alone.
++fn chat(a: Allocator, s: *Script, thinking: bool, reasoning: []const u8, content: []const u8, stream: bool) !Got {
++    var ids: std.ArrayList(u32) = .empty;
++    if (thinking) {
++        for (reasoning) |b| try ids.append(a, b);
++        try ids.append(a, close_id);
++    }
++    for (content) |b| try ids.append(a, b);
++    try ids.append(a, eos_id);
++    s.tokens = ids.items;
++    var bytes: Bytes = .{};
++    const srv = try Server.init(t.allocator, t.io, s.engine(), switchable(&bytes), .{ .served_name = "m", .model_ids = &.{"m"}, .use_drafts = false }, null);
++    defer srv.deinit();
++    const text = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"max_tokens\":500,\"stream\":{},\"chat_template_kwargs\":{{\"enable_thinking\":{}}}}}", .{ stream, thinking });
++    var conn = Conn{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var reply: Reply = .{ .a = a };
++    openai.run(srv, a, reply.out(), .{ .conn = &conn }, true, (try json.parse(a, text)).ok);
++    if (!stream) {
++        const whole = reply.whole orelse return error.NoReply;
++        const choices = whole.get("choices") orelse {
++            std.debug.print("refused: {s}\n", .{try json.stringify(a, whole, .{})});
++            return error.Refused;
++        };
++        const m = choices.array[0].get("message").?;
++        return .{ .reasoning = json.strOr(m.get("reasoning_content")), .content = json.strOr(m.get("content")) };
++    }
++    var r: std.ArrayList(u8) = .empty;
++    var c: std.ArrayList(u8) = .empty;
++    for (reply.events.items) |v| {
++        const cs = (v.get("choices") orelse continue).array;
++        if (cs.len == 0) continue;
++        const d = cs[0].get("delta") orelse continue;
++        try r.appendSlice(a, json.strOr(d.get("reasoning_content")));
++        try c.appendSlice(a, json.strOr(d.get("content")));
++    }
++    return .{ .reasoning = r.items, .content = c.items };
++}
++
++const Reply = struct {
++    a: Allocator,
++    whole: ?json.Value = null,
++    events: std.ArrayList(json.Value) = .empty,
++    fn out(r: *Reply) openai.Out {
++        return .{ .ctx = r, .vt = &.{ .open = open, .event = event, .reply = replied } };
++    }
++    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
++    fn event(ctx: *anyopaque, value: ?json.Value) error{Closed}!void {
++        const r: *Reply = @ptrCast(@alignCast(ctx));
++        if (value) |v| r.events.append(r.a, v) catch return error.Closed;
++    }
++    fn replied(ctx: *anyopaque, _: u16, value: json.Value) void {
++        const r: *Reply = @ptrCast(@alignCast(ctx));
++        r.whole = value;
++    }
++};
++
++const Env = struct {
++    var pairs: []const [2][]const u8 = &.{};
++    fn get(name: []const u8) ?[]const u8 {
++        for (pairs) |p| if (std.mem.eql(u8, p[0], name)) return p[1];
++        return null;
++    }
++};
++
++/// The Flash-Next profile's runner forms with the spans `reasoning` (its family default: runner_binding.zig).
++fn reasoningRunner() !api.runner.Runner {
++    Env.pairs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/c.tfpc" }, .{ "TF_RUNNER_FORMS", "fence,repl,inline" }, .{ "TF_RUNNER_SPANS", "reasoning" } };
++    return .{ .gpa = t.allocator, .cfg = (try api.runner.Config.parse(&Env.get, "TF_RUNNER")).?, .frontend = undefined, .backend = undefined };
++}
++
++// an inline sum and a fenced cell with its result header, each with the model's own (wrong) value after it
++const answer = "Sum: 12 + 7 = 20\n```python\nprint(12 + 7)\n```\nResult:\n20\nDone.";
++
++test "runner thinking only: a non-thinking chat gets no session, no cells and the runner-off server's bytes" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]bool{ false, true }) |stream| {
++        var off: Script = .{ .tokens = &.{} };
++        const plain = try chat(a, &off, false, "", answer, stream);
++        var rn = try reasoningRunner();
++        var on: Script = .{ .tokens = &.{}, .runner = &rn };
++        const got = try chat(a, &on, false, "", answer, stream);
++        try t.expectEqualStrings(answer, plain.content);
++        try t.expectEqualStrings(plain.content, got.content);
++        try t.expectEqualStrings(plain.reasoning, got.reasoning);
++        try t.expect(!on.run_cells and !on.think_end);
++        try t.expectEqual(@as(u32, 0), on.closed);
++        try t.expectEqual(@as(u32, 0), on.owned);
++    }
++}
++
++test "runner thinking only: a thinking chat keeps its session, owning in the think block and never in the answer" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_]bool{ false, true }) |stream| {
++        var rn = try reasoningRunner();
++        var on: Script = .{ .tokens = &.{}, .runner = &rn };
++        const got = try chat(a, &on, true, "First 12 + 7 = 20\nthen check.", answer, stream);
++        try t.expect(on.run_cells and on.think_end);
++        try t.expectEqualStrings("First 12 + 7 = 19\nthen check.", got.reasoning);
++        try t.expectEqualStrings(answer, got.content);
++        try t.expectEqual(@as(u32, 1), on.owned);
++    }
++}

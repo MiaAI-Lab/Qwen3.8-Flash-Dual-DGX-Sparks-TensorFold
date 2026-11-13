@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:42:16 +0700
+Subject: [PATCH 16/79] flashnext_mia: open through f212's CUDA family contract
+
+TF_FLASHNEXT_ENGINE=mia now opens her family with native/cuda.zig's openWith, as every registry
+family opens, instead of her own host:
+
+- max_segments 1, prompt_rows 2048; Options take segments/slide (ignored), lanes (--parallel),
+  kv8 (--kv-cache fp8, her --kv-dtype fp8), a nullable master and prompt_cache_gib.
+- stream_bytes 0: her engine admits each request's window on its own sequence budget, so the
+  server serves --parallel streams and reserves nothing per stream.
+- The prompt cache is snap_* over Loaded.target (her lanes), lookahead 0; snap_ready leaves the
+  store her budget (a quarter of the sequences' memory, 16 GiB at most, or --prompt-cache-gib;
+  none on rank 1, which follows rank 0's notes).
+- open refuses a null kernel set (f212's own glue): she replays a captured Triton set only;
+  explain words that and her other open refusals.
+- contextCeiling is her YaRN window, placementWeightBytes a rank's share of the files, benchmark
+  her rank count. --vision and --slide are refused by f212's family refusals.
+---
+ .../families/flashnext_mia/cuda_native.zig    | 115 ++++++++----
+ zig/src/native/cuda.zig                       |   3 +-
+ zig/src/native/cuda_flashnext_mia.zig         | 168 ++----------------
+ 3 files changed, 99 insertions(+), 187 deletions(-)
+
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index f20517aef..cea621e9e 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -16,7 +16,6 @@ const comm = @import("cuda_comm.zig");
+ const rope = @import("cuda_rope.zig");
+ const mirror = @import("cuda_mirror.zig");
+ const lane_backend = @import("cuda_lanes.zig");
+-const kvd = @import("cuda_state.zig");
+ 
+ pub const model_type = "qwen4_exp";
+ /// Weight formats as tensorfold.native.contract.weight_format names them: NVIDIA's ModelOpt NVFP4 export (top-10;
+@@ -26,48 +25,92 @@ pub const model_type = "qwen4_exp";
+ pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed-precision", "gptq-b4" };
+ /// The checkpoint's native window; 1,048,576 with YaRN (work/PLAN.md, "1M context").
+ pub const default_context: i64 = 262144;
+-pub const prefill_step: u32 = 2048;
++/// One prompt pass at a time (no staggered segments); her pass runs in her engine's own 2048-row chunks.
++pub const max_segments: u32 = 1;
++pub const prompt_rows: u32 = 2048;
+ 
+-/// `tp` 2: rank 0 serves and leads, rank 1 follows it over the link to `master`:`master_port` (cuda_link.zig).
+-/// `parallel`: streams one shared forward holds (--parallel; the engine's Options.streams, the lanes' max_streams).
+-/// `prompt_cache_gib`: the kept prompt states' budget (null: a quarter of the sequences' memory, 16 GiB at most;
+-/// 0: no prompt reuse). `kv_dtype`: the attention caches' format (--kv-dtype bf16|fp8; both ranks must agree).
+-pub const Options = struct { context: usize, drafts: bool, parallel: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: []const u8 = "", master_port: u16 = 29551, kv_dtype: kvd.KvDtype = .bf16, vision: bool = false };
++/// f212's contract (cuda_options.zig): lanes is --parallel, kv8 --kv-cache fp8 (her --kv-dtype fp8); segments ignored.
++pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, prompt_cache_gib: ?f64 = null, tp: u32 = 1, rank: u32 = 0, master: ?[]const u8 = null, master_port: u16 = 29551, kv8: bool = false };
+ 
+-
+-/// The engine takes image and video rows (Request.media: rotary positions MODE 2, features into the prompt rows).
+-pub const media = true;
+-
+-/// --vision: rank 0's vision helper (tensorfold.vision.native_helper) encodes on this GPU beside the engine; its
+-/// transient workspace is kept out of the sequences' budget (TENSORFOLD_VISION_WORKSPACE_MIB, 4096 by default
+-/// as Python's VISION_WORKSPACE; the tower and the helper's CUDA context are resident before the budget is read).
+-pub fn visionReserve(o: Options) usize {
+-    if (!o.vision or o.rank != 0) return 0;
+-    const mib: usize = if (getenv("TENSORFOLD_VISION_WORKSPACE_MIB")) |v| std.fmt.parseInt(usize, v, 10) catch 4096 else 4096;
+-    return mib << 20;
++/// The prompt cache's copies over `Loaded.target` (her lanes); a kept state depends on its tokens alone: lookahead 0.
++const Served = lane_backend.Lanes(@import("cuda_engine.zig").Engine);
++pub const snap_lookahead: u32 = 0;
++pub const snap_bytes = Served.bytesFn;
++pub const snap_save = Served.saveFn;
++pub const snap_restore = Served.restoreFn;
++pub const snap_drop = Served.dropFn;
++/// The store's budget is hers (cacheBudget at open; none on rank 1): f212's cache past it is set aside.
++pub fn snap_ready(target: *anyopaque, cache: u64) !u64 {
++    const l: *Served = @ptrCast(@alignCast(target));
++    return cache - @min(cache, l.cache_budget);
+ }
+ 
+-/// The prompt cache's rules for this engine (core/prompt_cache.zig Rules): a kept state depends on its tokens
+-/// alone (a resume absorbs the next prompt's own token into the MTP head), prompt chunks are chunk-invariant.
+-pub const cache_rules = .{ .lookahead = 0, .planned = false };
+-
+ /// What the native server drives: the lane backend, the facts its round loop reads, and how to free it.
+ pub const Loaded = struct {
+     backend: lanes.backend.Backend,
+     facts: lanes.Model,
+     rows: u32,
++    /// Her engine admits each request's window on its own budget: the server counts no per-stream bytes.
++    stream_bytes: usize = 0,
++    free_streams: u32 = 0,
+     ctx: *anyopaque,
+     deinit: *const fn (*anyopaque) void,
+     /// rank 1's loop: rank 0's requests in step until it stops
+     follow: ?*const fn (*anyopaque) anyerror!void = null,
+-    /// the prompt cache's family calls and budget (rank 0 or one rank; native/cuda.zig makes the Store)
+-    cache: ?lane_backend.CacheHooks = null,
++    /// her lanes (Served): the prompt cache's snap_* calls take it
++    target: *anyopaque,
+ };
+ 
++/// A load this engine refuses, in words (a request's errors keep their names, as her server gave them).
++pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
++    if (ctx != null) return null;
++    return switch (err) {
++        error.CapturedKernelsNeeded => "TF_FLASHNEXT_ENGINE=mia runs MiaAI-Lab's captured Triton kernel set: set TENSORFOLD_CUDA_KERNELS to its folder (the one with aot.json)",
++        error.UnsupportedTp => "--tp: TF_FLASHNEXT_ENGINE=mia runs on one or two ranks",
++        error.BadMaster => "--master: TF_FLASHNEXT_ENGINE=mia needs rank 0's IP address",
++        error.BadDepth => "TF_FLASHNEXT_DEPTH: drafts a round, 1 to 15",
++        error.RanksDisagree => "the two ranks load with different settings (checkpoint, window, drafts, YaRN, kernels): see either rank's log",
++        else => null,
++    };
++}
++pub const explains_open = true;
++
++/// Her window (modelWindow: YaRN's with TF_FLASHNEXT_YARN or the config's); --rope-yarn is refused before families.
++pub fn contextCeiling(a: std.mem.Allocator, io: std.Io, dir: []const u8, rope_yarn: ?f64) !i64 {
++    _ = rope_yarn;
++    return modelWindow(a, io, dir);
++}
++
++/// A rank's weight bytes: the safetensors files over the ranks (cuda_weights.zig splits all but small norms).
++pub fn placementWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: anytype, rank: anytype, drafts: bool) !u64 {
++    _ = rank;
++    _ = drafts;
++    var total: u64 = 0;
++    var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
++    defer d.close(io);
++    var it = d.iterate();
++    while (try it.next(io)) |entry| {
++        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
++        const st = try d.statFile(io, entry.name, .{});
++        total += st.size;
++    }
++    _ = a;
++    const w: u64 = @max(1, @as(u64, @intCast(world)));
++    return (total + w - 1) / w;
++}
++
++/// The benchmark reports name both ranks at two.
++pub fn benchmark(ptr: *anyopaque) struct { ranks: ?u32, group: ?[]const u8 } {
++    const own: *Owned(@import("cuda_engine.zig")) = @ptrCast(@alignCast(ptr));
++    return .{ .ranks = own.world, .group = null };
++}
++
+ /// How long either rank waits for the other at the link (the other may still be starting its container).
+ const link_timeout_ms: u32 = 10 * 60 * 1000;
+ 
+-pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
++pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
++    // f212 passes null for its own glue kernels: her engine replays only a captured Triton set
++    const kernels = captured orelse return error.CapturedKernelsNeeded;
+     return openOn(@import("cuda_engine.zig"), gpa, io, ctx, dir, kernels, o);
+ }
+ 
+@@ -89,16 +132,16 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+         // a rank stops on SIGTERM / SIGINT while it loads and, rank 1, while it follows (in a container it is PID 1,
+         // where a signal's default action is ignored); rank 0's server takes them over once it serves
+         installStop();
+-        const address = std.Io.net.IpAddress.parse(o.master, o.master_port) catch {
+-            std.log.err("--master {s}: not an IP address", .{o.master});
++        const address = std.Io.net.IpAddress.parse(o.master orelse "", o.master_port) catch {
++            std.log.err("--master {s}: not an IP address", .{o.master orelse ""});
+             return error.BadMaster;
+         };
+         if (o.rank == 0) {
+             own.server = try link.Server.open(address);
+-            std.log.info("rank 0: waiting for rank 1 on {s}:{d}", .{ o.master, o.master_port });
++            std.log.info("rank 0: waiting for rank 1 on {s}:{d}", .{ o.master orelse "", o.master_port });
+             own.link = try own.server.?.accept(@intCast(link_timeout_ms));
+         } else {
+-            std.log.info("rank 1: joining rank 0 at {s}:{d}", .{ o.master, o.master_port });
++            std.log.info("rank 1: joining rank 0 at {s}:{d}", .{ o.master orelse "", o.master_port });
+             own.link = try link.Link.join(io, address, link_timeout_ms);
+         }
+         const text = try settings(gpa, io, dir, kernels, o, depth, yarn);
+@@ -113,7 +156,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+         own.watch = .{ .io = io, .fd = own.link.?.fd, .rank = o.rank, .comm = &own.comm.? };
+         try own.watch.?.start();
+     }
+-    const streams: usize = @max(1, @min(o.parallel, lane_backend.max_streams));
++    const streams: usize = @max(1, @min(o.lanes, lane_backend.max_streams));
+     own.e = try M.Engine.init(gpa, io, ctx, dir, kernels, .{
+         .context = o.context,
+         .depth = depth,
+@@ -123,8 +166,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+         .world = o.tp,
+         .comm = if (own.comm) |*c| c else null,
+         .yarn = yarn,
+-        .vision_reserve = visionReserve(o),
+-        .kv = o.kv_dtype,
++        .kv = if (o.kv8) @import("cuda_state.zig").KvDtype.fp8 else .bf16,
+     });
+     errdefer own.e.deinit();
+     own.lanes = lane_backend.Lanes(M.Engine).init(gpa, own.e, o.drafts, o.context, depth + 1);
+@@ -143,6 +185,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+         defer gpa.free(ids);
+         try own.lanes.measure(io, ids);
+     }
++    own.lanes.cache_budget = if (o.rank == 0) cacheBudget(o, &own.lanes) else 0; // rank 1 follows rank 0's notes
+     var backend = own.lanes.backend();
+     own.lanes.follower = o.tp == 2 and o.rank == 1;
+     if (o.tp == 2) {
+@@ -164,7 +207,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+         .ctx = own,
+         .deinit = Own.release,
+         .follow = if (o.tp == 2 and o.rank == 1) Own.follow else null,
+-        .cache = if (o.rank == 0) own.lanes.cacheHooks(cacheBudget(o, &own.lanes)) else null,
++        .target = &own.lanes,
+     };
+ }
+ 
+@@ -368,7 +411,7 @@ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kern
+     const fill = getenv("TF_FLASHNEXT_FILL") orelse "0";
+     const fill_layers = getenv("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
+     return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} confidence={d}/{d} yarn={s} fill={s}/{s} kv={s} kernels={x}", .{
+-        o.tp, base, snapshot, o.context, o.parallel, o.drafts, depth, @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, @tagName(o.kv_dtype), kernel_set,
++        o.tp, base, snapshot, o.context, o.lanes, o.drafts, depth, @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, if (o.kv8) "fp8" else "bf16", kernel_set,
+     });
+ }
+ 
+@@ -382,7 +425,7 @@ test "open compiles over the engine" {
+     _ = &openOn;
+     const f = openOn;
+     _ = f;
+-    if (false) _ = try open(undefined, undefined, undefined, "", "", .{ .context = 1, .drafts = true });
++    if (false) _ = try open(undefined, undefined, undefined, "", null, .{ .context = 1, .drafts = true });
+ }
+ 
+ test "YaRN comes from the checkpoint, the environment or a window past the native one" {
+@@ -422,7 +465,7 @@ test "the settings text names everything both ranks must share" {
+     try std.testing.expect(std.mem.indexOf(u8, c, "yarn=4x262144") != null);
+     // the KV cache's format is part of what both ranks agree on (their budgets and kernels follow it)
+     try std.testing.expect(std.mem.indexOf(u8, a, "kv=bf16") != null);
+-    const f8 = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 1, .kv_dtype = .fp8 }, 6, null);
++    const f8 = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 1, .kv8 = true }, 6, null);
+     defer gpa.free(f8);
+     try std.testing.expect(!std.mem.eql(u8, a, f8));
+     try std.testing.expect(std.mem.indexOf(u8, f8, "kv=fp8") != null);
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 1c41e2435..b49624635 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -165,7 +165,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
+     // MiaAI-Lab's Flash Next engine also reads qwen4_exp: TF_FLASHNEXT_ENGINE=mia picks it over upstream's flashnext
+-    if (flashnext_mia.wanted(o)) return flashnext_mia.open(a, gpa, io, o, problem);
++    if (flashnext_mia.wanted(o)) return openWith(flashnext_mia.family, a, gpa, io, o, problem);
+     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
+         if (refusals.lfm2(o)) |why| {
+@@ -527,6 +527,7 @@ test {
+     _ = @import("cuda_ledger.zig");
+     _ = kv_pages;
+     _ = drafted;
++    _ = flashnext_mia; // MiaAI-Lab's family against the contract
+     _ = cuda_disk; // its tests run under test-cuda-disk-open-host's filter
+     _ = @import("cuda_disk_identity_test.zig");
+ }
+diff --git a/zig/src/native/cuda_flashnext_mia.zig b/zig/src/native/cuda_flashnext_mia.zig
+index b1483f509..95634b6ea 100644
+--- a/zig/src/native/cuda_flashnext_mia.zig
++++ b/zig/src/native/cuda_flashnext_mia.zig
+@@ -1,161 +1,29 @@
+ //! MiaAI-Lab's Flash Next engine (flashnext_mia) for qwen4_exp checkpoints, opened only with TF_FLASHNEXT_ENGINE=mia.
+ const std = @import("std");
+-const cuda = @import("cuda");
+ const api = @import("engine_api");
+-const lanes = @import("lanes");
+ const mia = @import("flashnext_mia");
+-const lane_backend = @import("cuda_bound.zig");
+-const windows = @import("cuda_window.zig");
+-const setting = @import("cuda_device.zig").setting;
+-const Allocator = std.mem.Allocator;
+-const F = mia.native;
++const refusals = @import("cuda_refusal.zig");
+ 
+-/// The context a lane thread needs current: the lane host steps rounds on its own thread, CUDA binds per thread.
+-threadlocal var bound: ?*const cuda.Context = null;
++/// Her family's namespace, which native/cuda.zig opens with openWith as every registry family (f212's contract).
++pub const family = mia.native;
+ 
+ /// Whether `o` asks for this engine: a qwen4_exp checkpoint with TF_FLASHNEXT_ENGINE=mia (unset: upstream's flashnext).
+ pub fn wanted(o: api.Open) bool {
+-    return std.mem.eql(u8, o.model_type, F.model_type) and mia.selected();
++    return std.mem.eql(u8, o.model_type, family.model_type) and mia.selected();
+ }
+ 
+-/// One loaded model behind the lane host: the family, its lane core and its kept prompt states.
+-const Host = struct {
+-    gpa: Allocator,
+-    driver: cuda.Driver,
+-    ctx: cuda.Context,
+-    family: *anyopaque,
+-    release: *const fn (*anyopaque) void,
+-    follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // rank 1's loop (two ranks)
+-    inner: lanes.backend.Backend,
+-    vtable: lanes.backend.Backend.VTable,
+-    cfg: lanes.Config,
+-    clock: lanes.backend.WallClock,
+-    core: lanes.Engine,
+-    host: api.LaneHost,
+-    store: ?api.prompt_cache.Store = null, // kept prompt states when the family's Loaded.cache has a budget
+-    store_vt: api.prompt_cache.Snapshots.VTable = undefined,
+-
+-    fn close(p: *anyopaque) void {
+-        const h: *Host = @ptrCast(@alignCast(p));
+-        h.host.stop();
+-        h.core.deinit();
+-        h.cfg.deinit(h.gpa);
+-        h.ctx.makeCurrent() catch {};
+-        if (h.store) |*st| st.deinit(); // its states go back to the family before the family goes
+-        h.release(h.family);
+-        h.ctx.deinit();
+-        h.driver.close();
+-        h.gpa.destroy(h);
+-    }
+-
+-    fn halt(p: *anyopaque, reason: []const u8) void {
+-        const h: *Host = @ptrCast(@alignCast(p));
+-        h.host.halt(reason);
+-    }
+-
+-    fn follow(p: *anyopaque) anyerror!void {
+-        const h: *Host = @ptrCast(@alignCast(p));
+-        try h.ctx.makeCurrent();
+-        return h.follow_fn.?(h.family);
+-    }
+-
+-    pub fn bind(p: *anyopaque) *Host {
+-        const h: *Host = @ptrCast(@alignCast(p));
+-        if (bound != &h.ctx) {
+-            h.ctx.makeCurrent() catch |e| std.log.err("cuCtxSetCurrent on the lane thread: {s}", .{@errorName(e)});
+-            bound = &h.ctx;
+-        }
+-        return h;
+-    }
+-
+-    /// The family's backend, each entry it gives called with the context current (cuda_bound.zig).
+-    fn backend(h: *Host) lanes.backend.Backend {
+-        h.vtable = lane_backend.vtable(Host, h.inner.vtable.*);
+-        return .{ .ptr = h, .round_observer = h.inner.round_observer, .vtable = &h.vtable, .first_before_draft = h.inner.first_before_draft, .penalties = h.inner.penalties, .chunk_invariant = h.inner.chunk_invariant };
+-    }
+-};
+-
+-/// Frees a host whose family never opened or is already released: its context, driver and memory.
+-fn discard(h: *Host) void {
+-    bound = null;
+-    h.ctx.deinit();
+-    h.driver.close();
+-    h.gpa.destroy(h);
+-}
+-
+-/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary.
+-fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
+-    if (std.c.getenv("TENSORFOLD_CUDA_KERNELS")) |dir| return a.dupe(u8, std.mem.span(dir));
+-    const exe = try std.process.executableDirPathAlloc(io, a);
+-    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
+-}
+-
+-/// The engine for `o.dir` on this family, or null with `problem` set.
+-pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+-    // a window past config.json's with YaRN: the family's modelWindow says how far
+-    const native = F.modelWindow(a, io, o.dir);
+-    const window = windows.contextWindow(o.context, native, F.default_context) catch {
+-        problem.* = try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ o.context orelse 0, native });
+-        return null;
+-    };
+-    if (o.vision != null) {
+-        problem.* = "--vision: TF_FLASHNEXT_ENGINE=mia serves text only; unset it to serve images with upstream's engine";
+-        return null;
+-    }
+-    if (o.tp != 1 and o.tp != 2) {
+-        problem.* = try std.fmt.allocPrint(a, "--tp {d}: TF_FLASHNEXT_ENGINE=mia runs on one or two ranks", .{o.tp});
+-        return null;
+-    }
+-    const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
+-    const h = try gpa.create(Host);
+-    h.gpa = gpa;
+-    h.driver = cuda.Driver.open() catch |e| {
+-        problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
+-        gpa.destroy(h); // a null return runs no errdefer
+-        return null;
+-    };
+-    h.ctx = cuda.Context.init(&h.driver, @intCast(device)) catch |e| {
+-        h.driver.close();
+-        gpa.destroy(h);
+-        return e;
+-    };
+-    bound = &h.ctx;
+-    errdefer discard(h);
+-    const kernels = try kernelDir(a, io, try h.ctx.capability());
+-    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts };
+-    fo.kv_dtype = if (o.kv8) .fp8 else .bf16; // --kv-cache fp8 (her --kv-dtype fp8)
+-    fo.parallel = o.lanes; // --parallel: streams one shared forward holds
+-    fo.prompt_cache_gib = o.prompt_cache_gib;
+-    fo.tp = o.tp;
+-    fo.rank = o.rank;
+-    fo.master = o.master;
+-    fo.master_port = o.master_port;
+-    const loaded = F.open(gpa, io, &h.ctx, o.dir, kernels, fo) catch |e| {
+-        problem.* = try std.fmt.allocPrint(a, "TF_FLASHNEXT_ENGINE=mia cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
+-        discard(h); // a null return runs no errdefer
+-        return null;
+-    };
+-    errdefer loaded.deinit(loaded.ctx);
+-    h.family = loaded.ctx;
+-    h.release = loaded.deinit;
+-    h.follow_fn = loaded.follow;
+-    h.inner = loaded.backend;
+-    h.store = null;
+-    h.cfg = try lanes.Config.init(gpa, loaded.facts, loaded.rows, loaded.rows - 1);
+-    errdefer h.cfg.deinit(gpa);
+-    h.clock = .{ .io = io };
+-    h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
+-    errdefer h.core.deinit();
+-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step });
+-    if (loaded.cache) |c| if (c.budget > 0) {
+-        // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
+-        h.store_vt = .{ .bytes = c.bytes, .save = c.save, .restore = c.restore, .drop = c.drop };
+-        const rules: api.prompt_cache.Rules = .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned };
+-        h.store = api.prompt_cache.Store.init(gpa, .{ .ptr = c.ptr, .vtable = &h.store_vt }, rules, c.budget);
+-        h.host.cache = &h.store.?;
+-    };
+-    errdefer if (h.store) |*st| st.deinit();
+-    try h.host.start();
+-    const follower: ?*const fn (*anyopaque) anyerror!void = if (h.follow_fn != null) Host.follow else null;
+-    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .halt = Host.halt, .follow = follower };
++test "flashnext_mia family: two ranks and fp8 caches through the options, no --vision or --slide" {
++    const F = family;
++    try std.testing.expect(refusals.family(F, .{ .dir = "d", .model_type = F.model_type, .tp = 2, .rank = 1, .master = "192.0.2.1", .kv8 = true }) == null);
++    try std.testing.expect(!@hasField(F.Options, "vision")); // refusals.family refuses --vision for it
++    try std.testing.expect(!@hasDecl(F, "slide") and F.max_segments == 1);
++    try std.testing.expect(F.explain(null, error.CapturedKernelsNeeded) != null);
++    var opts: F.Options = .{ .context = 1 << 20, .drafts = true };
++    var why: []const u8 = "";
++    const o: api.Open = .{ .dir = "d", .model_type = F.model_type, .lanes = 16, .tp = 2, .rank = 1, .master = "192.0.2.1", .master_port = 29551, .kv8 = true, .prompt_cache_gib = 4 };
++    try std.testing.expect(@import("cuda_options.zig").set(F, o, &opts, &why));
++    try std.testing.expectEqual(@as(u32, 16), opts.lanes);
++    try std.testing.expect(opts.kv8 and opts.tp == 2 and opts.rank == 1 and opts.master_port == 29551);
++    try std.testing.expectEqualStrings("192.0.2.1", opts.master.?);
++    try std.testing.expectEqual(@as(?f64, 4), opts.prompt_cache_gib);
+ }

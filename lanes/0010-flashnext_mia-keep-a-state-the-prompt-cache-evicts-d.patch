@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:34:06 +0200
+Subject: [PATCH 10/79] flashnext_mia: keep a state the prompt cache evicts
+ during its own pass until the pass ends
+
+A state the prompt cache evicts during the pass that kept it is no longer freed under the pass's own note
+(MiaAI-Lab issue #9: a segfault in endPass under a full prompt cache, and a state rank 1 kept that rank 0 had
+freed). The fix and its regression test are by Drake Lu (xinlu8439), who reported and diagnosed it;
+jeff-defuser confirmed it on a second setup.
+
+Source: patches/0010-prompt-cache-evict-in-pass.patch @ MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold dc05c912342e
+Port: applied as is to zig/src/families/flashnext_mia/cuda_lanes.zig (her zig/src/families/flashnext/cuda_lanes.zig).
+---
+ zig/src/families/flashnext_mia/cuda_lanes.zig | 85 +++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes.zig b/zig/src/families/flashnext_mia/cuda_lanes.zig
+index 4f9761b0a..94197a227 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes.zig
+@@ -684,6 +684,15 @@ pub fn Lanes(comptime E: type) type {
+         fn dropFn(ptr: *anyopaque, saved: *anyopaque) void {
+             const self = of(ptr);
+             const k = self.keptOf(saved) orelse return;
++            // Store.keep evicts to fit the pass's next mark, and once older states are gone it takes one this same
++            // pass kept: the pass's tentative entry still points at it and rank 1 has not adopted its copy yet.
++            // Freeing it here left endPass reading a freed Kept (and its stale key adopted on rank 1, never
++            // dropped). It goes back to unadopted: endPass leaves it out of the note and frees it, as rank 1 does.
++            for (self.tentative.items) |*t| if (t.kept == k and t.adopted) {
++                t.adopted = false;
++                if (std.mem.indexOfScalar(*Kept, self.kept.items, k)) |i| _ = self.kept.swapRemove(i);
++                return;
++            };
+             if (self.notes) |n| {
+                 var buf: [9]u8 = undefined;
+                 buf[0] = @backingInt(Note.drop);
+@@ -1858,3 +1867,79 @@ test "prompts filling in slices between rounds equal serial decoding, the prompt
+     try std.testing.expectEqual(@as(usize, 0), t.fills);
+     try std.testing.expectEqual(@as(usize, 0), t.seqs - 2); // the two keepers stay with their states
+ }
++
++test "a state the store evicts during the pass that kept it is left out of rank 1's note and freed on both ranks" {
++    const gpa = std.testing.allocator;
++    const Sink = struct {
++        notes: std.ArrayList(u8) = .empty,
++        lens: std.ArrayList(usize) = .empty,
++        fn send(ptr: *anyopaque, bytes: []const u8) void {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.lens.append(std.testing.allocator, bytes.len) catch unreachable;
++            self.notes.appendSlice(std.testing.allocator, bytes) catch unreachable;
++        }
++    };
++    // Store.keep with room for one state: once older states are gone it evicts the pass's own earlier mark
++    // before it saves the next one (four 175K-token marks past a ~4.4 GiB budget in production)
++    const KeepOne = struct {
++        hooks: CacheHooks,
++        saved: std.ArrayList(*anyopaque) = .empty,
++        fn hook(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
++            const k: *@This() = @ptrCast(@alignCast(ptr));
++            if (k.saved.items.len > 0) k.hooks.drop(k.hooks.ptr, k.saved.orderedRemove(0));
++            const got = k.hooks.save(k.hooks.ptr, s, at) catch return;
++            k.saved.append(std.testing.allocator, got) catch {};
++        }
++    };
++    var sink: Sink = .{};
++    defer sink.notes.deinit(gpa);
++    defer sink.lens.deinit(gpa);
++    var t0: Toy = .{ .gpa = gpa };
++    var t1: Toy = .{ .gpa = gpa };
++    var r0 = Lanes(Toy).init(gpa, &t0, true, 4096, max_rows);
++    defer r0.deinit();
++    var r1 = Lanes(Toy).init(gpa, &t1, true, 4096, max_rows);
++    defer r1.deinit();
++    r0.notes = .{ .ptr = &sink, .send = Sink.send };
++    r1.follower = true;
++    var store: KeepOne = .{ .hooks = r0.cacheHooks(1 << 20) };
++    defer store.saved.deinit(gpa);
++    var long: [300]u32 = undefined;
++    for (&long, 0..) |*x, i| x.* = @intCast((i * 5 + 1) % 37);
++    var a0 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &long, .max_new = 4 });
++    defer a0.deinit(gpa);
++    var a1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &long, .max_new = 4 });
++    defer a1.deinit(gpa);
++    // 100 gets a keeper in the pass; 250 is the late one, kept at the next call
++    a0.reuse = .{ .marks = &.{ 100, 250 }, .hook = .{ .ptr = &store, .at = KeepOne.hook } };
++    a1.reuse = .{ .marks = &.{ 100, 250 } };
++    try r0.backend().prefill(&a0);
++    try r1.backend().prefill(&a1);
++    // one note, the pass's, naming only the surviving state: no drop note for a state rank 1 never adopted
++    try std.testing.expectEqual(@as(usize, 1), sink.lens.items.len);
++    try std.testing.expectEqual(@as(usize, 5 + 12), sink.lens.items[0]);
++    try std.testing.expectEqual(@as(usize, 1), r0.kept.items.len);
++    try std.testing.expectEqual(@as(u32, 250), r0.kept.items[0].at);
++    try std.testing.expectEqual(@as(usize, 0), r0.tentative.items.len);
++    try r1.applyNote(sink.notes.items[0..sink.lens.items[0]]);
++    // both ranks hold the same state, the same bytes and the same engine objects
++    try std.testing.expectEqual(@as(usize, 1), r1.kept.items.len);
++    try std.testing.expect(r1.savedFor(r0.kept.items[0].key) != null);
++    try std.testing.expectEqual(r0.kept_bytes, r1.kept_bytes);
++    try std.testing.expectEqual(t0.snaps, t1.snaps);
++    try std.testing.expectEqual(t0.seqs, t1.seqs);
++    r0.backend().release(&a0);
++    r1.backend().release(&a1);
++    // the store drops the survivor later: the drop note frees rank 1's copy and nothing is left on either rank
++    r0.cacheHooks(0).drop(&r0, store.saved.items[0]);
++    try std.testing.expectEqual(@as(usize, 2), sink.lens.items.len);
++    try r1.applyNote(sink.notes.items[sink.lens.items[0]..][0..sink.lens.items[1]]);
++    for ([_]*Lanes(Toy){ &r0, &r1 }) |r| {
++        try std.testing.expectEqual(@as(usize, 0), r.kept.items.len);
++        try std.testing.expectEqual(@as(u64, 0), r.kept_bytes);
++    }
++    for ([_]*Toy{ &t0, &t1 }) |t| {
++        try std.testing.expectEqual(@as(usize, 0), t.snaps);
++        try std.testing.expectEqual(@as(usize, 0), t.seqs);
++    }
++}

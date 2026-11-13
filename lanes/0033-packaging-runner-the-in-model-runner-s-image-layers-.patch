@@ -1,0 +1,782 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:06:13 +0700
+Subject: [PATCH 33/79] packaging/runner: the in-model runner's image layers
+ and its pinned assets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The runner image for this build, not built yet.
+
+- Dockerfile, build.sh, check-image.sh: the circuit frontend layer over a serving image (clang-18, lld-18 and
+  tf-runner-frontend-check, checked at every boot), ported from the DeepSeek-V4.1 release line. check-image.sh
+  switches the runner with the generic TF_RUNNER; the README names the generic knobs.
+- assets.release: the archive the runner's circuit and graph bank come from, DeepSeek-V4.1's runner-assets-20261107
+  release asset (sha256 b5c40d32…), used where it is rather than re-hosted.
+- assets.sha256: exactly the files the layer takes (calc.tfpc and the graph-v7-powmod bank), each at its sha256.
+- assets.py: `fetch` downloads the archive, checks its sha256, unpacks plain files only and checks every file
+  against the manifest; `check` compares a local directory with it. RUNNER_ASSETS_URL names a mirror.
+- assets.Dockerfile, build-assets.sh: the assets over a frontend image; the build fails unless the circuit route
+  computes the engine's probe cells.
+- test_assets.py: the fetch and the check offline, and the pins.
+
+Ported from the dsv41 release line (s86 7b79ef92d, and the DeepSeek-V4.1 recipe's runner asset scripts).
+---
+ packaging/runner/Dockerfile        |  11 ++
+ packaging/runner/README.md         |  38 ++++++
+ packaging/runner/assets.Dockerfile |  10 ++
+ packaging/runner/assets.py         | 156 +++++++++++++++++++++++
+ packaging/runner/assets.release    |   4 +
+ packaging/runner/assets.sha256     | 198 +++++++++++++++++++++++++++++
+ packaging/runner/build-assets.sh   |  20 +++
+ packaging/runner/build.sh          |  45 +++++++
+ packaging/runner/check-image.sh    |  25 ++++
+ packaging/runner/test_assets.py    | 168 ++++++++++++++++++++++++
+ 10 files changed, 675 insertions(+)
+ create mode 100644 packaging/runner/Dockerfile
+ create mode 100644 packaging/runner/README.md
+ create mode 100644 packaging/runner/assets.Dockerfile
+ create mode 100755 packaging/runner/assets.py
+ create mode 100644 packaging/runner/assets.release
+ create mode 100644 packaging/runner/assets.sha256
+ create mode 100755 packaging/runner/build-assets.sh
+ create mode 100755 packaging/runner/build.sh
+ create mode 100755 packaging/runner/check-image.sh
+ create mode 100644 packaging/runner/test_assets.py
+
+diff --git a/packaging/runner/Dockerfile b/packaging/runner/Dockerfile
+new file mode 100644
+index 000000000..931d4e043
+--- /dev/null
++++ b/packaging/runner/Dockerfile
+@@ -0,0 +1,11 @@
++ARG BASE_IMAGE
++FROM ${BASE_IMAGE}
++ARG RUNNER_BUILD_ID=runner-frontend
++LABEL org.tensorfold.runner.frontend.build=${RUNNER_BUILD_ID}
++RUN nice -n 19 sh -ec 'apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang-18 lld-18; ln -sf clang-18 /usr/bin/clang; ln -sf ld.lld-18 /usr/bin/ld.lld; apt-get clean; find /var/lib/apt/lists -type f -delete'
++COPY tf-runner-frontend-check /opt/tensorfold/bin/tf-runner-frontend-check
++COPY runner-entrypoint /opt/tensorfold/bin/runner-entrypoint
++RUN nice -n 19 /opt/tensorfold/bin/tf-runner-frontend-check --require
++ARG FRONTEND_TREE
++LABEL org.tensorfold.runner.frontend.tree=${FRONTEND_TREE}
++ENTRYPOINT ["/opt/tensorfold/bin/runner-entrypoint"]
+diff --git a/packaging/runner/README.md b/packaging/runner/README.md
+new file mode 100644
+index 000000000..80387893b
+--- /dev/null
++++ b/packaging/runner/README.md
+@@ -0,0 +1,38 @@
++# In-model runner image layers
++
++Two layers over a serving image: the circuit frontend (`build.sh`) and the runner's assets (`build-assets.sh`).
++
++## Circuit frontend
++
++Build `zig build runner-frontend-check` with the repository's pinned Zig. Then run:
++
++```sh
++packaging/runner/build.sh BASE_IMAGE TAG zig-out/bin/tf-runner-frontend-check
++packaging/runner/check-image.sh TAG
++```
++
++Use a derived serving base that already contains the engine and its lane Python layer. The layer adds Ubuntu 24.04's clang-18 and lld-18, with `/usr/bin/clang` and `/usr/bin/ld.lld` aliases. No cross libc, RISC-V emulator or Python dependency is added for compilation. Host Python is used only to prepare the build context and report image sizes. The builder preserves the base image's entrypoint arguments and CMD; it does not replace engine binaries. Source provenance can be set with `TF_RUNNER_FRONTEND_TREE`; `TF_RUNNER_BUILD_ID` labels task-owned build containers for the shared-node pause guard.
++
++At every container boot, `tf-runner-frontend-check` compiles a tiny freestanding C program through the production frontend and validates its RV32IM+Zba ELF. It never runs that ELF on the host. The Docker build runs the same check with `--require` so an image without a functioning RISC-V toolchain is rejected.
++
++An image that ships a circuit also proves the route the compiled programs take. `tf-runner-frontend-check --require --circuit PATH` compiles the cells in `zig/src/core/runner_probe.zig` (Python loops with `*`, `//` and `%`, and a C string read from ROM bytes) and runs them on that circuit; any output but the expected one, or a run past 100,000 steps, exits 1. `check-image.sh` runs it on `/opt/tensorfold/share/runner/calc.tfpc` when the image has one, and a serving image's Dockerfile should run it as a `RUN` step after copying its circuit. The engine runs the same probe when it opens the runner (`TF_RUNNER=1`) and refuses to start on a wrong output (about a second at boot).
++
++At runtime, a missing or broken compiler/linker reports unavailable and allows ordinary boot when `TF_RUNNER` (or a family's alias, such as DeepSeek-V4.1's `TF_DSV41_RUNNER`) is unset, empty, 0, false, off or no. Any other runner value requires a successful check and fails boot otherwise. `TF_RUNNER_CLANG` and `TF_RUNNER_LLD` override compiler/linker paths for deployment and diagnostics. The production frontend also independently abstains if compilation is unavailable; boot does not turn a missing optional dependency into model output.
++
++Runner threads (each cell's translation, which also starts clang and ld.lld, and each circuit run) leave the engine thread's CPU pin when they start. `TF_RUNNER_CPUS` sets where they run: `auto` (default) takes the container's cpuset, removes the CPUs the engine pins (the TP plan link's, `TF_TP_PLAN_PIN`, and the RoCE proxy's, `TF_TP_ROCE_CPU`) and, when core sizes differ (smallest capacity under 80% of the largest), keeps the small cores; on a GB10 rank with the plan link on CPU 19 that is 0-4,10-14. `inherit` keeps the previous behaviour (the engine thread's CPU); a list such as `0-4,10-14` is used as given. `TF_RUNNER_NICE` (default 10, 0-19) is the least niceness they run at; a higher inherited niceness is kept. The engine logs the resolved set at the first run (`in-model runner threads: CPUs ...`), and the threads are named `tf-runner`. `zig build test-runner-host` checks the placement; `zig build bench-runner-place` measures an engine host-loop stand-in beside the runner at full load (`runner-place-bench ENGINE_CPU SECONDS WORKERS ROUNDS`, `TF_RUNNER_CIRCUIT` for a real circuit).
++
++Exact decimal/fraction arithmetic is separately gated by `TF_RUNNER_EXACT` (default off), through the engine's frontend context. Default Python output remains CPython-identical: unsupported floating, decimal and rational output abstains. Installing the toolchain does not enable either runner knob.
++
++Build on a CPU node at nice 19. On shared nodes, stop the build session and pause its labelled Docker build containers while QUIET exists; stopping only the Docker client does not stop daemon-owned build work. No GPU access is needed. `check-image.sh` uses the runc runtime, no network and no GPU mounts, and checks normal/required boot, missing clang/LLD, successful compiler without ELF, and argument preservation. It never launches the engine.
++
++The builder emits a JSON receipt with tag, immutable image/base IDs, sizes and size delta reported by `docker image inspect .Size`. Docker storage backends may report additional unpacked disk usage in `docker image ls`; record that separately when budgeting local storage. The base engine revision label is inherited; the frontend source tree is recorded separately.
++
++## Assets
++
++```sh
++packaging/runner/build-assets.sh RUNNER_IMAGE TAG [ASSETS_DIR]
++```
++
++`RUNNER_IMAGE` is an image `build.sh` built. The layer adds the runner circuit at `/opt/tensorfold/share/runner/calc.tfpc` and the graph bank at `/opt/tensorfold/share/runner/graph-v7-powmod/bank/` (its MIT notice also under `/opt/tensorfold/licenses/runtime-deps/`); point `TF_RUNNER_CIRCUIT` and `TF_RUNNER_GRAPH_BANK` (`.../bank/bank.json`) at them. The build runs the circuit-route probe and fails on a wrong output.
++
++`assets.sha256` pins exactly the files the layer takes, each at its sha256: the circuit and the graph-v7-powmod bank DeepSeek-V4.1's AB3 image served. `assets.release` names the archive they come from, DeepSeek-V4.1's `runner-assets-20261107` release (one deterministic tar.gz at its sha256); it is used where it is, not re-hosted. Without `ASSETS_DIR`, `assets.py fetch` downloads that archive, checks its sha256, unpacks only plain files and directories and checks every file against `assets.sha256`. With `ASSETS_DIR`, `assets.py check` compares the directory with `assets.sha256` before the build. `RUNNER_ASSETS_URL` names a mirror; it must serve the same bytes. `pytest packaging/runner` checks the fetch and the check offline.
+diff --git a/packaging/runner/assets.Dockerfile b/packaging/runner/assets.Dockerfile
+new file mode 100644
+index 000000000..e660cd003
+--- /dev/null
++++ b/packaging/runner/assets.Dockerfile
+@@ -0,0 +1,10 @@
++# The runner's assets over an image build.sh layered (the circuit frontend: clang-18 / lld-18 and
++# tf-runner-frontend-check), supplied by build-assets.sh: the runner circuit and the graph bank assets.sha256 pins.
++# It adds no engine binary, and the build fails unless the image's circuit route computes the engine's probe cells.
++ARG BASE_IMAGE
++FROM ${BASE_IMAGE}
++COPY runner/calc.tfpc /opt/tensorfold/share/runner/calc.tfpc
++COPY runner/graph-v7-powmod/bank/ /opt/tensorfold/share/runner/graph-v7-powmod/bank/
++COPY runner/graph-v7-powmod/bank/Qwenputer-MIT.txt /opt/tensorfold/licenses/runtime-deps/Qwenputer-MIT.txt
++RUN nice -n 19 /opt/tensorfold/bin/tf-runner-frontend-check --require --circuit /opt/tensorfold/share/runner/calc.tfpc
++LABEL org.tensorfold.runner.circuit="calc.tfpc" org.tensorfold.runner.graph="graph-v7-powmod"
+diff --git a/packaging/runner/assets.py b/packaging/runner/assets.py
+new file mode 100755
+index 000000000..e1ad52489
+--- /dev/null
++++ b/packaging/runner/assets.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""The in-model runner's assets: `check DIR` compares a directory with assets.sha256 (exactly the listed files, each at
++its sha256); `fetch DIR` downloads the archive assets.release names into an empty DIR, checks its sha256, unpacks it and
++checks every file. Any failure names the file and the URL."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import os
++from pathlib import Path, PurePosixPath
++import sys
++import tarfile
++import time
++import urllib.error
++import urllib.request
++
++HERE = Path(__file__).resolve().parent
++RELEASE = HERE / 'assets.release'
++MANIFEST = HERE / 'assets.sha256'
++
++
++class AssetError(Exception):
++    pass
++
++
++def release(path=RELEASE):
++    """The archive's `url` and `sha256` (one `key value` per line; # comments)."""
++    fields = {}
++    for line in path.read_text().splitlines():
++        if line.strip() and not line.startswith('#'):
++            key, _, value = line.partition(' ')
++            fields[key] = value.strip()
++    url, digest = fields.get('url', ''), fields.get('sha256', '')
++    if not url.startswith('https://') or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
++        raise AssetError(f'{path.name} must hold an https url and a 64-digit sha256')
++    return url, digest
++
++
++def listed(manifest=MANIFEST):
++    pins = {}
++    for line in manifest.read_text().splitlines():
++        if not line or line.startswith('#'):
++            continue
++        digest, _, name = line.partition('  ')
++        if len(digest) != 64 or not name or name in pins or name.startswith('/') or '..' in PurePosixPath(name).parts:
++            raise ValueError(f'bad manifest line: {line}')
++        pins[name] = digest
++    return pins
++
++
++def sha256(path):
++    with path.open('rb') as stream:
++        return hashlib.file_digest(stream, 'sha256').hexdigest()
++
++
++def found(root):
++    files = {}
++    for path in sorted(root.rglob('*')):
++        if path.is_symlink() or not (path.is_file() or path.is_dir()):
++            raise ValueError(f'not a regular file: {path.relative_to(root)}')
++        if path.is_file():
++            files[path.relative_to(root).as_posix()] = sha256(path)
++    return files
++
++
++def check(root, manifest=MANIFEST):
++    pins, files = listed(manifest), found(root)
++    problems = [f'missing {n}' for n in sorted(pins.keys() - files.keys())]
++    problems += [f'unlisted {n}' for n in sorted(files.keys() - pins.keys())]
++    problems += [f'sha256 differs {n}' for n in sorted(pins.keys() & files.keys()) if pins[n] != files[n]]
++    return problems
++
++
++def download(url, dest, attempts=3, timeout=120):
++    last = None
++    for attempt in range(attempts):
++        try:
++            with urllib.request.urlopen(url, timeout=timeout) as response, dest.open('wb') as out:
++                while chunk := response.read(1 << 20):
++                    out.write(chunk)
++            return
++        except (urllib.error.URLError, OSError) as error:
++            last = error
++            time.sleep(2 * (attempt + 1))
++    raise AssetError(f'cannot download {PurePosixPath(url).name} from {url}: {last}')
++
++
++def keep_dir_mode(member, path):
++    """tarfile's 'data' filter, keeping the archive's directory modes: it leaves them to the umask, and the image layer
++    would then differ between builders."""
++    kept = tarfile.data_filter(member, path)
++    return kept.replace(mode=member.mode & 0o755, deep=False) if member.isdir() else kept
++
++
++def unpack(archive, dest, url):
++    """Only plain files and directories under relative names; anything else stops before a byte is written there."""
++    try:
++        with tarfile.open(archive, 'r:gz') as tar:
++            members = tar.getmembers()
++            for m in members:
++                if not (m.isfile() or m.isdir()) or m.name.startswith('/') or '..' in PurePosixPath(m.name).parts:
++                    raise AssetError(f'{archive.name} from {url} holds an unsafe entry: {m.name}')
++            tar.extractall(dest, members=members, filter=keep_dir_mode)
++    except tarfile.TarError as error:
++        raise AssetError(f'cannot unpack {archive.name} from {url}: {error}') from error
++
++
++def fetch(dest, release_path=RELEASE, manifest=MANIFEST, archive=None):
++    url, digest = release(release_path)
++    url = os.environ.get('RUNNER_ASSETS_URL') or url  # a mirror must serve the same bytes (same sha256)
++    dest.mkdir(parents=True, exist_ok=True)
++    if any(dest.iterdir()):
++        raise AssetError(f'{dest} must be empty')
++    name = PurePosixPath(url).name
++    local = Path(archive) if archive else dest.parent / f'.{dest.name}-{name}'
++    try:
++        if not archive:
++            print(f'runner assets: downloading {name} from {url}')
++            download(url, local)
++        got = sha256(local)
++        if got != digest:
++            raise AssetError(f'sha256 mismatch for {name} from {url}: expected {digest}, got {got}')
++        unpack(local, dest, url)
++    finally:
++        if not archive and local.exists():
++            local.unlink()
++    problems = check(dest, manifest)
++    if problems:
++        raise AssetError('; '.join(problems) + f' (in {name} from {url}; expected by {manifest.name})')
++    print(f'runner assets: {name} sha256 {digest} ok, {len(listed(manifest))} files match {manifest.name}')
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('action', choices=('check', 'fetch'))
++    parser.add_argument('dest', type=Path, help='check: the asset directory; fetch: an empty or new directory')
++    parser.add_argument('--archive', help='fetch: an already downloaded archive (offline); still sha256-checked')
++    args = parser.parse_args(argv)
++    try:
++        if args.action == 'fetch':
++            fetch(args.dest, archive=args.archive)
++            return 0
++        problems = check(args.dest)
++    except (AssetError, OSError, ValueError) as error:
++        print(f'runner assets: {error}', file=sys.stderr)
++        return 2 if args.action == 'check' else 1
++    for problem in problems:
++        print(f'runner assets: {problem}', file=sys.stderr)
++    if problems:
++        return 1
++    print(f'runner assets: {len(listed())} files match {MANIFEST.name}')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/packaging/runner/assets.release b/packaging/runner/assets.release
+new file mode 100644
+index 000000000..d132686e6
+--- /dev/null
++++ b/packaging/runner/assets.release
+@@ -0,0 +1,4 @@
++# The archive assets.py downloads for build-assets.sh: the files listed in assets.sha256, one deterministic tar.gz.
++# DeepSeek-V4.1's runner asset release, used as it is (not re-hosted); a mirror must serve the same bytes.
++url https://github.com/jayleaton/deepseek-v41-tensorfold-spark/releases/download/runner-assets-20261107/runner-assets-20261107.tar.gz
++sha256 b5c40d32bcab0fa896795d08aaa651d55d0574e500f3624e61db23058cdd800f
+diff --git a/packaging/runner/assets.sha256 b/packaging/runner/assets.sha256
+new file mode 100644
+index 000000000..b23c5a3f5
+--- /dev/null
++++ b/packaging/runner/assets.sha256
+@@ -0,0 +1,198 @@
++# The in-model runner assets build-assets.sh layers into a runner image: the runner circuit (calc.tfpc) and the
++# graph-v7-powmod bank, as DeepSeek-V4.1's AB3 image served them. assets.py accepts exactly these files at these sha256s.
++3a421a2b8ba7c138c502ac205a8139ea05eeb2f7086715fe939b492ebbc18cf3  calc.tfpc
++7e0b399bba31458734e2f87b27d3d76d5d8a128631a8fba67a9b4e57444a786f  graph-v7-powmod/bank/Qwenputer-MIT.txt
++e90a082f6ad4e2be20161c856cda895824b43c15fe1ef3f03a9ffafbd22f3db3  graph-v7-powmod/bank/add-1.tfgp
++62fe59f2fbc27c9a75f1647edcf733f24fa5b2d7a228068d44f23f7759b200f8  graph-v7-powmod/bank/add-128.tfgp
++fb2f36e861d78a63c836b33dfdda7a4e72293cfb491b2e6c2c0b8182fd74e99e  graph-v7-powmod/bank/add-16.tfgp
++a38bb66351cbaa6cb70f2eb4c99ab81091242510923210f79c06d1e34140c240  graph-v7-powmod/bank/add-2.tfgp
++ae115ea1ad3816ffb211b1a6bf8d33bb030d1af8f965fb4e0cbd81e41df19f8b  graph-v7-powmod/bank/add-256.tfgp
++ae7b41f8ea7d39dc4e450a6ca75e436f402008582036661196e80851c3d012fb  graph-v7-powmod/bank/add-32.tfgp
++896631b756f1ba9040b61193d3af552a097a6f77be7ad908cf5a467670314ca1  graph-v7-powmod/bank/add-4.tfgp
++29d4a02e2b37734fa5fdace0cdf64a0bd466caa668af46109f708e1cfeb295a7  graph-v7-powmod/bank/add-62.tfgp
++c23dab0d6ed1b75ccb5b1f6d7d91c2a81475358ba09fbcc477e706bb2f06d57f  graph-v7-powmod/bank/add-8.tfgp
++068450da3c84ad87a6a0abf28bd84ca666f1fa2e106eadaa591a666710d51668  graph-v7-powmod/bank/assert_true-1.tfgp
++0bc24e9368fb7e6f092ef1807ff212923dc6c3efb4d40faa2acc4b83409e772e  graph-v7-powmod/bank/assert_true-128.tfgp
++ca0acc53d8961d17ea574e8cb8337bfeb1eae3ac0b427cb4602682ffa8115b74  graph-v7-powmod/bank/assert_true-16.tfgp
++5fc70a0ca278fc3a0e6795a08b4a7126a715f87f49dcb25312bf9d9ec7e72346  graph-v7-powmod/bank/assert_true-2.tfgp
++7e391cf9aee7d15c339ea8ae00b68e3a83b53db6659e6e14ca4c77ed94e238eb  graph-v7-powmod/bank/assert_true-32.tfgp
++526a25ae54140e32033aae160dc9ffb0f74cdc6ba3fc25cf3090c9be35696638  graph-v7-powmod/bank/assert_true-4.tfgp
++9cd1cbb8ebeacd563b7ff490b6a65820860ec44c3c1e76d0b93ba0b1690f7e83  graph-v7-powmod/bank/assert_true-62.tfgp
++f6570eb9fbfe02cdddaf9dabfd3fdd72f92031348589874f5c8c3db6f88f7c46  graph-v7-powmod/bank/assert_true-8.tfgp
++26862f0a758af4e01a1d8c69d501ad49ee1657162b36d057b8a3c312fcf12512  graph-v7-powmod/bank/bank.json
++07785af5bd6beb6e99fd89117a23c7a97eff055901d976a52e2c918c8a57095f  graph-v7-powmod/bank/byte_check-128.tfgp
++65bea0ba75fb5665920664271f5b8a9a8cd5f420013706d1f8245f241709003d  graph-v7-powmod/bank/compare-1.tfgp
++42d0c427eb82f06ce7cb9b8cff6fb401e9c5a3a4a572b585352072d0326a8670  graph-v7-powmod/bank/compare-128.tfgp
++a4f4624d018540d0adb388f26eef897eeeac396edaaa7b6024ecb48e7a030369  graph-v7-powmod/bank/compare-16.tfgp
++4b4eccf10d0911013c9e12dd30e0d87943f5bd2b4ed5894efa27ce0700f980d2  graph-v7-powmod/bank/compare-2.tfgp
++92b827d517056bd67259643fef87ac1688bb5c98f831aaf9c36dca3233e72033  graph-v7-powmod/bank/compare-32.tfgp
++448ee620d734714b4f262fc174ae1d3274938403b7e3667eace435de10d34b35  graph-v7-powmod/bank/compare-4.tfgp
++f4e2aa51594b78a110164a04fe46a8d4f6ffbf04f125e45a19cc7d9256fd3e04  graph-v7-powmod/bank/compare-62.tfgp
++fc17612d8c7a432d64d5cc84fef5d6b34d2b386b1e69a7b51c39812b684bf5cf  graph-v7-powmod/bank/compare-8.tfgp
++f9f0ce356f47a682cf55b170f00f5a552c05b6a9a85dc44bdd27ebeb1ad0391d  graph-v7-powmod/bank/decimal_mul-1.tfgp
++e503bd3ab10ffa09e05c26bfaa7da49f67a6af18dc9d0c791aee0247062fe2c8  graph-v7-powmod/bank/decimal_mul-128.tfgp
++7955f5449c59bff9234898e5fdce7e2033ba7116f4c9043a7004920e6d7964de  graph-v7-powmod/bank/decimal_mul-16.tfgp
++4d439950fd6fcb9e65e937cd6a5139ceedc849592e650468f522e748c02f894a  graph-v7-powmod/bank/decimal_mul-2.tfgp
++db90cf047415c0e355087746828ca171f90cf29b452347ceac89d4f2190903bf  graph-v7-powmod/bank/decimal_mul-32.tfgp
++ad18ef65d03188a1db638f1b6eb106b2871a3cc6123fcd0cacd1a70367ee3191  graph-v7-powmod/bank/decimal_mul-4.tfgp
++058c3d7342979c8eb43ea34cd3905ce3ac2a5e13f27c8dbe6b9b8cb053d77de7  graph-v7-powmod/bank/decimal_mul-62.tfgp
++d8fc73a7310fe8379a300fb0adc753e5ea4379f031efe00126f62ed7e83c4a7e  graph-v7-powmod/bank/decimal_mul-8.tfgp
++3c54642bd156a684594e71f85825916928fb4c3e2a82fbc454ddd6a9a488c502  graph-v7-powmod/bank/digit_sum-1.tfgp
++da842997a9a2a93d59703d8b6f9be589389b58a93f1fdd84d0d87fc902e8ee9e  graph-v7-powmod/bank/digit_sum-128.tfgp
++2dbc14662fdd8f16efe42ed2a324c392bc74ded236bbe516392ade0ba0c12e1b  graph-v7-powmod/bank/digit_sum-16.tfgp
++a32ad843a2aec34e4e879514824a86d137d61f27d175a401ffadcd496b29ceb8  graph-v7-powmod/bank/digit_sum-2.tfgp
++0ba270580cf216657e00013fccc6a75adb9e3e6f9965cc5abfccef0a4fa8375e  graph-v7-powmod/bank/digit_sum-32.tfgp
++8c107596bb998398ca71ca5771f2dd55bde91232d284ddad0dca0731adec07f7  graph-v7-powmod/bank/digit_sum-4.tfgp
++d15dfcca05023054a712146490586172cc39805f01a08fd82a9f482a7be682f6  graph-v7-powmod/bank/digit_sum-62.tfgp
++93e6e95c3c5883b1f9e8f808064fd5441570d766e8e941c9d6cabd3972c4ed24  graph-v7-powmod/bank/digit_sum-8.tfgp
++a0673eb5ba6f0934ad221b4c5aa290c8f7c793785545add79163b35ad74bff4f  graph-v7-powmod/bank/divfinal-1.tfgp
++8c33e4c8404c321f18963c6605d3d86ed54a740c8f12e6dc1eacb2896d7b7fd3  graph-v7-powmod/bank/divfinal-128.tfgp
++e78a6b97b4c7a333960723675d1499ac0a451f450dd00659083635084ad87eaa  graph-v7-powmod/bank/divfinal-16.tfgp
++1f3e0266ca60075712152ec0ef6f9d631547e1403191eb56319adc607d0193f6  graph-v7-powmod/bank/divfinal-2.tfgp
++11ba95d456c808d8af397d9c4d42da031735d81ff501b99f778ed20124fa2070  graph-v7-powmod/bank/divfinal-256.tfgp
++0d72c47c715b897828cfc58d9a9f5c85f87fa08600c2dbc5388f0cc8c2583b48  graph-v7-powmod/bank/divfinal-32.tfgp
++139879bdb9f58221543bec13b967483d2842d8a0ee9d4c65fdba6702bae76a3e  graph-v7-powmod/bank/divfinal-4.tfgp
++796e179260d3512196d393e0af150005ce66bb520297b8442e30e2eb4fe23ef6  graph-v7-powmod/bank/divfinal-62.tfgp
++3b5d1d0fb77ee9a9be38984a319621fe6dec485829a9b9a099446ece7d967411  graph-v7-powmod/bank/divfinal-8.tfgp
++f09a155586049ba13ab049a600a36216fa44c4a04570a2c52bafa58c026f0e04  graph-v7-powmod/bank/divstep-1.tfgp
++70ec129c6a343b4c1716341829455241fb165dc9f9f358afc6e45b2523636eb1  graph-v7-powmod/bank/divstep-128.tfgp
++83fb5db80fac9e777459b3dfac5fcca5c0de04ca1604a0cc10acfb26ba1b11ec  graph-v7-powmod/bank/divstep-16.tfgp
++8faebd7cb403da931fd9064ab8fede53d6b41d1dbe67ebd757506e36f6941def  graph-v7-powmod/bank/divstep-2.tfgp
++fa46f6743a0cf77c715433811ff4a21471da9c1d45a871d3abd653f164c452b7  graph-v7-powmod/bank/divstep-256.tfgp
++0e2f4a4b5d9842b0cbad765f12ad418c5e1a9e8081eb1e008ed4527befb976c6  graph-v7-powmod/bank/divstep-32.tfgp
++da28488220199fed1579d9162dab8667ca25656206c4364e77c0a38f0066e2de  graph-v7-powmod/bank/divstep-4.tfgp
++86da7dc07b9bfb450dc491e09eb81a541a52bf7f10538a22552e265839574709  graph-v7-powmod/bank/divstep-62.tfgp
++2f45f859899466a7373bdc0eac241807b85e52fc889454ceb9222fcde312d987  graph-v7-powmod/bank/divstep-8.tfgp
++d982100541d7fed4457983eafdf336b3f88291c9ad0ca9ffebc22da2496595ef  graph-v7-powmod/bank/emit-128.tfgp
++ca2193e83fc09c0f56f586b925471d1dbb06b5955b83d1695d2e70398ee1f6cf  graph-v7-powmod/bank/emit-256.tfgp
++449d6948fd158b3714b159a5d09cf1b4b83f45e4d619f1f334199c27cff2ea30  graph-v7-powmod/bank/emit-62.tfgp
++a97eba4e842391c30bb9911de8fe4a858b6e5c3870af97c0cd9ac0c8ac258f12  graph-v7-powmod/bank/emit_byte-4.tfgp
++eecc5ceaf5ad7e099a23d21ea32e087c564fbd502550779d84ceccb832803ad2  graph-v7-powmod/bank/emit_first-128.tfgp
++25c641991fbaa835dd0a1f98490479112a4c539dee7f5b185fc4d9cf912f3d51  graph-v7-powmod/bank/emit_first-256.tfgp
++4a77c9bf0dc62bed25fc6540a1913c22abb16f835a50fa5cc1a836962f90c8da  graph-v7-powmod/bank/emit_first-62.tfgp
++f69721286960b8dfb95be725c40a669038873d0f60f6920d8b4ff6455d521f36  graph-v7-powmod/bank/emit_last-128.tfgp
++6f440c60178a54f8063f116458d682b2b12d9303f650e03069c64870aba337fb  graph-v7-powmod/bank/emit_last-256.tfgp
++a22a2fb150cdd6fb223b1337b2ef2ad64eb247ec02bc8df40daac075e8a83df3  graph-v7-powmod/bank/emit_last-62.tfgp
++7e0b399bba31458734e2f87b27d3d76d5d8a128631a8fba67a9b4e57444a786f  graph-v7-powmod/bank/extension-base/Qwenputer-MIT.txt
++852cd2e6d46b924df8097ddb19f13f5acb3990049b3c6ff4096a3bc1cde12c23  graph-v7-powmod/bank/extension-base/bank.json
++7e0b399bba31458734e2f87b27d3d76d5d8a128631a8fba67a9b4e57444a786f  graph-v7-powmod/bank/extension-base/extension-base/Qwenputer-MIT.txt
++a9b8808e27029d0cb2fadd26777de9e727ce29f8a42bd53d26f4c190ac5a3d88  graph-v7-powmod/bank/extension-base/extension-base/bank.json
++7e0b399bba31458734e2f87b27d3d76d5d8a128631a8fba67a9b4e57444a786f  graph-v7-powmod/bank/extension-base/extension-base/extension-base/Qwenputer-MIT.txt
++ec0f284687d499e812cc72a6c3d61611e32ad436df9048c8d5430ca26e69587c  graph-v7-powmod/bank/extension-base/extension-base/extension-base/bank.json
++55d637f11b10a33558ac3bd12fc7fe56dddcefc9806bbe07b98ced020d0b544e  graph-v7-powmod/bank/extension-base/extension-base/extension-base/provenance.json
++ac68ee456c1c3dfb2248c107c5f965ec17ca050e31780e5085c8e55dc439d03a  graph-v7-powmod/bank/extension-base/extension-base/extension-build.json
++0bfdeba495b2d285835dada7436432b73bf8a5a33fa3e56caa8321d23ae0a58e  graph-v7-powmod/bank/extension-base/extension-base/extension-progress.json
++a4a0781fbd1916299de73add0a937ab9360733189e347c53f32ad33f9c993ddf  graph-v7-powmod/bank/extension-base/extension-base/provenance.json
++b48cb4e4b1f68111bfec646421566fcb5ac1ba5ca80c52a5d5640d4991c2f02d  graph-v7-powmod/bank/extension-base/extension-build.json
++dbd9585bfd4b618ad99e1a1328e9ec909b22df7f3506bbf86a722601ba488ca3  graph-v7-powmod/bank/extension-base/extension-progress.json
++25980323088d68906422c63c63c80a88a14c4f1f19e7d49d791d17300067adbe  graph-v7-powmod/bank/extension-base/provenance.json
++ae44ca68d93629429679685fd293fdc613b35dcc2c8152657e53a7d1f0273b6c  graph-v7-powmod/bank/extension-build.json
++5a75ed1580d8c6bc57165e320e522273220e6d632a42c7f3517dc5c304a7aa8b  graph-v7-powmod/bank/extension-progress.json
++54537462e83d5b815ab6178aef4ea6de0ae3c4f355f5b2fcb0757231558d9993  graph-v7-powmod/bank/float_exact-1.tfgp
++3b61f7dcb93515c66c6ab93862737503e02eeefdcc39f502295414ace2cd844c  graph-v7-powmod/bank/float_exact-128.tfgp
++547334227b3fb4f6a09b3906895c082b499f7dd3edad7b248fbe1c6012c04a42  graph-v7-powmod/bank/float_exact-16.tfgp
++eb85542b04ad09e70d36d829aa1f68b9f6da2503f71f0d318960be22b733f063  graph-v7-powmod/bank/float_exact-2.tfgp
++ff828e25d5e077b01f4e9df49bb13c1474e835bec961c74eda478c83fb87a13e  graph-v7-powmod/bank/float_exact-32.tfgp
++3e5830576c6dd29aaaca843f69ca4413b1d5c3618634fd1f57afa7781a887ef0  graph-v7-powmod/bank/float_exact-4.tfgp
++17a52c69a12f071479e29401f3e186cf6ae6dcf66356983d5f06f4a1911516de  graph-v7-powmod/bank/float_exact-62.tfgp
++39edef8bddd2c12de482846cc6d28ee640469d7fd513e90da8939cf2d7cb2e1c  graph-v7-powmod/bank/float_exact-8.tfgp
++d09ce7dd270429bedd433be6ba8830f7ffc69dc3acb98df17dae72e3aab7e791  graph-v7-powmod/bank/format-128.tfgp
++fe0e3723c8c51bfdeb166ef5a0d9e53c31f1bd31c4dda40f1b3eae40c4f87c7d  graph-v7-powmod/bank/format-256.tfgp
++829735e8a7674609f4ad3161ee1306e75c9fda391fe4c52607b2e1bccd5ac5ea  graph-v7-powmod/bank/format-62.tfgp
++8f6b3399bccf3fb2c8e0a9448f87f9f914cb237f26d7b0de8697e3e1572f3237  graph-v7-powmod/bank/format_f64-62.tfgp
++b6447a7269f15a0ae5d1f6542761da096fc9cf43e1e202120f23ca49caeab772  graph-v7-powmod/bank/half-1.tfgp
++ff2c85a8f02d4dbc188b5de9dd942300642ff4d3ebabe8b9a5fdd8f31c57b130  graph-v7-powmod/bank/half-128.tfgp
++4b22261b63be1f160946cd3f0e340d93852cd13ab5edd2ac24c3af17dd3c60a9  graph-v7-powmod/bank/half-16.tfgp
++7dac4b55d3b69f6abd65829908d2a4f209269040d84df7bcf7813ec9ec6f04e7  graph-v7-powmod/bank/half-2.tfgp
++0a08d23bfb416fb9b29cd3dfc2fe54782fc4837e890ec15b15dcaef26c026683  graph-v7-powmod/bank/half-256.tfgp
++1ce8fa06268cfb487372c06fa74c3ffb5f6af9b2c894358eaf983392fcc83071  graph-v7-powmod/bank/half-32.tfgp
++24eece4afb34a421f48e21670e572000b74e8e0d29314321d760e8f176e3b105  graph-v7-powmod/bank/half-4.tfgp
++54b80705e58c2eaf4122f72bc45e9c98a72e539915fdf50da9773adcb65e7437  graph-v7-powmod/bank/half-62.tfgp
++0c710ebc5a3464eb2530e1435d2b86c009fa65b729eceee37c46c4e8b51a2dad  graph-v7-powmod/bank/half-8.tfgp
++b88069553eacca3570fb3749f6a8538713acd4ee6ebd36d1a117fb4ea789bc6b  graph-v7-powmod/bank/max-1.tfgp
++8a129b16426a76fa3a173a4391d45a5e743f29109b00de5360470c7e91c095e3  graph-v7-powmod/bank/max-128.tfgp
++06d6e1bbf569c7c67e17c68c6718dba1891a86eb28e0e8be019d115dedec5c76  graph-v7-powmod/bank/max-16.tfgp
++e1e72917221f72b82c439ec932279e33b71e1ab452ed911109c03ff83c150f0e  graph-v7-powmod/bank/max-2.tfgp
++d62d5fd3c68d99f75ac711c2997307269f713c82363266ba257bcfa98f98d381  graph-v7-powmod/bank/max-32.tfgp
++9b4dcb572fdff6c83f5776c89aa7e235796abd0b3fc16860bf0a46a4ead8bf66  graph-v7-powmod/bank/max-4.tfgp
++e8db89843d7a5e05585047bab9adc79c117cd7c845ec128176c6d28e4e750e3a  graph-v7-powmod/bank/max-62.tfgp
++91e8ffc2bf1ea81607559d2a218182a283f6236334bacded2dfa233dd47f3cce  graph-v7-powmod/bank/max-8.tfgp
++ce1c3731af4e676e1379b5e37280fd96e270ca35e0c9d2dbee293d2f1309881c  graph-v7-powmod/bank/meta-128.tfgp
++418122a4b772681ced52f6ee8edd5d6d35ad922766432e37ad90e386469b4ffc  graph-v7-powmod/bank/meta-16.tfgp
++118129bd73b2d649b97639b7d74056a0e2b1db2bcc2438a904edfc84fbcc366d  graph-v7-powmod/bank/meta-256.tfgp
++1d102565a30f99319a93922cb9543634ad254551908484a63f9ba466ead9a28b  graph-v7-powmod/bank/meta-32.tfgp
++147bcdd1de08b7969ad128b74662479a5f6005c52ea8ab2fa5e7bfae4e36c9ca  graph-v7-powmod/bank/meta-62.tfgp
++884fd94f28770c70b56a31ead2a6e21533502322f9a434830b016c90e97e6658  graph-v7-powmod/bank/meta-8.tfgp
++0a749575a9506b660cc06490242a094279beed03ccd3f1a449a0d539d0f13cb1  graph-v7-powmod/bank/min-1.tfgp
++7062e98b8f9900b7e37fb073958d4542a068f747d27765d16d952aa63933513b  graph-v7-powmod/bank/min-128.tfgp
++5a8212dd4444200b9c1347ca951db117e745e95257e8a062f8435b157a5b6ba5  graph-v7-powmod/bank/min-16.tfgp
++b4cd47279d4429a5478d7a281cf6ea72fc2b7f1d9d9baff59fa65a5e36b787d5  graph-v7-powmod/bank/min-2.tfgp
++d8d5e384c4ead9986da73cb1674c948538491f757a9e7ff6b5c35f811b21d065  graph-v7-powmod/bank/min-32.tfgp
++87a3da35ef9d0500efd01c32595c59d89ad054f8d8930042743841c420e81c0d  graph-v7-powmod/bank/min-4.tfgp
++3000cc6c160ee7e039b9bf48f5485ece0ce3dfc116b7b41bfa040a1e93ddbb39  graph-v7-powmod/bank/min-62.tfgp
++11a288fecd6d3fcfef77937b8b9b0af9ccd8db6f37d1597fe8ad791bae2ac449  graph-v7-powmod/bank/min-8.tfgp
++6fbbc2752409f9ea74dfe0ea6445abe3f3f26607d75011e6f886791d0f2a8491  graph-v7-powmod/bank/mul-1.tfgp
++069ddbb25bf7067d92193d7e72b38b0e4abb8d2dcd0c0100258b80edba6fe205  graph-v7-powmod/bank/mul-128.tfgp
++17f7e3291ec71e5294478b2ee55fdafe565f1294b5c03bcee98e2251a6f5a39e  graph-v7-powmod/bank/mul-16.tfgp
++8970d2a0ee6aa3181799e3781e369c45614b2e65c5f9d185f00cc7ff03b33028  graph-v7-powmod/bank/mul-2.tfgp
++50bc364dedb41a734de68441d62d46816366cc03095c351278a51b80ba35be84  graph-v7-powmod/bank/mul-256.tfgp
++b23a0bc14eb41f6ffea0c0583883fa3c9d3cfd6e3678b70dc3a03f90fc089c90  graph-v7-powmod/bank/mul-32.tfgp
++dfae9416b52a1cbaadf30db773b250b3b6190bd5650a91d7d1847fd2517a56d2  graph-v7-powmod/bank/mul-4.tfgp
++184d62a2a1e1c7c89f8f3007e6c28916c154a2654499346b6e9e2c0ccddba8c2  graph-v7-powmod/bank/mul-62.tfgp
++55419bdb6c4e16d903f8978770e1e381efdafbf772759fd667c31175f17215b7  graph-v7-powmod/bank/mul-8.tfgp
++f8ac478fd452d0840f955ca14fdc9941f641e928a02e88098dc7bc2d73017635  graph-v7-powmod/bank/mulmodstep-1.tfgp
++44d4e568e3fdc1b94716cd436a1ff9de22fe30b162bb50e10ece6993eff6d9d8  graph-v7-powmod/bank/mulmodstep-128.tfgp
++6c84717d3d4f07037c7d0700f5ee9cb91f9bb919573930ad61809828d52e0254  graph-v7-powmod/bank/mulmodstep-16.tfgp
++b636fd039ee698784f7bd94e1fa8847e26bd002450b2860c84a501ae3fe4521e  graph-v7-powmod/bank/mulmodstep-2.tfgp
++e668c54b2b78a35ab3bc8b73b932d666f07c9c3a887ac3693415f20b573530e4  graph-v7-powmod/bank/mulmodstep-256.tfgp
++8d1d0b12f0eb0da0af464831afb7cee1e310048561f9c373175bf4f7f40c158c  graph-v7-powmod/bank/mulmodstep-32.tfgp
++7cdebc04fad9419b6bd920ccb36c76b7aea31862464dd78462f1976bff964223  graph-v7-powmod/bank/mulmodstep-4.tfgp
++9a0cbd99194bde558602e0d89da638ac78417bbce4d5c14b54b2b692fe85cf35  graph-v7-powmod/bank/mulmodstep-62.tfgp
++a3ad211a378237761f87b443d6ed35c19ae936816fbc3990bc52fca687602a00  graph-v7-powmod/bank/mulmodstep-8.tfgp
++648abbed8274a98d6d34d122e85ce36a04b0dcf6a6a2d4e9ec42c176a7cfaf3e  graph-v7-powmod/bank/provenance.json
++7461bd697fc2fb34e26f260d09f2931cdae2fa030f8cb6529154b13c217036b6  graph-v7-powmod/bank/raw_meta-128.tfgp
++a6f9932232993963fa8d3023799446d2a46d7cce44904dc7b59c976239f5703e  graph-v7-powmod/bank/raw_meta-16.tfgp
++267914376c4c0f1b3b2021a1a91c4102f13d25019c05725ac853e79dcc8be9b3  graph-v7-powmod/bank/raw_meta-32.tfgp
++925515a85a26ed22b8c15de727b2f9a08d834f42a7391152113efbe4d506812d  graph-v7-powmod/bank/raw_meta-62.tfgp
++ebbdeec44c6e601b02f543fed186ea4c337e02c432ac8c3ee3ba3bd07d532777  graph-v7-powmod/bank/raw_meta-8.tfgp
++49f5d4dc8ca4679797eaf70113ed452471bd3696000e09b4c9ab7a1f378e017a  graph-v7-powmod/bank/reverse_decimal-1.tfgp
++399d569b5cdf8e51ae6822953d7f463b060ad5cc15960a4dfa978d469bcc85ab  graph-v7-powmod/bank/reverse_decimal-128.tfgp
++71b0ba4fe12c0d438600dcdd5743ec377e540dbac9a4541e8128201367d9a5df  graph-v7-powmod/bank/reverse_decimal-16.tfgp
++25b9a7accc311e071792485fd11dc8e493f87f8a0249706cf16a99976933b895  graph-v7-powmod/bank/reverse_decimal-2.tfgp
++0b977d165bfe9687c983c9ae4a64cdf31f256f60127974a1c36831d2746fc097  graph-v7-powmod/bank/reverse_decimal-32.tfgp
++18b14d17fba0af77f8fe6a9e078bc3c028865460e144a158c66a39f7d87a2657  graph-v7-powmod/bank/reverse_decimal-4.tfgp
++3736e62a3855775fb2e841463486d068e6a8d0960e29f17184b1bd06f94d4f12  graph-v7-powmod/bank/reverse_decimal-62.tfgp
++482c2696f3346265a97cab6e58bb501236eb349cbf8399c575afabd9bd59adb9  graph-v7-powmod/bank/reverse_decimal-8.tfgp
++140aa0122e95387232608ee7b7ed0252c5d98f68dbaf63858a26e61bd85dbd45  graph-v7-powmod/bank/round_div-1.tfgp
++f222ae5f55b898d478dbad0c051f5bf25f418050a5bf174d7668bef9db36c4ac  graph-v7-powmod/bank/round_div-128.tfgp
++d379deaa8663dc8261d46405d1a224555c8d25f2d0afa3c4e77ba0767b70beef  graph-v7-powmod/bank/round_div-16.tfgp
++b83b5b8d727f108f4d693fc7600bfc2f5bfc3e938cce3609d2fac411739f1e3d  graph-v7-powmod/bank/round_div-2.tfgp
++c467bdce5744cdea5c9e329a6e94cddd3eeef43dffb829df7d2f99a1ad866e8e  graph-v7-powmod/bank/round_div-32.tfgp
++76f76a123c914d4af88cd61a4ecac28bc952296a58eff48fb17c5e9fa0b86bfa  graph-v7-powmod/bank/round_div-4.tfgp
++7346b7bb06dcefc3c7a2aa0634d82044cf0656353df41822f2323ff9da266abf  graph-v7-powmod/bank/round_div-62.tfgp
++3b251c4d28c440125e6a81a2e3d3175ecbe0b2ea07b215f1823e0f0b7c39124a  graph-v7-powmod/bank/round_div-8.tfgp
++ee09dec0656ef1757f049a59bf8f18d9e5f4389dfcd9afdc36a75f9025557a76  graph-v7-powmod/bank/scale10-1.tfgp
++1b5488237d089db0c1b125cf17e0ada364d5bb4be5a0838ac47ab44602715b72  graph-v7-powmod/bank/scale10-128.tfgp
++cf29a0754ec8a64e874c019a99350c72d050a487e4e2239af2fb12f5d4bed0b2  graph-v7-powmod/bank/scale10-16.tfgp
++4acd371b645106a42e8163688291a10bd9f8060456d3d19f5f0e126db63f0d75  graph-v7-powmod/bank/scale10-2.tfgp
++dd8a4bb21ac8dd205c5b5bd4597a3dbc29c874d3a441ef02b12fc9e69714e3ab  graph-v7-powmod/bank/scale10-32.tfgp
++dca1dca4ed6fae6be6b3182cd48abe4c73b071cb7ab4e845274bdf3f7b9fecde  graph-v7-powmod/bank/scale10-4.tfgp
++a145d11bbf7bbbbd74eda2f4b24d331e6277607d84e7b15c3aa0efec4dc44d5d  graph-v7-powmod/bank/scale10-62.tfgp
++74082156160644e7f18b058e6f674a16b11190cbab7edf29f9d3e4147f9ffe04  graph-v7-powmod/bank/scale10-8.tfgp
++e8777c3e46399ebe5a2934c05e8bbed36b0bab3d0521bdca851ddc0802e2f325  graph-v7-powmod/bank/select-1.tfgp
++91930f16ffcaa5c72964bbbf29cb2f2a3eea98793132328dd30d3ab5881851b7  graph-v7-powmod/bank/select-128.tfgp
++3f423446edb37b62ee22e8faba46880c1641d3f3371dc6070b129e9790744cd3  graph-v7-powmod/bank/select-16.tfgp
++df1b818b8da0ae3c111e18da742e4596d3fe3af244680d69f31494f1ffb54c5c  graph-v7-powmod/bank/select-2.tfgp
++120dbb5f11cbc81b2a0b8a6bc1c2f684806f20dc3c743b30d3bc1e0ab6dc6b2a  graph-v7-powmod/bank/select-32.tfgp
++fe5acb2cbc311f2ae32c8ff590b4571238a3a6d427f12ced082711a3bacb64a3  graph-v7-powmod/bank/select-4.tfgp
++03424aa194f2a7243f22506e0fbdc5510f5d3727ca2c4ae985a1b6141bf3cf8c  graph-v7-powmod/bank/select-62.tfgp
++01d667785f5fbabe8003e23eea8646a5483cb4f4d192a61b9c9b3ff404f98ba5  graph-v7-powmod/bank/select-8.tfgp
++2ac502d8becfb5f6c61db5bf1273575c6066942f681ba987754bfabec46d16f2  graph-v7-powmod/bank/sub-1.tfgp
++540c6563f5aac66742c5ddd88ff7d884ac864c80dbe22e00cd08fa227680963b  graph-v7-powmod/bank/sub-128.tfgp
++4cba7ec0693ac4926b35476108e851c27dc7972ec474eedb531bc9ceaacb5293  graph-v7-powmod/bank/sub-16.tfgp
++001e2ae1d6186b25b68a2541b8bbee4c191d9b79d73f4d82eb7b8e9a159dde9a  graph-v7-powmod/bank/sub-2.tfgp
++1c42bb34c635ae4955ed6b38ed2fd2c72f2ff02f261e7c88587b8b0920b16db1  graph-v7-powmod/bank/sub-256.tfgp
++34b8d66a3bdf0e6953071cf54ef121d3443a3b1c86cebebf0a2df10bfa573646  graph-v7-powmod/bank/sub-32.tfgp
++8e5e2a9989877d4be32b0fbe8855decc6e07088a18a4b5aa6bb2831bb87ef135  graph-v7-powmod/bank/sub-4.tfgp
++c30b1ca3e5f4db3fcec0ef7e5c2c6af00ace2c64632053ee453db3e69b635e78  graph-v7-powmod/bank/sub-62.tfgp
++910ca8e1b26edb49efb6c87f935539ee7dfec0278d57f8f48693b2c31fadce9a  graph-v7-powmod/bank/sub-8.tfgp
+diff --git a/packaging/runner/build-assets.sh b/packaging/runner/build-assets.sh
+new file mode 100755
+index 000000000..50f7d51dc
+--- /dev/null
++++ b/packaging/runner/build-assets.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# Layer the runner's circuit and graph bank (assets.Dockerfile) over an image build.sh built. Without ASSETS_DIR the
++# assets are downloaded from assets.release; either way assets.py checks them against assets.sha256 before the build.
++set -euo pipefail
++usage='usage: build-assets.sh RUNNER_IMAGE TAG [ASSETS_DIR]'
++if [[ $# -lt 2 || $# -gt 3 ]]; then echo "$usage" >&2; exit 2; fi
++base=$1 tag=$2 assets=${3:-}
++[[ -z "$assets" || -d "$assets" ]] || { echo 'ASSETS_DIR must be a directory' >&2; exit 2; }
++here=$(cd -- "$(dirname -- "$0")" && pwd)
++context=$(mktemp -d -t tf-runner-assets.XXXXXXXX)
++trap 'python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1])" "$context"' EXIT
++cp "$here/assets.Dockerfile" "$context/Dockerfile"
++if [[ -n "$assets" ]]; then
++    cp -R "$assets" "$context/runner"
++    python3 "$here/assets.py" check "$context/runner"
++else
++    python3 "$here/assets.py" fetch "$context/runner"
++fi
++DOCKER_BUILDKIT=0 nice -n 19 ionice -c3 docker build --build-arg "BASE_IMAGE=$base" -t "$tag" "$context" >&2
++docker image inspect -f '{{.Id}}' "$tag"
+diff --git a/packaging/runner/build.sh b/packaging/runner/build.sh
+new file mode 100755
+index 000000000..da3f8b340
+--- /dev/null
++++ b/packaging/runner/build.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++set -euo pipefail
++if [[ $# != 3 ]]; then echo 'usage: build.sh BASE_IMAGE TAG BOOT_CHECK_BINARY' >&2; exit 2; fi
++base=$1 tag=$2 binary=$3
++here=$(cd -- "$(dirname -- "$0")" && pwd)
++context=$(mktemp -d -t tf-runner-image.XXXXXXXX)
++cleanup() { find "$context" -maxdepth 1 -type f -delete; rmdir "$context"; }
++trap cleanup EXIT
++cp "$here/Dockerfile" "$context/Dockerfile"
++cp "$binary" "$context/tf-runner-frontend-check"
++chmod 755 "$context/tf-runner-frontend-check"
++docker image inspect "$base" > "$context/base.json"
++base_id=$(docker image inspect -f '{{.Id}}' "$base")
++python3 - "$context" <<'PY'
++import json, pathlib, shlex, sys
++root=pathlib.Path(sys.argv[1])
++config=json.loads((root/'base.json').read_text())[0]['Config']
++entry=config.get('Entrypoint') or []
++if '/opt/tensorfold/bin/runner-entrypoint' in entry:
++    raise SystemExit('base already contains runner-entrypoint; use the original serving base')
++script='#!/bin/sh\nset -eu\n/opt/tensorfold/bin/tf-runner-frontend-check\nexec '
++script+=' '.join(shlex.quote(arg) for arg in entry)
++script+=' "$@"\n'
++(root/'runner-entrypoint').write_text(script)
++(root/'runner-entrypoint').chmod(0o755)
++with (root/'Dockerfile').open('a') as f:
++    f.write('CMD '+json.dumps(config.get('Cmd') or [])+'\n')
++PY
++DOCKER_BUILDKIT=0 nice -n 19 ionice -c3 docker build \
++    --build-arg "BASE_IMAGE=$base_id" \
++    --build-arg "FRONTEND_TREE=${TF_RUNNER_FRONTEND_TREE:-unknown}" \
++    --build-arg "RUNNER_BUILD_ID=${TF_RUNNER_BUILD_ID:-runner-frontend}" \
++    -t "$tag" "$context" >&2
++docker image inspect "$tag" > "$context/derived.json"
++python3 - "$context" "$tag" <<'PY'
++import json, pathlib, sys
++root=pathlib.Path(sys.argv[1])
++base=json.loads((root/'base.json').read_text())[0]
++image=json.loads((root/'derived.json').read_text())[0]
++assert (image['Config'].get('Cmd') or []) == (base['Config'].get('Cmd') or [])
++assert image['RootFS']['Layers'][:len(base['RootFS']['Layers'])] == base['RootFS']['Layers']
++print(json.dumps({'size_metric':'docker image inspect .Size','tag':sys.argv[2],'image_id':image['Id'],'base_id':base['Id'],
++ 'base_bytes':base['Size'],'image_bytes':image['Size'],'delta_bytes':image['Size']-base['Size'],
++ 'frontend_tree':image['Config']['Labels']['org.tensorfold.runner.frontend.tree']},sort_keys=True))
++PY
+diff --git a/packaging/runner/check-image.sh b/packaging/runner/check-image.sh
+new file mode 100755
+index 000000000..71dce6d0a
+--- /dev/null
++++ b/packaging/runner/check-image.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++set -euo pipefail
++if [[ $# != 1 ]]; then echo 'usage: check-image.sh TAG' >&2; exit 2; fi
++tag=$1
++run() { docker run --rm --runtime=runc --network none -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= "$@"; }
++run "$tag" /bin/true
++run -e TF_RUNNER=1 "$tag" /bin/true
++for dependency in TF_RUNNER_CLANG TF_RUNNER_LLD; do
++ run -e "$dependency=/nonexistent-runner-tool" -e TF_RUNNER=0 "$tag" /bin/true
++ rc=0
++ run -e "$dependency=/nonexistent-runner-tool" -e TF_RUNNER=1 "$tag" /bin/true || rc=$?
++ [[ $rc != 0 ]] || { echo "FAIL: missing $dependency did not fail closed" >&2; exit 1; }
++done
++rc=0
++run -e TF_RUNNER_CLANG=/bin/true -e TF_RUNNER=1 "$tag" /bin/true || rc=$?
++[[ $rc != 0 ]] || { echo 'FAIL: compiler success without an ELF was accepted' >&2; exit 1; }
++run "$tag" /bin/sh -c 'test "$1" = "hello world"' sh 'hello world'
++circuit=/opt/tensorfold/share/runner/calc.tfpc
++probed=no
++if run "$tag" test -f "$circuit"; then
++ run --entrypoint /opt/tensorfold/bin/tf-runner-frontend-check "$tag" --require --circuit "$circuit" ||
++  { echo "FAIL: the image's circuit route (compiled probe cells on $circuit) is wrong" >&2; exit 1; }
++ probed=yes
++fi
++echo "RUNNER_IMAGE_CHECK: compile/ELF validation, optional fallback, required failure, argv preservation, circuit route ($probed) PASS"
+diff --git a/packaging/runner/test_assets.py b/packaging/runner/test_assets.py
+new file mode 100644
+index 000000000..0051f8f60
+--- /dev/null
++++ b/packaging/runner/test_assets.py
+@@ -0,0 +1,168 @@
++import gzip
++import hashlib
++import io
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tarfile
++import urllib.error
++
++import pytest
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++import assets  # noqa: E402
++
++URL = "https://example.invalid/releases/download/runner-assets-x/runner-assets-x.tar.gz"
++FILES = {"calc.tfpc": b"circuit", "graph-v7-powmod/bank/bank.json": b"{}"}
++
++
++def archive_bytes(files, extra=None):
++    raw = io.BytesIO()
++    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as tar:
++        for name, data in sorted(files.items()):
++            info = tarfile.TarInfo(name)
++            info.size = len(data)
++            tar.addfile(info, io.BytesIO(data))
++        if extra:
++            tar.addfile(extra)
++    return raw.getvalue()
++
++
++def pinned(tmp_path, files, archive=None, extra=None):
++    """A manifest for `files`, a release file pinning the archive of `archive` (default: `files`) and that archive."""
++    manifest = tmp_path / "assets.sha256"
++    manifest.write_text("".join(f"{hashlib.sha256(d).hexdigest()}  {n}\n" for n, d in sorted(files.items())))
++    data = archive_bytes(files if archive is None else archive, extra)
++    rel = tmp_path / "assets.release"
++    rel.write_text(f"# test\nurl {URL}\nsha256 {hashlib.sha256(data).hexdigest()}\n")
++    return manifest, rel, data
++
++
++class Served:
++    def __init__(self, data):
++        self.stream = io.BytesIO(data)
++
++    def __enter__(self):
++        return self.stream
++
++    def __exit__(self, *exc):
++        return False
++
++
++def test_exact_files_pass_and_every_difference_is_named(tmp_path):
++    manifest, _, _ = pinned(tmp_path, FILES)
++    root = tmp_path / "runner"
++    for name, data in FILES.items():
++        (root / name).parent.mkdir(parents=True, exist_ok=True)
++        (root / name).write_bytes(data)
++    assert assets.check(root, manifest) == []
++    (root / "calc.tfpc").write_bytes(b"other")
++    (root / "extra").write_bytes(b"")
++    (root / "graph-v7-powmod/bank/bank.json").unlink()
++    assert assets.check(root, manifest) == [
++        "missing graph-v7-powmod/bank/bank.json", "unlisted extra", "sha256 differs calc.tfpc"]
++
++
++def test_symlinks_and_escaping_names_are_refused(tmp_path):
++    manifest, _, _ = pinned(tmp_path, {"calc.tfpc": b"circuit"})
++    root = tmp_path / "runner"
++    root.mkdir()
++    (root / "calc.tfpc").write_bytes(b"circuit")
++    (root / "link").symlink_to(root / "calc.tfpc")
++    with pytest.raises(ValueError, match="not a regular file: link"):
++        assets.check(root, manifest)
++    manifest.write_text(f"{'0' * 64}  ../calc.tfpc\n")
++    with pytest.raises(ValueError, match="bad manifest line"):
++        assets.listed(manifest)
++
++
++def test_download_checks_the_archive_and_every_file(tmp_path, monkeypatch):
++    manifest, rel, data = pinned(tmp_path, FILES)
++    monkeypatch.setattr(assets.urllib.request, "urlopen", lambda url, timeout: Served(data))
++    assets.fetch(tmp_path / "runner", rel, manifest)
++    assert (tmp_path / "runner/calc.tfpc").read_bytes() == b"circuit"
++    assert not list(tmp_path.glob(".runner-*"))  # the downloaded archive does not stay
++
++
++def test_unpacked_modes_come_from_the_archive_not_the_umask(tmp_path):
++    manifest, rel, _ = pinned(tmp_path, {"graph-v7-powmod/bank/bank.json": b"{}"})
++    raw = io.BytesIO()
++    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as tar:
++        for name in ("graph-v7-powmod", "graph-v7-powmod/bank"):
++            info = tarfile.TarInfo(name)
++            info.type, info.mode = tarfile.DIRTYPE, 0o755
++            tar.addfile(info)
++        info = tarfile.TarInfo("graph-v7-powmod/bank/bank.json")
++        info.size, info.mode = 2, 0o644
++        tar.addfile(info, io.BytesIO(b"{}"))
++    archive = tmp_path / "local.tar.gz"
++    archive.write_bytes(raw.getvalue())
++    rel.write_text(f"url {URL}\nsha256 {hashlib.sha256(archive.read_bytes()).hexdigest()}\n")
++    old = os.umask(0o002)
++    try:
++        assets.fetch(tmp_path / "runner", rel, manifest, archive=archive)
++    finally:
++        os.umask(old)
++    modes = {p.relative_to(tmp_path / "runner").as_posix(): p.stat().st_mode & 0o777
++             for p in (tmp_path / "runner").rglob("*")}
++    assert modes == {"graph-v7-powmod": 0o755, "graph-v7-powmod/bank": 0o755, "graph-v7-powmod/bank/bank.json": 0o644}
++
++
++def test_a_failed_download_names_the_file_and_the_url(tmp_path, monkeypatch):
++    manifest, rel, _ = pinned(tmp_path, FILES)
++
++    def refuse(url, timeout):
++        raise urllib.error.URLError("no route")
++
++    monkeypatch.setattr(assets.urllib.request, "urlopen", refuse)
++    monkeypatch.setattr(assets.time, "sleep", lambda s: None)
++    with pytest.raises(assets.AssetError, match="cannot download runner-assets-x.tar.gz from " + URL):
++        assets.fetch(tmp_path / "runner", rel, manifest)
++
++
++def test_a_wrong_archive_hash_stops_before_unpacking(tmp_path, monkeypatch):
++    manifest, rel, data = pinned(tmp_path, FILES)
++    monkeypatch.setattr(assets.urllib.request, "urlopen", lambda url, timeout: Served(data + b"x"))
++    with pytest.raises(assets.AssetError, match=f"sha256 mismatch for runner-assets-x.tar.gz from {URL}"):
++        assets.fetch(tmp_path / "runner", rel, manifest)
++    assert not any((tmp_path / "runner").iterdir())
++
++
++def test_a_missing_or_changed_file_is_named(tmp_path):
++    manifest, rel, data = pinned(tmp_path, FILES, archive={"calc.tfpc": b"other"})
++    archive = tmp_path / "local.tar.gz"
++    archive.write_bytes(data)
++    with pytest.raises(assets.AssetError) as error:
++        assets.fetch(tmp_path / "runner", rel, manifest, archive=archive)
++    message = str(error.value)
++    assert "missing graph-v7-powmod/bank/bank.json" in message and "sha256 differs calc.tfpc" in message
++    assert URL in message
++
++
++def test_unsafe_archive_entries_are_refused(tmp_path):
++    link = tarfile.TarInfo("calc.tfpc.link")
++    link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
++    manifest, rel, data = pinned(tmp_path, FILES, extra=link)
++    archive = tmp_path / "local.tar.gz"
++    archive.write_bytes(data)
++    with pytest.raises(assets.AssetError, match="unsafe entry: calc.tfpc.link"):
++        assets.fetch(tmp_path / "runner", rel, manifest, archive=archive)
++
++
++def test_the_cli_reports_on_stderr_and_fails(tmp_path):
++    result = subprocess.run([sys.executable, str(HERE / "assets.py"), "fetch", "--archive", str(tmp_path / "none.tgz"),
++                             str(tmp_path / "runner")], capture_output=True, text=True)
++    assert result.returncode == 1 and result.stderr.startswith("runner assets: ")
++
++
++def test_the_pins_are_deepseek_v41_s_runner_asset_release():
++    url, digest = assets.release()
++    assert url == ("https://github.com/jayleaton/deepseek-v41-tensorfold-spark/releases/download/"
++                   "runner-assets-20261107/runner-assets-20261107.tar.gz")
++    assert digest == "b5c40d32bcab0fa896795d08aaa651d55d0574e500f3624e61db23058cdd800f"
++    pins = assets.listed()
++    assert pins["calc.tfpc"] == "3a421a2b8ba7c138c502ac205a8139ea05eeb2f7086715fe939b492ebbc18cf3"
++    assert pins["graph-v7-powmod/bank/bank.json"] == "26862f0a758af4e01a1d8c69d501ad49ee1657162b36d057b8a3c312fcf12512"
++    assert "graph-v7-powmod/bank/Qwenputer-MIT.txt" in pins

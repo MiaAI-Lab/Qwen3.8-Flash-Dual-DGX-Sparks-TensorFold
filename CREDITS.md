@@ -58,8 +58,8 @@ third-party notices that go with it (TensorFold's MIT and Apache-2.0 notices, Zi
 - **[Zig](https://ziglang.org)** by the Zig Software Foundation and the Zig contributors (MIT): the language and
   compiler TensorFold's Zig engine is written in and built with (0.17.0).
 - **Compute lanes (opt-in, `ENGINE=lanes`).**
-  - The lane engine is TensorFold's Zig engine (`LANES_REPO` @ `LANES_REF`), with this recipe's engine patches
-    0001-0008 and 0010-0012 ported in. Those are MiaAI-Lab's commits, with her authorship and her license, notice and
+  - The lane engine is upstream TensorFold's Zig engine (`LANES_REPO` @ `LANES_REF`, unmodified) plus the patches in
+    `lanes/`, which carry this recipe's engine patches 0001-0008 and 0010-0012 ported in (`lanes/` 0002-0012). Those are MiaAI-Lab's commits, with her authorship and her license, notice and
     credits kept in the engine's `LICENSES/`.
   - The port, the compute lane, the in-model runner and their binding to her engine are by Jay Leaton
     ([jayleaton](https://github.com/jayleaton)), on TensorFold by Ash Hart and the TensorFold contributors.

@@ -1,0 +1,3054 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:31:33 +0700
+Subject: [PATCH 43/79] flashnext_mia: cuda_lanes split by job (core, fill,
+ keep, rounds, costs, toy)
+
+Pure code motion under 600 lines: declarations moved whole, moved methods aliased in their struct, pub where another file now calls them.
+---
+ zig/src/families/flashnext_mia/cuda_lanes.zig | 1409 +----------------
+ .../flashnext_mia/cuda_lanes_core.zig         |  290 ++++
+ .../flashnext_mia/cuda_lanes_costs.zig        |  159 ++
+ .../flashnext_mia/cuda_lanes_fill.zig         |  284 ++++
+ .../flashnext_mia/cuda_lanes_keep.zig         |  220 +++
+ .../flashnext_mia/cuda_lanes_rounds.zig       |  296 ++++
+ .../families/flashnext_mia/cuda_lanes_toy.zig |  304 ++++
+ 7 files changed, 1560 insertions(+), 1402 deletions(-)
+ create mode 100644 zig/src/families/flashnext_mia/cuda_lanes_core.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda_lanes_costs.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda_lanes_fill.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda_lanes_keep.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda_lanes_rounds.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda_lanes_toy.zig
+
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes.zig b/zig/src/families/flashnext_mia/cuda_lanes.zig
+index b8e50d8e1..0825b1b53 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes.zig
+@@ -4,6 +4,8 @@ const envs = @import("cuda_env.zig");
+ const lanes = @import("lanes");
+ const media_mod = @import("cuda_media.zig");
+ const decode = @import("cuda_decode.zig");
++const lanes_core = @import("cuda_lanes_core.zig");
++const toy_part = @import("cuda_lanes_toy.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -17,9 +19,9 @@ pub const default_confidence = 0.70;
+ pub const draft_prior = [_]f64{ 0.82, 0.76, 0.72, 0.68, 0.65, 0.62, 0.6, 0.58, 0.56, 0.54, 0.52, 0.5, 0.5, 0.5, 0.5 };
+ 
+ /// First tokens a handle names (the prompt's draw is on the host once prefill returns).
+-const ring = 1024;
++pub const ring = 1024;
+ /// a pass keeps its state late only this close to the prompt's end (the indexer key ring holds 4096+ rows)
+-const late_keep_rows = 1024;
++pub const late_keep_rows = 1024;
+ 
+ /// Two ranks' prepare / agree / commit: local fallible steps, one gather, then collectives; `fatal` ends a split rank.
+ pub const Gate = struct {
+@@ -46,1413 +48,16 @@ pub const CacheHooks = struct {
+     budget: u64,
+ };
+ 
+-pub fn Lanes(comptime E: type) type {
+-    return struct {
+-        const Self = @This();
+-        /// the engine's sequence handle, as newSeq returns it
+-        const SeqPtr = @typeInfo(@typeInfo(@TypeOf(E.newSeq)).@"fn".return_type.?).error_union.payload;
+-
+-        /// prefillWith's result and its kept state (cuda_engine's Prefilled / Snapshot)
+-        const Prefilled = @typeInfo(@typeInfo(@TypeOf(E.prefillWith)).@"fn".return_type.?).error_union.payload;
+-        const SnapPtr = @typeInfo(@FieldType(Prefilled, "kept")).optional.child;
+-        /// the engine's prompt fill (fillBegin / fillStep / fillFree), when it has one
+-        const FillPtr = if (@hasDecl(E, "fillBegin")) @typeInfo(@typeInfo(@TypeOf(E.fillBegin)).@"fn".return_type.?).error_union.payload else *anyopaque;
+-
+-        /// A kept prompt state: engine snapshot at `at` plus a keeper sequence; `key` is rank 0's address of it.
+-        pub const Kept = struct {
+-            snap: SnapPtr,
+-            keeper: ?SeqPtr,
+-            at: u32,
+-            bytes: u64,
+-            key: u64 = 0,
+-            src: ?SeqPtr = null,
+-            broken: bool = false,
+-        };
+-
+-        const Tentative = struct { at: u32, kept: *Kept, adopted: bool = false };
+-
+-        const Lane = struct {
+-            seq: SeqPtr,
+-            /// the last verify's uncommitted rows of this stream (kept only on drops; a shared round drafts first)
+-            pending_rows: ?usize = null,
+-            /// this stream's window in the round `round` (the engine's sampleWindow / commitWindow index)
+-            index: usize = 0,
+-            round: u64 = 0,
+-            held: [max_drafts]u32 = undefined,
+-            held_n: usize = 0,
+-            /// the caches of this stream's whole window, reserved at admission (the guaranteed class)
+-            reserved: usize = 0,
+-            /// the prompt filling between rounds (sliced fills), null once it is in
+-            fill: ?Filling = null,
+-            /// the first token's handle of a burst's prompt (firstFn gives it once; else the last one taken)
+-            first: ?u64 = null,
+-        };
+-
+-        /// A prompt filling in slices: the engine fill of the current segment, its resume state and the pass position.
+-        const Filling = struct {
+-            fl: FillPtr,
+-            cur: ?SnapPtr = null,
+-            owned: bool = false,
+-            at: usize = 0,
+-            final: bool = false,
+-        };
+-
+-        gpa: std.mem.Allocator,
+-        e: *E,
+-        drafting: bool,
+-        context: usize,
+-        /// a window's rows at most: the engine's depth + 1 (its buffers' rows and the kernel set's windows)
+-        window: usize,
+-        /// streams a shared forward holds (--parallel; the engine's Options.streams)
+-        streams: usize = 1,
+-        confidence: f64 = default_confidence,
+-        /// running product (confidence < 0) while at most this many streams draft, per-draft `wide_confidence` above
+-        product_streams: usize = std.math.maxInt(usize),
+-        wide_confidence: f64 = 0.5,
+-        gate: ?Gate = null,
+-        /// admit only if the window's caches fit the budget; `overcommit` (TF_FLASHNEXT_OVERCOMMIT=1) uses free now
+-        overcommit: bool = false,
+-        reserved: usize = 0,
+-        /// kept prompt states: every live one (the store's), the last pass's not yet adopted ones, their bytes
+-        kept: std.ArrayList(*Kept) = .empty,
+-        tentative: std.ArrayList(Tentative) = .empty,
+-        kept_bytes: u64 = 0,
+-        /// the prompt cache's budget on this rank (cuda_native.cacheBudget; snap_ready hands f212's store this much)
+-        cache_budget: u64 = 0,
+-        /// keep a pass's last state late, after the first token (TF_FLASHNEXT_KEEP_LATE=0 off; the copy is the same)
+-        late_keep: bool = true,
+-        late: std.ArrayList(*Kept) = .empty,
+-        /// rank 1 at two ranks: the last pass's kept states wait for rank 0's note of which the store took
+-        follower: bool = false,
+-        /// rank 0 at two ranks: where the store's decisions go to rank 1 (cuda_mirror's Leader.note)
+-        notes: ?Notes = null,
+-        /// prompts fill in slices between rounds (prefill_begin / prefill_step), `fill_layers` layers a step
+-        sliced: bool = false,
+-        fill_layers: usize = 8,
+-        lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
+-        /// the last verify's lanes whose windows wait for their commits: committed before the next forward
+-        opened: std.ArrayList(*Lane) = .empty,
+-        round: u64 = 0,
+-        drawn: [ring]u32 = undefined,
+-        next: u64 = 0,
+-        costs: [max_rows]lanes.config.Cost = undefined,
+-        cost_count: usize = 0,
+-        shared: [shared_points]lanes.config.Cost = undefined,
+-        shared_count: usize = 0,
+-        mtp_ms: f64 = 0,
+-
+-        pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
+-            const late = if (envs.get("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, v, "0") else true;
+-            return .{ .gpa = gpa, .e = e, .drafting = drafting, .context = context, .window = @max(1, @min(window, max_rows)), .late_keep = late };
+-        }
+-
+-        pub fn deinit(self: *Self) void {
+-            var it = self.lanes.valueIterator();
+-            while (it.next()) |l| {
+-                self.stopFill(l.*);
+-                self.e.freeSeq(l.*.seq);
+-                self.gpa.destroy(l.*);
+-            }
+-            self.lanes.deinit(self.gpa);
+-            self.opened.deinit(self.gpa);
+-            self.dropTentative();
+-            self.tentative.deinit(self.gpa);
+-            for (self.kept.items) |k| self.freeKept(k);
+-            self.kept.deinit(self.gpa);
+-            self.late.deinit(self.gpa);
+-        }
+-
+-        pub fn backend(self: *Self) be.Backend {
+-            if (@hasDecl(E, "fillBegin") and self.sliced) return .{ .ptr = self, .vtable = &.{
+-                .prefill = prefillFn,
+-                .first = firstFn,
+-                .queue = queueFn,
+-                .read = readFn,
+-                .verify = verifyFn,
+-                .keep = keepFn,
+-                .draft = draftFn,
+-                .tree = heldFn,
+-                .release = releaseFn,
+-                .prefill_step = fillStepFn,
+-            } };
+-            return .{ .ptr = self, .vtable = &.{
+-                .prefill = prefillFn,
+-                .first = firstFn,
+-                .queue = queueFn,
+-                .read = readFn,
+-                .verify = verifyFn,
+-                .keep = keepFn,
+-                .draft = draftFn,
+-                .tree = heldFn,
+-                .release = releaseFn,
+-                .prefill_many = if (@hasDecl(E, "prefillMany")) prefillManyFn else null,
+-            } };
+-        }
+-
+-        // -- prompts filling between rounds (the lanes core's prefill_begin / prefill_step) --------------------
+-
+-        /// f212's prefill_step: the first call begins the fill, each steps it `fill_layers` layers; true once in.
+-        fn fillStepFn(ptr: *anyopaque, s: *lanes.Stream, cap: u32) anyerror!bool {
+-            _ = cap;
+-            const self = of(ptr);
+-            if (self.lanes.get(s) == null) try prefillBeginFn(ptr, s);
+-            var state: [1]FillState = .{.filling};
+-            try prefillStepFn(ptr, &.{s}, &state);
+-            return state[0] == .done;
+-        }
+-
+-        /// The prefill's admission and agreements, its resume made, the first segment's fill started.
+-        fn prefillBeginFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+-            const self = of(ptr);
+-            self.fillLate();
+-            const e = self.e;
+-            const a = self.admit(s, 0) catch |err| {
+-                try self.agree(err);
+-                unreachable;
+-            };
+-            try self.agree(null);
+-            const l = self.makeLane(s, a) catch |err| return self.lost("a prompt's sequence", err);
+-            const requested = s.reuse.at > 0;
+-            var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
+-            if (requested) {
+-                if (!(try self.agreeOn(from != null))) from = null;
+-            }
+-            var f: Filling = .{ .fl = undefined };
+-            if (from) |k| {
+-                e.copyPrefix(l.seq, k.keeper.?, k.snap.pos, k.snap.mtp_len) catch |err| {
+-                    self.dropLane(s, l);
+-                    return self.lost("a prompt's resume", err);
+-                };
+-                f.cur = k.snap;
+-                f.at = k.snap.pos;
+-            }
+-            s.cached = @intCast(f.at);
+-            s.reuse_failed = requested and from == null;
+-            self.dropTentative();
+-            self.startSegment(s, l, &f) catch |err| {
+-                self.dropLane(s, l);
+-                // a media attachment both ranks refused together (memory, bad rows): this request fails, not the server
+-                if (err == error.MediaRefused) return err;
+-                return self.lost("a prompt's fill", err);
+-            };
+-            l.fill = f;
+-        }
+-
+-        /// The next segment's fill: up to the next mark (its state kept there), else to the prompt's end.
+-        fn startSegment(self: *Self, s: *lanes.Stream, l: *Lane, f: *Filling) !void {
+-            const ids = s.prompt();
+-            const next_mark: ?u32 = for (s.reuse.marks) |m| {
+-                if (m > f.at and m < ids.len) break m;
+-            } else null;
+-            if (next_mark) |m| {
+-                f.fl = try self.e.fillBegin(l.seq, ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = f.cur });
+-                f.final = false;
+-            } else {
+-                f.fl = try self.e.fillBegin(l.seq, ids, s.sampling, .{ .resume_from = f.cur, .media = media_mod.of(s) });
+-                f.final = true;
+-            }
+-        }
+-
+-        /// `fill_layers` more layers of every filling prompt; segments keep their marks, a done prompt draws `first`.
+-        fn prefillStepFn(ptr: *anyopaque, streams: []const *lanes.Stream, states: []FillState) anyerror!void {
+-            const self = of(ptr);
+-            self.fillLate();
+-            try self.agree(null); // nothing to prepare: the ranks only meet before the slices' collectives
+-            for (streams, states) |s, *st| {
+-                const l = self.lanes.get(s) orelse return error.UnknownStream;
+-                const f = &(l.fill orelse return error.NotFilling);
+-                const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
+-                if (!done) continue;
+-                if (!f.final) {
+-                    const m: u32 = @intCast(f.fl.prompt.len);
+-                    const snap = f.fl.kept orelse return self.lost("a prompt's fill", error.NoStateKept);
+-                    f.fl.kept = null; // the pass's now
+-                    self.e.fillFree(f.fl);
+-                    if (f.owned) self.e.freeSnapshot(f.cur.?);
+-                    f.cur = snap;
+-                    f.owned = true;
+-                    if (self.keep(l, snap, m)) |k| {
+-                        f.owned = false;
+-                        self.tentative.append(self.gpa, .{ .at = m, .kept = k }) catch |err| return self.lost("a prompt's fill", err);
+-                    } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
+-                    if (s.reuse.hook) |h| h.at(h.ptr, s, m);
+-                    f.at = m;
+-                    self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
+-                    continue;
+-                }
+-                _ = self.take(f.fl.first);
+-                self.e.fillFree(f.fl);
+-                if (f.owned) self.e.freeSnapshot(f.cur.?);
+-                l.fill = null;
+-                self.endPass();
+-                st.* = .done;
+-            }
+-        }
+-
+-        fn stopFill(self: *Self, l: *Lane) void {
+-            if (comptime !@hasDecl(E, "fillBegin")) return; // an engine without fills never starts one
+-            const f = l.fill orelse return;
+-            self.e.fillFree(f.fl);
+-            if (f.owned) self.e.freeSnapshot(f.cur.?);
+-            l.fill = null;
+-        }
+-
+-        /// Round loop setup facts: windows up to `window` rows (16 max), `streams` per forward, this GPU's costs.
+-        pub fn facts(self: *const Self) lanes.Model {
+-            const many = self.streams > 1;
+-            return .{
+-                .exact_width = if (self.drafting) @intCast(self.window) else 1,
+-                .gpu_tokens = false,
+-                .mtp = self.drafting,
+-                .speculate = self.drafting,
+-                .speculate_early = false,
+-                .draft_prior = &draft_prior,
+-                .drafts = @intCast(self.window - 1),
+-                .window_costs = self.costs[0..self.cost_count],
+-                .mtp_step_ms = self.mtp_ms,
+-                .streams_exact = true,
+-                .hidden_rows = many,
+-                .batch_rows = @intCast(self.streams * self.window),
+-                .max_streams = @intCast(self.streams),
+-                .shared_costs = self.shared[0..self.shared_count],
+-                .draft_streams = many,
+-                // the running-product rule (confidence < 0) stops each chain itself: the round loop asks the most
+-                .draft_stops = self.drafting and self.confidence < 0,
+-                .draft_stops_most = @intCast(@min(self.product_streams, std.math.maxInt(u32))),
+-                // each sequence keeps its prompt's last streams until its first drafts: joiners draft together
+-                .join_batch = self.drafting,
+-            };
+-        }
+-
+-        /// The lane, its sequence bound and its stream's sampling set.
+-        fn lane(self: *Self, s: *const lanes.Stream) !*Lane {
+-            const l = self.lanes.get(s) orelse return error.UnknownStream;
+-            self.e.bind(l.seq);
+-            if (@hasDecl(E, "setSampling")) self.e.setSampling(s.sampling);
+-            return l;
+-        }
+-
+-        /// Commits every still-uncommitted window of the last verify whole before the next forward overwrites its rows.
+-        fn settle(self: *Self) !void {
+-            defer self.opened.clearRetainingCapacity();
+-            for (self.opened.items) |o| {
+-                const rows = o.pending_rows orelse continue;
+-                o.pending_rows = null;
+-                try self.e.commitWindow(o.index, rows);
+-            }
+-        }
+-
+-        /// Every rank's prepare done: return this rank's error, or error.OtherRankFailed, before any collective.
+-        fn agree(self: *Self, failed: ?anyerror) !void {
+-            if (self.gate) |g| {
+-                const all = g.agree(g.ptr, failed == null) catch |e| {
+-                    g.fatal(g.ptr, "the ranks' agreement", e);
+-                    return e;
+-                };
+-                if (!all) return failed orelse error.OtherRankFailed;
+-            }
+-            if (failed) |e| return e;
+-        }
+-
+-        /// An engine call failed after the agreement: with two ranks this one leaves (they may be apart now).
+-        fn lost(self: *Self, what: []const u8, err: anyerror) anyerror {
+-            if (self.gate) |g| g.fatal(g.ptr, what, err);
+-            return err;
+-        }
+-
+-        fn take(self: *Self, token: u32) u64 {
+-            const h = self.next;
+-            self.drawn[h % ring] = token;
+-            self.next += 1;
+-            return h;
+-        }
+-
+-        fn value(self: *const Self, feed: be.Feed) u32 {
+-            return switch (feed) {
+-                .handle => |h| self.drawn[h % ring],
+-                .value => |v| v,
+-            };
+-        }
+-
+-        fn of(ptr: *anyopaque) *Self {
+-            return @ptrCast(@alignCast(ptr));
+-        }
+-
+-        // -- the vtable -----------------------------------------------------------------------------------------
+-
+-        /// A new sequence for the stream, its prompt, and the first draw at the prompt's length with its sampling.
+-        fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+-            const self = of(ptr);
+-            self.fillLate();
+-            const e = self.e;
+-            const a = self.admit(s, 0) catch |err| {
+-                try self.agree(err);
+-                unreachable;
+-            };
+-            try self.agree(null);
+-            const l = self.makeLane(s, a) catch |err| return self.lost("a prompt's sequence", err);
+-            // a resume both ranks can make (each holds the state), else both prefill from the start
+-            const requested = s.reuse.at > 0;
+-            var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
+-            if (requested) {
+-                if (!(try self.agreeOn(from != null))) from = null;
+-            }
+-            e.bind(l.seq);
+-            const first = self.pass(s, l, from) catch |err| {
+-                self.dropLane(s, l);
+-                if (err == error.MediaRefused) return err;
+-                return self.lost("a prompt's prefill", err);
+-            };
+-            _ = self.take(first);
+-        }
+-
+-        /// A prompt burst: admit all first (a refusal: false, prefill singly), then share prefillMany passes.
+-        fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+-            const self = of(ptr);
+-            if (comptime !@hasDecl(E, "prefillMany")) return false;
+-            const e = self.e;
+-            if (ss.len < 2 or ss.len > max_rows) return false;
+-            // an image or video prompt prefills alone (attachMedia, the MODE 2 prompt rows)
+-            for (ss) |s| if (s.reuse.at > 0 or s.reuse.marks.len > 0 or media_mod.of(s) != null) return false;
+-            var ls: [max_rows]*Lane = undefined;
+-            var adm: [max_rows]Admission = undefined;
+-            var admitted: usize = 0;
+-            var ahead: usize = 0; // the burst's earlier streams' reservations, not made yet
+-            var failure: ?anyerror = null;
+-            for (ss) |s| {
+-                adm[admitted] = self.admit(s, ahead) catch |err| {
+-                    failure = err;
+-                    break;
+-                };
+-                ahead += adm[admitted].need;
+-                admitted += 1;
+-            }
+-            self.agree(failure) catch return false;
+-            var made: usize = 0;
+-            for (ss, adm[0..ss.len]) |s, a| {
+-                ls[made] = self.makeLane(s, a) catch |err| return self.burstLost(ss, ls[0..made], err);
+-                made += 1;
+-            }
+-            for (ss) |s| {
+-                s.cached = 0;
+-                s.reuse_failed = false;
+-            }
+-            self.dropTentative();
+-            var i: usize = 0;
+-            while (i < ss.len) {
+-                var j = i;
+-                var rows: usize = 0;
+-                while (j < ss.len and rows + ss[j].prompt().len <= e.prefill_rows) : (j += 1) rows += ss[j].prompt().len;
+-                if (j - i >= 2) {
+-                    var items: [max_rows]E.ManyPrompt = undefined;
+-                    for (items[0 .. j - i], ss[i..j], ls[i..j]) |*it, s, l| it.* = .{ .seq = l.seq, .prompt = s.prompt(), .sampling = s.sampling };
+-                    if (e.manyFit(items[0 .. j - i])) {
+-                        var firsts: [max_rows]u32 = undefined;
+-                        e.prefillMany(items[0 .. j - i], &firsts) catch |err| return self.burstLost(ss, ls[0..made], err);
+-                        for (ls[i..j], firsts[0 .. j - i]) |l, f| l.first = self.take(f);
+-                        i = j;
+-                        continue;
+-                    }
+-                }
+-                e.bind(ls[i].seq);
+-                const r = e.prefillWith(ss[i].prompt(), ss[i].sampling, .{}) catch |err| return self.burstLost(ss, ls[0..made], err);
+-                ls[i].first = self.take(r.first);
+-                i += 1;
+-            }
+-            self.endPass();
+-            return true;
+-        }
+-
+-        fn burstLost(self: *Self, ss: []const *lanes.Stream, ls: []*Lane, err: anyerror) anyerror {
+-            for (ss[0..ls.len], ls) |s, l| self.dropLane(s, l);
+-            return self.lost("a burst's prefill", err);
+-        }
+-
+-        /// The prompt pass from a kept state or 0, cut at each mark to keep a tentative state, then to the end.
+-        fn pass(self: *Self, s: *lanes.Stream, l: *Lane, from: ?*Kept) !u32 {
+-            const e = self.e;
+-            const ids = s.prompt();
+-            var cur: ?SnapPtr = null; // the state the next segment resumes
+-            var owned = false; // `cur` is this pass's own (no Kept holds it)
+-            defer if (owned) e.freeSnapshot(cur.?);
+-            var at: usize = 0;
+-            if (from) |k| {
+-                try e.copyPrefix(l.seq, k.keeper.?, k.snap.pos, k.snap.mtp_len);
+-                cur = k.snap;
+-                at = k.snap.pos;
+-            }
+-            s.cached = @intCast(at);
+-            s.reuse_failed = s.reuse.at > 0 and from == null;
+-            self.dropTentative();
+-            // TF_FLASHNEXT_PASS_TIMES=1: each part's wall time (the stream drained at each edge), in the log
+-            const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
+-            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
+-            var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
+-            var parts: [3]f64 = @splat(0); // to the marks, keeping, the rest
+-            for (s.reuse.marks) |m| {
+-                if (m <= at or m >= ids.len) continue;
+-                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = cur });
+-                if (times) parts[0] += passSince(e, &t_last);
+-                if (owned) e.freeSnapshot(cur.?);
+-                cur = r.kept.?;
+-                owned = true;
+-                // late only the pass's last mark: the source's rows and key ring stay until the next call
+-                const last = for (s.reuse.marks) |n| {
+-                    if (n > m and n < ids.len) break false;
+-                } else true;
+-                const late = self.late_keep and last and ids.len - m <= late_keep_rows;
+-                if (self.keepAt(l, cur.?, m, late)) |k| {
+-                    owned = false; // the Kept holds it now
+-                    try self.tentative.append(self.gpa, .{ .at = m, .kept = k });
+-                } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
+-                if (s.reuse.hook) |h| h.at(h.ptr, s, m);
+-                at = m;
+-                if (times) parts[1] += passSince(e, &t_last);
+-            }
+-            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = cur, .media = media_mod.of(s) });
+-            self.endPass();
+-            if (times) {
+-                parts[2] = passSince(e, &t_last);
+-                std.log.info("pass times: {d} tokens from {d}, marks {any}: to the marks {d:.1} ms, keeping {d:.1} ms, the rest {d:.1} ms", .{ ids.len, s.cached, s.reuse.marks, parts[0], parts[1], parts[2] });
+-            }
+-            return r.first;
+-        }
+-
+-        /// A tentative Kept of the pass at `at`: a keeper sequence takes the prompt's first `at` rows.
+-        fn keep(self: *Self, l: *Lane, snap: SnapPtr, at: u32) !*Kept {
+-            return self.keepAt(l, snap, at, false);
+-        }
+-
+-        fn keepAt(self: *Self, l: *Lane, snap: SnapPtr, at: u32, late: bool) !*Kept {
+-            const e = self.e;
+-            if (late) {
+-                const k = try self.gpa.create(Kept);
+-                errdefer self.gpa.destroy(k);
+-                k.* = .{ .snap = snap, .keeper = null, .src = l.seq, .at = at, .bytes = self.footprint(at) };
+-                k.key = @intFromPtr(k);
+-                try self.late.append(self.gpa, k);
+-                self.kept_bytes += k.bytes;
+-                return k;
+-            }
+-            const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
+-            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
+-            var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
+-            const keeper = try e.newSeq(at + 1);
+-            errdefer e.freeSeq(keeper);
+-            const t_new = if (times) passSince(e, &t_last) else 0;
+-            try e.copyPrefix(keeper, l.seq, at, snap.mtp_len);
+-            if (times) std.log.info("keep at {d}: new sequence {d:.1} ms, copy {d:.1} ms", .{ at, t_new, passSince(e, &t_last) });
+-            // the keeper now holds `at` rows: say so, or a later copyPrefix from it refuses (PrefixPastSource)
+-            if (@hasField(E, "f")) {
+-                try e.f.setPos(&keeper.st, at);
+-                try e.f.setMtpLen(&keeper.st, snap.mtp_len);
+-            }
+-            const k = try self.gpa.create(Kept);
+-            k.* = .{ .snap = snap, .keeper = keeper, .at = at, .bytes = self.footprint(at) };
+-            k.key = @intFromPtr(k);
+-            self.kept_bytes += k.bytes;
+-            return k;
+-        }
+-
+-        /// Fills late Kepts' keepers at the start of collective calls; rank 1 follows rank 0's order and adopt note.
+-        fn fillLate(self: *Self) void {
+-            if (self.late.items.len == 0) return;
+-            const e = self.e;
+-            for (self.late.items) |k| {
+-                const src = k.src orelse continue;
+-                k.src = null;
+-                const keeper = e.newSeq(k.at + 1) catch |err| {
+-                    k.broken = true;
+-                    std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k.at, @errorName(err) });
+-                    continue;
+-                };
+-                e.copyPrefix(keeper, src, k.at, k.snap.mtp_len) catch |err| {
+-                    e.freeSeq(keeper);
+-                    k.broken = true;
+-                    std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k.at, @errorName(err) });
+-                    continue;
+-                };
+-                if (@hasField(E, "f")) {
+-                    e.f.setPos(&keeper.st, k.at) catch {};
+-                    e.f.setMtpLen(&keeper.st, k.snap.mtp_len) catch {};
+-                }
+-                k.keeper = keeper;
+-            }
+-            self.late.clearRetainingCapacity();
+-        }
+-
+-        fn freeKept(self: *Self, k: *Kept) void {
+-            self.kept_bytes -= k.bytes;
+-            if (std.mem.indexOfScalar(*Kept, self.late.items, k)) |i| _ = self.late.orderedRemove(i);
+-            if (k.keeper) |kp| self.e.freeSeq(kp);
+-            self.e.freeSnapshot(k.snap);
+-            self.gpa.destroy(k);
+-        }
+-
+-        /// Pass end: rank 0 frees what the store did not adopt and tells rank 1, which keeps them all until that note.
+-        fn endPass(self: *Self) void {
+-            if (self.follower) return;
+-            if (self.notes) |n| if (self.tentative.items.len > 0) {
+-                var buf: [1 + 4 + 64 * 12]u8 = undefined;
+-                var len: usize = 5;
+-                buf[0] = @backingInt(Note.pass);
+-                var count: u32 = 0;
+-                for (self.tentative.items) |t| if (t.adopted and len + 12 <= buf.len) {
+-                    std.mem.writeInt(u32, buf[len..][0..4], t.at, .little);
+-                    std.mem.writeInt(u64, buf[len + 4 ..][0..8], t.kept.key, .little);
+-                    len += 12;
+-                    count += 1;
+-                };
+-                std.mem.writeInt(u32, buf[1..5], count, .little);
+-                n.send(n.ptr, buf[0..len]);
+-            };
+-            self.dropTentative();
+-        }
+-
+-        /// The last pass's states the store did not adopt.
+-        fn dropTentative(self: *Self) void {
+-            for (self.tentative.items) |t| if (!t.adopted) self.freeKept(t.kept);
+-            self.tentative.clearRetainingCapacity();
+-        }
+-
+-        fn keptOf(self: *Self, saved: ?*anyopaque) ?*Kept {
+-            const p = saved orelse return null;
+-            for (self.kept.items) |k| if (@as(*anyopaque, @ptrCast(k)) == p) return if (k.keeper == null) null else k;
+-            return null;
+-        }
+-
+-        /// Both ranks' answer to a yes/no both must share (one rank: its own).
+-        fn agreeOn(self: *Self, ok: bool) !bool {
+-            const g = self.gate orelse return ok;
+-            return g.agree(g.ptr, ok) catch |e| {
+-                g.fatal(g.ptr, "the ranks' agreement", e);
+-                return e;
+-            };
+-        }
+-
+-        // -- the prompt cache's family (core/prompt_cache.zig Snapshots; native/cuda.zig makes the Store) ------
+-
+-        pub fn cacheHooks(self: *Self, cache_budget: u64) CacheHooks {
+-            return .{ .ptr = self, .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .budget = cache_budget };
+-        }
+-
+-        pub fn bytesFn(ptr: *anyopaque, at: u32) u64 {
+-            return of(ptr).footprint(at);
+-        }
+-
+-        /// The store keeps the pass's state at `at`: the tentative Kept made there.
+-        pub fn saveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+-            _ = owner;
+-            const self = of(ptr);
+-            for (self.tentative.items) |*t| if (t.at == at and !t.adopted) {
+-                t.adopted = true;
+-                try self.kept.append(self.gpa, t.kept);
+-                return t.kept;
+-            };
+-            return error.NoStateKept;
+-        }
+-
+-        /// The backend restores inside its pass (LaneHost's lookup, not begin).
+-        pub fn restoreFn(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
+-            return error.RestoredInThePass;
+-        }
+-
+-        pub fn dropFn(ptr: *anyopaque, saved: *anyopaque) void {
+-            const self = of(ptr);
+-            const k = self.keptOf(saved) orelse return;
+-            // Store.keep may evict a Kept this pass made before rank 1 adopted it: unadopt it so endPass frees it
+-            for (self.tentative.items) |*t| if (t.kept == k and t.adopted) {
+-                t.adopted = false;
+-                if (std.mem.indexOfScalar(*Kept, self.kept.items, k)) |i| _ = self.kept.swapRemove(i);
+-                return;
+-            };
+-            if (self.notes) |n| {
+-                var buf: [9]u8 = undefined;
+-                buf[0] = @backingInt(Note.drop);
+-                std.mem.writeInt(u64, buf[1..9], k.key, .little);
+-                n.send(n.ptr, &buf);
+-            }
+-            self.forgetKept(k);
+-        }
+-
+-        fn forgetKept(self: *Self, k: *Kept) void {
+-            if (std.mem.indexOfScalar(*Kept, self.kept.items, k)) |i| _ = self.kept.swapRemove(i);
+-            self.freeKept(k);
+-        }
+-
+-        // -- rank 1: rank 0's prompt cache decisions ----------------------------------------------------------
+-
+-        /// A note of rank 0's store (cuda_mirror carries it): the last pass's adopted states, or a dropped one.
+-        pub fn applyNote(self: *Self, bytes: []const u8) !void {
+-            if (bytes.len == 0) return error.BadNote;
+-            switch (@as(Note, @fromBackingInt(bytes[0]))) {
+-                .pass => {
+-                    if (bytes.len < 5) return error.BadNote;
+-                    const n = std.mem.readInt(u32, bytes[1..5], .little);
+-                    if (bytes.len != 5 + 12 * @as(usize, n)) return error.BadNote;
+-                    for (0..n) |i| {
+-                        const at = std.mem.readInt(u32, bytes[5 + 12 * i ..][0..4], .little);
+-                        const key = std.mem.readInt(u64, bytes[9 + 12 * i ..][0..8], .little);
+-                        for (self.tentative.items) |*t| if (t.at == at and !t.adopted) {
+-                            t.adopted = true;
+-                            t.kept.key = key;
+-                            try self.kept.append(self.gpa, t.kept);
+-                            break;
+-                        };
+-                    }
+-                    self.dropTentative();
+-                },
+-                .drop => {
+-                    if (bytes.len != 9) return error.BadNote;
+-                    const key = std.mem.readInt(u64, bytes[1..9], .little);
+-                    for (self.kept.items) |k| if (k.key == key) return self.forgetKept(k);
+-                },
+-                _ => return error.BadNote,
+-            }
+-        }
+-
+-        /// Rank 1's own state for rank 0's key (null: it holds none; the resume then runs from 0 on both).
+-        pub fn savedFor(self: *Self, key: u64) ?*anyopaque {
+-            for (self.kept.items) |k| if (k.key == key) return k;
+-            return null;
+-        }
+-
+-        /// An admitted prompt's window and reservation (admit), for its lane (makeLane).
+-        const Admission = struct { limit: usize, need: usize, before: usize };
+-
+-        /// Local prefill admission (no collective); ranks agree before makeLane so none waits alone in a collective.
+-        fn admit(self: *Self, s: *lanes.Stream, ahead: usize) !Admission {
+-            const ids = s.prompt();
+-            const limit = ids.len + s.max_new + self.window;
+-            if (ids.len == 0 or limit > self.context) return error.PromptTooLong;
+-            // an image or video prompt also holds its rotary table and features while it fills (attachMedia)
+-            const media_bytes: usize = if (media_mod.of(s)) |m| std.mem.alignForward(usize, ids.len * 12, 256) + std.mem.alignForward(usize, m.featureBytes(), 256) else 0;
+-            const need = self.footprint(limit) + media_bytes;
+-            const before = if (self.lanes.get(s)) |old| old.reserved else 0;
+-            if (!self.overcommit and self.reserved - before + ahead + need + self.kept_bytes > self.budget()) return error.NoRoom;
+-            return .{ .limit = limit, .need = need, .before = before };
+-        }
+-
+-        /// The agreed prefill's steps: the last round's commits, the stream's lane and a new sequence.
+-        fn makeLane(self: *Self, s: *lanes.Stream, a: Admission) !*Lane {
+-            const e = self.e;
+-            const limit = a.limit;
+-            const need = a.need;
+-            const before = a.before;
+-            try self.settle();
+-            const l = if (self.lanes.get(s)) |old| blk: {
+-                e.freeSeq(old.seq);
+-                break :blk old;
+-            } else blk: {
+-                const l = try self.gpa.create(Lane);
+-                errdefer self.gpa.destroy(l);
+-                try self.lanes.put(self.gpa, s, l);
+-                break :blk l;
+-            };
+-            self.reserved -= before;
+-            l.* = .{ .seq = e.newSeq(limit) catch |err| {
+-                _ = self.lanes.remove(s);
+-                self.gpa.destroy(l);
+-                return err;
+-            } };
+-            l.reserved = need;
+-            self.reserved += need;
+-            return l;
+-        }
+-
+-        /// A stream's caches at its whole window (the engine's seqBytes; 0 for an engine that does not say).
+-        fn footprint(self: *const Self, rows: usize) usize {
+-            return if (@hasDecl(E, "seqBytes")) self.e.seqBytes(rows) else 0;
+-        }
+-
+-        /// The bytes the sequences' caches may take on this rank (the engine's budget; unbounded without one).
+-        pub fn budget(self: *const Self) usize {
+-            return if (@hasField(E, "budget")) self.e.budget.limit else std.math.maxInt(usize);
+-        }
+-
+-        fn dropLane(self: *Self, s: *const lanes.Stream, l: *Lane) void {
+-            for (self.late.items) |k| if (k.src == l.seq) {
+-                k.src = null;
+-                k.broken = true;
+-            };
+-            _ = self.lanes.remove(s);
+-            self.stopFill(l);
+-            self.reserved -= l.reserved;
+-            self.forget(l);
+-            self.e.freeSeq(l.seq);
+-            self.gpa.destroy(l);
+-        }
+-
+-        fn forget(self: *Self, l: *Lane) void {
+-            for (self.opened.items, 0..) |o, i| if (o == l) {
+-                _ = self.opened.swapRemove(i);
+-                return;
+-            };
+-        }
+-
+-        fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+-            const self = of(ptr);
+-            if (position != s.prompt_len) return error.PositionMismatch;
+-            if (self.lanes.get(s)) |l| if (l.first) |h| {
+-                l.first = null;
+-                return h;
+-            };
+-            if (self.next == 0) return error.NoFirstToken;
+-            return self.next - 1;
+-        }
+-
+-        fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
+-            _ = .{ ptr, s, feed, position };
+-            return error.NotPipelined;
+-        }
+-
+-        fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
+-            const self = of(ptr);
+-            if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
+-            return self.drawn[handle % ring];
+-        }
+-
+-        /// Every stream's window in one forward, each row drawn at its position; extra held drafts cost rows, not bits.
+-        fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
+-            const self = of(ptr);
+-            self.fillLate();
+-            var ids: [max_streams][max_rows]u32 = undefined;
+-            var wins: [max_streams]E.Window = undefined;
+-            var ls: [max_streams]*Lane = undefined;
+-            self.prepareVerify(windows, &ids, &wins, &ls) catch |err| {
+-                try self.agree(err);
+-                unreachable;
+-            };
+-            try self.agree(null);
+-            const e = self.e;
+-            const n = windows.len;
+-            e.verifyMany(wins[0..n]) catch |err| return self.lost("a round's forward", err);
+-            self.round += 1;
+-            for (windows, out, ls[0..n], 0..) |w, o, l, i| {
+-                const rows = w.rows();
+-                e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows]) catch |err| return self.lost("a window's draws", err);
+-                @memcpy(o.drafts[0 .. rows - 1], ids[i][1..rows]);
+-                l.held_n = 0;
+-                l.pending_rows = rows;
+-                l.index = i;
+-                l.round = self.round;
+-                self.opened.append(self.gpa, l) catch |err| return self.lost("a window's bookkeeping", err);
+-            }
+-        }
+-
+-        /// The windows' checks and rows, the last round committed.
+-        fn prepareVerify(self: *Self, windows: []const be.Window, ids: *[max_streams][max_rows]u32, wins: *[max_streams]E.Window, ls: *[max_streams]*Lane) !void {
+-            if (windows.len == 0 or windows.len > self.streams) return error.TooManyStreams;
+-            try self.opened.ensureTotalCapacity(self.gpa, windows.len);
+-            try self.settle();
+-            for (windows, 0..) |w, i| {
+-                if (w.parents != null) return error.TreesNotBuilt;
+-                const rows = w.rows();
+-                if (rows > self.window) return error.WindowTooWide;
+-                const l = try self.lane(w.stream);
+-                for (windows[0..i]) |v| if (v.stream == w.stream) return error.StreamTwiceInRound;
+-                for (w.positions, 0..) |p, r| if (p != self.e.pos() + 1 + r) return error.PositionMismatch;
+-                ids[i][0] = w.pending;
+-                for (ids[i][1..][0..w.held], 0..) |*d, j| d.* = if (j < l.held_n) l.held[j] else if (l.held_n > 0) l.held[l.held_n - 1] else w.pending;
+-                @memcpy(ids[i][1 + w.held ..][0..w.tokens.len], w.tokens);
+-                wins[i] = .{ .seq = l.seq, .tokens = ids[i][0..rows] };
+-                ls[i] = l;
+-            }
+-        }
+-
+-        /// Each window keeps its path's rows (a window its draft already committed is left as it is).
+-        fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+-            const self = of(ptr);
+-            if (windows.len != paths.len) return error.PathsWindowsMismatch;
+-            for (windows, paths) |w, path| {
+-                if (path.len == 0) return error.EmptyPath;
+-                for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
+-                const l = self.lanes.get(w.stream) orelse return error.UnknownStream;
+-                const rows = l.pending_rows orelse continue;
+-                if (path.len > rows) return error.PathTooLong;
+-                l.pending_rows = null;
+-                // a commit runs no collective, but a failed one leaves this rank's caches apart from the other's
+-                self.e.commitWindow(l.index, path.len) catch |err| return self.lost("a window's commit", err);
+-            }
+-        }
+-
+-        /// Heads absorb each request's kept rows, then chain up to `depth` drafts in shared steps; `tree` gets counts.
+-        fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+-            const self = of(ptr);
+-            self.fillLate();
+-            self.prepareDraft(requests) catch |err| {
+-                try self.agree(err);
+-                unreachable;
+-            };
+-            try self.agree(null);
+-            const e = self.e;
+-            var reqs: [max_streams]E.DraftReq = undefined;
+-            var firsts: [max_streams][1]u32 = undefined;
+-            var ls: [max_streams]*Lane = undefined;
+-            const conf = self.confidenceNow();
+-            for (requests, 0..) |r, i| {
+-                const l = self.lanes.get(r.stream).?;
+-                ls[i] = l;
+-                // a shared round drafts before it keeps: the kept rows are this request's, commit them first
+-                if (r.rows) |rows| if (l.pending_rows) |_| {
+-                    l.pending_rows = null;
+-                    e.commitWindow(l.index, rows.len) catch |err| return self.lost("a window's commit", err);
+-                };
+-                l.held_n = 0;
+-                const depth = @min(r.depth, self.window - 1);
+-                if (r.rows == null) firsts[i] = .{self.value(r.first.?)};
+-                reqs[i] = .{
+-                    .seq = l.seq,
+-                    .source = if (r.rows != null) .{ .window = l.index } else .prefill_last,
+-                    .next = if (r.rows != null) r.follow else &firsts[i],
+-                    .count = depth,
+-                    .sampling = r.stream.sampling,
+-                    .confidence = conf,
+-                    .out = &l.held,
+-                };
+-            }
+-            e.draftMany(reqs[0..requests.len]) catch |err| return self.lost("the head's drafts", err);
+-            for (reqs[0..requests.len], ls[0..requests.len]) |q, l| l.held_n = q.drafted;
+-        }
+-
+-        /// Draft stop rule now: running product while few streams draft, per-draft rule above (same on both ranks).
+-        fn confidenceNow(self: *const Self) f64 {
+-            if (self.confidence >= 0) return self.confidence;
+-            var live: usize = 0;
+-            var it = self.lanes.valueIterator();
+-            while (it.next()) |l| live += @intFromBool(l.*.fill == null);
+-            return if (live <= self.product_streams) self.confidence else self.wide_confidence;
+-        }
+-
+-        /// The drafts' checks: each request's window is the last round's, its draft lands after its kept rows.
+-        fn prepareDraft(self: *Self, requests: []const be.DraftRequest) !void {
+-            if (!self.drafting) return error.NoDraftHead;
+-            if (requests.len > self.streams) return error.TooManyStreams;
+-            for (requests) |r| {
+-                if (r.lanes != null or r.early) return error.TreesNotBuilt;
+-                const l = try self.lane(r.stream);
+-                var after = self.e.pos();
+-                if (r.rows) |rows| {
+-                    for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+-                    if (r.follow.len != rows.len or rows.len == 0) return error.FollowMismatch;
+-                    if (l.round != self.round) return error.NoWindowThisRound;
+-                    if (l.pending_rows) |pending| {
+-                        if (rows.len > pending) return error.PathTooLong;
+-                        after += rows.len;
+-                    }
+-                } else if (r.first == null) return error.NoFirstToken;
+-                if (r.position != after + 1) return error.PositionMismatch;
+-            }
+-        }
+-
+-        /// The drafts held for the stream's next window: the chain's length (it may stop short of the depth asked).
+-        fn heldFn(ptr: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
+-            _ = gpa;
+-            const self = of(ptr);
+-            const l = self.lanes.get(s) orelse return null;
+-            return .{ .count = @intCast(l.held_n) };
+-        }
+-
+-        fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+-            const self = of(ptr);
+-            const kv = self.lanes.fetchRemove(s) orelse return;
+-            // a late Kept of this lane takes its sequence as keeper: release runs no collective, so none is made here
+-            var kept_seq = false;
+-            var i: usize = 0;
+-            while (i < self.late.items.len) {
+-                const k = self.late.items[i];
+-                if (k.src != kv.value.seq) {
+-                    i += 1;
+-                    continue;
+-                }
+-                _ = self.late.orderedRemove(i);
+-                k.src = null;
+-                if (kept_seq) { // a second late Kept of one lane (one pass keeps at most one near its end)
+-                    k.broken = true;
+-                    continue;
+-                }
+-                if (@hasField(E, "f")) {
+-                    self.e.f.setPos(&kv.value.seq.st, k.at) catch {
+-                        k.broken = true;
+-                        continue;
+-                    };
+-                    self.e.f.setMtpLen(&kv.value.seq.st, k.snap.mtp_len) catch {
+-                        k.broken = true;
+-                        continue;
+-                    };
+-                }
+-                k.keeper = kv.value.seq;
+-                kept_seq = true;
+-            }
+-            if (kv.value.fill != null) {
+-                self.stopFill(kv.value); // a cancelled fill (the host discards it between steps, on both ranks)
+-                self.dropTentative();
+-            }
+-            self.reserved -= kv.value.reserved;
+-            self.forget(kv.value);
+-            if (!kept_seq) self.e.freeSeq(kv.value.seq);
+-            self.gpa.destroy(kv.value);
+-        }
+-
+-        // -- costs ----------------------------------------------------------------------------------------------
+-
+-        /// Times verify windows, head levels and shared rounds in ms on `ids` (ranks in step) for the cost tables.
+-        pub fn measure(self: *Self, io: std.Io, ids: []const u32) !void {
+-            if (!self.drafting) return;
+-            const reps = 5;
+-            const e = self.e;
+-            if (ids.len < 3 * max_rows) return error.CostTextTooShort;
+-            try self.settle();
+-            const top = self.window;
+-            // 19 prompt rows: a multiple of 16 asks Triton for an M % 16 variant a capture may not hold
+-            const lead = max_rows + 3;
+-            const cont = ids[lead..];
+-            var c = try Costing(E).init(self.gpa, e, @min(self.context, 4096), 1, ids[0..lead]);
+-            defer c.deinit();
+-            for (0..32) |_| try c.round(1, cont, null, 0); // the GPU at its working clocks before any window is timed
+-            var verify_all: [max_rows + 1]f64 = @splat(0);
+-            const verify = verify_all[0 .. top + 1];
+-            var times: [reps + 1]f64 = undefined;
+-            for (1..top + 1) |w| {
+-                for (&times) |*x| try c.round(w, cont, .{ .io = io, .out = x }, 0);
+-                verify[w] = median(times[1..]);
+-            }
+-            var chain: [2]f64 = undefined;
+-            const deep = @max(2, @min(8, top - 1));
+-            for ([_]usize{ 1, deep }, &chain) |levels, *out| {
+-                for (&times) |*x| x.* = try c.chain(io, levels);
+-                out.* = median(times[1..]);
+-            }
+-            // one regime over every width: f212's pooling as hers at db281878 (no regime boundary)
+-            const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)), std.math.maxInt(usize));
+-            self.cost_count = 0;
+-            for (1..k.rows + 1) |w| {
+-                self.costs[self.cost_count] = .{ .width = @intCast(w), .ms = k.verify[w] };
+-                self.cost_count += 1;
+-            }
+-            self.mtp_ms = k.level;
+-            // shared rounds: n streams' full windows in one forward
+-            self.shared_count = 0;
+-            var n: usize = 2;
+-            while (n <= self.streams and self.shared_count < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
+-                var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
+-                defer many.deinit();
+-                try many.round(1, cont, null, 0);
+-                // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
+-                for (&times) |*x| try many.round(top, cont, .{ .io = io, .out = x }, top - 1);
+-                self.shared[self.shared_count] = .{ .width = @intCast(n * top), .ms = median(times[1..]) };
+-                self.shared_count += 1;
+-            }
+-        }
+-    };
+-}
++pub const Lanes = lanes_core.Lanes;
+ 
+ /// Shared rounds' cost points at most (2, 4, ... 64 streams).
+-const shared_points = 8;
++pub const shared_points = 8;
+ /// Streams one shared forward holds at most (the engine's round segments).
+ pub const max_streams = 64;
+ 
+-/// The cost measurement's sequences and rounds: `n` streams each prefilled with `lead` and its head in step.
+-fn Costing(comptime E: type) type {
+-    return struct {
+-        const Self = @This();
+-        const SeqPtr = @typeInfo(@typeInfo(@TypeOf(E.newSeq)).@"fn".return_type.?).error_union.payload;
+-        e: *E,
+-        seqs: [max_streams]SeqPtr = undefined,
+-        pending: [max_streams]u32 = undefined,
+-        n: usize = 0,
+-
+-        fn init(gpa: std.mem.Allocator, e: *E, limit: usize, n: usize, lead: []const u32) !Self {
+-            _ = gpa;
+-            var c: Self = .{ .e = e };
+-            errdefer c.deinit();
+-            for (0..n) |i| {
+-                c.seqs[i] = try e.newSeq(limit);
+-                c.n += 1;
+-                e.bind(c.seqs[i]);
+-                if (@hasDecl(E, "setSampling")) e.setSampling(null);
+-                c.pending[i] = try e.prefill(lead, null);
+-            }
+-            var reqs: [max_streams]E.DraftReq = undefined;
+-            var firsts: [max_streams][1]u32 = undefined;
+-            var none: [1]u32 = undefined;
+-            for (0..n) |i| {
+-                firsts[i] = .{c.pending[i]};
+-                reqs[i] = .{ .seq = c.seqs[i], .source = .prefill_last, .next = &firsts[i], .count = 0, .out = &none };
+-            }
+-            try e.draftMany(reqs[0..n]);
+-            return c;
+-        }
+-
+-        fn deinit(c: *Self) void {
+-            for (c.seqs[0..c.n]) |q| c.e.freeSeq(q);
+-            c.n = 0;
+-        }
+-
+-        const Timing = struct { io: std.Io, out: *f64 };
+-
+-        /// One round of every stream's `w`-row window, first row kept and absorbed, then `levels` drafts, timed.
+-        fn round(c: *Self, w: usize, text: []const u32, timing: ?Timing, levels: usize) !void {
+-            const e = c.e;
+-            var ids: [max_streams][max_rows]u32 = undefined;
+-            var wins: [max_streams]E.Window = undefined;
+-            for (0..c.n) |i| {
+-                ids[i][0] = c.pending[i];
+-                @memcpy(ids[i][1..w], text[0 .. w - 1]);
+-                wins[i] = .{ .seq = c.seqs[i], .tokens = ids[i][0..w] };
+-            }
+-            var sampled: [max_streams][max_rows]u32 = undefined;
+-            const t0 = if (timing) |t| std.Io.Timestamp.now(t.io, .awake) else undefined;
+-            try e.verifyMany(wins[0..c.n]);
+-            for (0..c.n) |i| try e.sampleWindow(i, null, sampled[i][0..w]);
+-            if (timing != null and levels == 0) timing.?.out.* = msSince(timing.?.io, t0);
+-            var reqs: [max_streams]E.DraftReq = undefined;
+-            var drafts: [max_streams][max_drafts]u32 = undefined;
+-            for (0..c.n) |i| {
+-                try e.commitWindow(i, 1);
+-                c.pending[i] = sampled[i][0];
+-                reqs[i] = .{ .seq = c.seqs[i], .source = .{ .window = i }, .next = sampled[i][0..1], .count = levels, .confidence = 0, .out = &drafts[i] };
+-            }
+-            try e.draftMany(reqs[0..c.n]);
+-            if (timing != null and levels > 0) timing.?.out.* = msSince(timing.?.io, t0);
+-        }
+-
+-        /// One stream's kept row, then its head chaining `levels` drafts (greedy, confidence 0), timed.
+-        fn chain(c: *Self, io: std.Io, levels: usize) !f64 {
+-            const e = c.e;
+-            var ids = [1]u32{c.pending[0]};
+-            var sampled: [1]u32 = undefined;
+-            try e.verifyMany(&.{.{ .seq = c.seqs[0], .tokens = &ids }});
+-            try e.sampleWindow(0, null, &sampled);
+-            try e.commitWindow(0, 1);
+-            c.pending[0] = sampled[0];
+-            var drafts: [max_drafts]u32 = undefined;
+-            var reqs = [1]E.DraftReq{.{ .seq = c.seqs[0], .source = .{ .window = 0 }, .next = &sampled, .count = levels, .confidence = 0, .out = &drafts }};
+-            const t0 = std.Io.Timestamp.now(io, .awake);
+-            try e.draftMany(&reqs);
+-            return msSince(io, t0);
+-        }
+-    };
+-}
+-
+-fn passNow(e: anytype) std.Io.Timestamp {
+-    e.stream.synchronize() catch {};
+-    return std.Io.Timestamp.now(e.io, .awake);
+-}
+-
+-/// ms since `last` (the stream drained first), and `last` moved to now.
+-fn passSince(e: anytype, last: *std.Io.Timestamp) f64 {
+-    const now = passNow(e);
+-    const d = last.durationTo(now);
+-    last.* = now;
+-    return @as(f64, @floatFromInt(d.nanoseconds)) / 1e6;
+-}
+-
+-fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
+-    const d = t0.durationTo(std.Io.Timestamp.now(io, .awake));
+-    return @as(f64, @floatFromInt(d.nanoseconds)) / 1e6;
+-}
+-
+-fn median(xs: []f64) f64 {
+-    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+-    return if (xs.len % 2 == 1) xs[xs.len / 2] else (xs[xs.len / 2 - 1] + xs[xs.len / 2]) / 2;
+-}
+-
+ // -- tests: a toy engine with several sequences -------------------------------------------------------------------
+ 
+-/// Toy target: draws from a hash of the sequence, window rows and position; the head guesses it right mostly.
+-pub const Toy = struct {
+-    pub const Seq = struct {
+-        tokens: std.ArrayList(u32) = .empty,
+-        sampling: ?lanes.Sampling = null,
+-        head: std.ArrayList(u32) = .empty, // the committed tokens the head absorbed, then its chain
+-        absorbed: usize = 0,
+-        limit: usize,
+-    };
+-
+-    pub const Window = struct { seq: *Seq, tokens: []const u32 };
+-    pub const DraftSource = union(enum) { prefill_last, window: usize };
+-    pub const DraftReq = struct {
+-        seq: *Seq,
+-        source: DraftSource,
+-        next: []const u32,
+-        count: usize,
+-        sampling: ?lanes.Sampling = null,
+-        confidence: f64 = default_confidence,
+-        out: []u32,
+-        drafted: usize = 0,
+-    };
+-    const Held = struct { seq: *Seq, tokens: [max_rows]u32, n: usize };
+-
+-    gpa: std.mem.Allocator,
+-    stream: ?*anyopaque = null, // the engine's stream (cuda_native's records run on it)
+-    budget: struct { limit: usize } = .{ .limit = std.math.maxInt(usize) },
+-    round_windows: [max_streams]Held = undefined,
+-    round_n: usize = 0,
+-    rounds: usize = 0,
+-    widest: usize = 0,
+-    snaps: usize = 0,
+-    passes: usize = 0,
+-    resumed: usize = 0,
+-    fills: usize = 0,
+-    bound: ?*Seq = null,
+-    window: [max_rows]u32 = undefined,
+-    rows: usize = 0,
+-    seqs: usize = 0,
+-    forwards: usize = 0,
+-    head_err: u64 = 1,
+-
+-    pub fn next(done: []const u32, extra: []const u32, s: ?lanes.Sampling, position: u64) u32 {
+-        var h = std.hash.Wyhash.init(11);
+-        h.update(std.mem.sliceAsBytes(done));
+-        h.update(std.mem.sliceAsBytes(extra));
+-        if (s) |smp| {
+-            h.update(std.mem.asBytes(&smp.seed));
+-            h.update(std.mem.asBytes(&position));
+-        }
+-        return @intCast(h.final() % 50);
+-    }
+-
+-    /// As cuda_engine's Engine.init, for cuda_native.openOn's tests.
+-    pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: anytype, dir: []const u8, kernels: []const u8, o: anytype) !*Toy {
+-        _ = .{ io, ctx, dir, kernels, o.context, o.mtp, o.rank, o.world, o.comm, o.yarn, o.depth, o.streams };
+-        const t = try gpa.create(Toy);
+-        t.* = .{ .gpa = gpa };
+-        return t;
+-    }
+-    pub fn deinit(t: *Toy) void {
+-        t.gpa.destroy(t);
+-    }
+-
+-    /// A sequence's caches at `rows` rows (cuda_engine's seqBytes): 100 bytes a row here.
+-    pub fn seqBytes(_: *const Toy, rows: usize) usize {
+-        return rows * 100;
+-    }
+-
+-    pub fn newSeq(t: *Toy, limit: usize) !*Seq {
+-        const s = try t.gpa.create(Seq);
+-        s.* = .{ .limit = limit };
+-        t.seqs += 1;
+-        return s;
+-    }
+-    pub fn freeSeq(t: *Toy, s: *Seq) void {
+-        if (t.bound == s) t.bound = null;
+-        s.tokens.deinit(t.gpa);
+-        s.head.deinit(t.gpa);
+-        t.gpa.destroy(s);
+-        t.seqs -= 1;
+-    }
+-    pub fn bind(t: *Toy, s: *Seq) void {
+-        t.bound = s;
+-    }
+-    fn seq(t: *Toy) *Seq {
+-        return t.bound.?;
+-    }
+-    pub fn prefill(t: *Toy, prompt: []const u32, s: ?lanes.Sampling) !u32 {
+-        return (try t.prefillWith(prompt, s, .{})).first;
+-    }
+-
+-    // -- kept prompt states (cuda_engine's Snapshot, prefillWith, copyPrefix, freeSnapshot) --
+-
+-    pub const Snapshot = struct { pos: usize, mtp_len: usize, tokens: []u32 };
+-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, media: ?*const media_mod.Media = null };
+-    pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
+-
+-    /// The prompt from 0 or a kept state, keeping keep_at's state; first draw; the head holds all but the last row.
+-    pub fn prefillWith(t: *Toy, prompt: []const u32, s: ?lanes.Sampling, o: PrefillOptions) !Prefilled {
+-        const q = t.seq();
+-        if (prompt.len == 0 or prompt.len > q.limit) return error.ToyMisuse;
+-        if (o.resume_from) |snap| {
+-            if (snap.pos >= prompt.len or !std.mem.eql(u32, snap.tokens, prompt[0..snap.pos])) return error.ResumeOtherPrompt;
+-            if (q.tokens.items.len < snap.pos or !std.mem.eql(u32, q.tokens.items[0..snap.pos], prompt[0..snap.pos])) return error.CachesNotThePrompts;
+-            q.tokens.shrinkRetainingCapacity(snap.pos);
+-            t.resumed += 1;
+-        } else q.tokens.clearRetainingCapacity();
+-        q.sampling = s;
+-        try q.tokens.appendSlice(t.gpa, prompt[q.tokens.items.len..]);
+-        // the head takes every prompt row but the last (its row waits for the first token)
+-        q.head.clearRetainingCapacity();
+-        try q.head.appendSlice(t.gpa, prompt[0 .. prompt.len - 1]);
+-        q.absorbed = prompt.len - 1;
+-        t.rows = 0;
+-        var kept: ?*Snapshot = null;
+-        if (o.keep_at) |k| {
+-            if (k == 0 or k > prompt.len) return error.BadKeepPoint;
+-            const snap = try t.gpa.create(Snapshot);
+-            snap.* = .{ .pos = k, .mtp_len = k - 1, .tokens = try t.gpa.dupe(u32, prompt[0..k]) };
+-            t.snaps += 1;
+-            kept = snap;
+-        }
+-        t.passes += 1;
+-        return .{ .first = next(q.tokens.items, &.{}, s, prompt.len), .kept = kept };
+-    }
+-
+-    /// cuda_engine's Fill: a prompt filling in layer slices; here `left` layers, then prefillWith's effect.
+-    pub const Fill = struct {
+-        seq: *Seq,
+-        prompt: []u32,
+-        sampling: ?lanes.Sampling,
+-        opts: PrefillOptions,
+-        left: usize = 5,
+-        kept: ?*Snapshot = null,
+-        first: u32 = 0,
+-        done: bool = false,
+-    };
+-
+-    pub fn fillBegin(t: *Toy, q: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !*Fill {
+-        if (prompt.len == 0 or prompt.len > q.limit) return error.ToyMisuse;
+-        const fl = try t.gpa.create(Fill);
+-        fl.* = .{ .seq = q, .prompt = try t.gpa.dupe(u32, prompt), .sampling = sampling, .opts = o };
+-        t.fills += 1;
+-        return fl;
+-    }
+-
+-    pub fn fillStep(t: *Toy, fl: *Fill, layers: usize) !bool {
+-        if (fl.done) return true;
+-        fl.left -|= layers;
+-        if (fl.left > 0) return false;
+-        // the slices' effect: the same pass prefillWith makes, on this fill's sequence
+-        const keep = t.bound;
+-        t.bound = fl.seq;
+-        defer t.bound = keep;
+-        const r = try t.prefillWith(fl.prompt, fl.sampling, fl.opts);
+-        fl.kept = r.kept;
+-        fl.first = r.first;
+-        fl.done = true;
+-        return true;
+-    }
+-
+-    pub fn fillFree(t: *Toy, fl: *Fill) void {
+-        if (fl.kept) |k| t.freeSnapshot(k);
+-        t.gpa.free(fl.prompt);
+-        t.gpa.destroy(fl);
+-        t.fills -= 1;
+-    }
+-
+-    pub fn copyPrefix(t: *Toy, dst: *Seq, src: *Seq, rows: usize, mtp_rows: usize) !void {
+-        _ = mtp_rows;
+-        if (rows > src.tokens.items.len) return error.PrefixPastSource;
+-        dst.tokens.clearRetainingCapacity();
+-        try dst.tokens.appendSlice(t.gpa, src.tokens.items[0..rows]);
+-    }
+-
+-    pub fn freeSnapshot(t: *Toy, snap: *Snapshot) void {
+-        t.gpa.free(snap.tokens);
+-        t.gpa.destroy(snap);
+-        t.snaps -= 1;
+-    }
+-    pub fn pos(t: *Toy) u64 {
+-        return t.seq().tokens.items.len;
+-    }
+-    pub fn forward(t: *Toy, tokens: []const u32) !void {
+-        if (t.seq().tokens.items.len + tokens.len > t.seq().limit) return error.SeqFull;
+-        @memcpy(t.window[0..tokens.len], tokens);
+-        t.rows = tokens.len;
+-        t.forwards += 1;
+-    }
+-    pub fn sample(t: *Toy, rows: usize, first: u64, out: []u32) !void {
+-        const q = t.seq();
+-        if (first != q.tokens.items.len + 1 or rows != t.rows) return error.ToyMisuse;
+-        for (0..rows) |i| out[i] = next(q.tokens.items, t.window[0 .. i + 1], q.sampling, first + i);
+-    }
+-    pub fn commit(t: *Toy, rows: usize, keep: usize) !void {
+-        if (keep < 1 or keep > rows or rows != t.rows) return error.ToyMisuse;
+-        try t.seq().tokens.appendSlice(t.gpa, t.window[0..keep]);
+-        t.rows = 0;
+-    }
+-    pub fn absorb(t: *Toy, source: decode.Source, next_tokens: []const u32) !void {
+-        const q = t.seq();
+-        // the head drops its last chain and must take exactly the rows committed since it last absorbed
+-        q.head.shrinkRetainingCapacity(q.absorbed);
+-        const behind = q.tokens.items.len - q.absorbed;
+-        if (behind != next_tokens.len) return error.HeadOutOfStep;
+-        if (source == .prefill_last and behind != 1) return error.HeadOutOfStep;
+-        try q.head.appendSlice(t.gpa, q.tokens.items[q.absorbed..]);
+-        q.absorbed = q.tokens.items.len;
+-        // the head's input after the kept rows is the token the target drew after the last of them
+-        try q.head.append(t.gpa, next_tokens[next_tokens.len - 1]);
+-    }
+-    pub fn chain(t: *Toy, token: u32, _: usize) !void {
+-        try t.seq().head.append(t.gpa, token);
+-    }
+-    // -- the shared rounds (cuda_engine's verifyMany / sampleWindow / commitWindow / draftMany) --
+-
+-    pub fn verifyMany(t: *Toy, windows: []const Window) !void {
+-        if (windows.len == 0 or windows.len > max_streams) return error.ToyMisuse;
+-        for (windows, 0..) |w, i| {
+-            if (w.seq.tokens.items.len + w.tokens.len > w.seq.limit) return error.SeqFull;
+-            t.round_windows[i] = .{ .seq = w.seq, .tokens = undefined, .n = w.tokens.len };
+-            @memcpy(t.round_windows[i].tokens[0..w.tokens.len], w.tokens);
+-        }
+-        t.round_n = windows.len;
+-        t.rounds += 1;
+-        t.forwards += 1;
+-        t.widest = @max(t.widest, windows.len);
+-    }
+-    pub fn sampleWindow(t: *Toy, i: usize, s: ?lanes.Sampling, out: []u32) !void {
+-        if (i >= t.round_n) return error.ToyMisuse;
+-        const w = t.round_windows[i];
+-        const done = w.seq.tokens.items;
+-        for (0..w.n) |r| out[r] = next(done, w.tokens[0 .. r + 1], s, done.len + 1 + r);
+-    }
+-    pub fn commitWindow(t: *Toy, i: usize, keep: usize) !void {
+-        if (i >= t.round_n) return error.ToyMisuse;
+-        const w = &t.round_windows[i];
+-        if (keep < 1 or keep > w.n) return error.ToyMisuse;
+-        try w.seq.tokens.appendSlice(t.gpa, w.tokens[0..keep]);
+-        w.n = 0; // committed once
+-    }
+-    pub fn draftMany(t: *Toy, reqs: []DraftReq) !void {
+-        for (reqs) |*r| {
+-            const q = r.seq;
+-            q.head.shrinkRetainingCapacity(q.absorbed);
+-            const behind = q.tokens.items.len - q.absorbed;
+-            if (behind != r.next.len) return error.HeadOutOfStep;
+-            switch (r.source) {
+-                .prefill_last => if (behind != 1) return error.HeadOutOfStep,
+-                .window => |w| if (w >= t.round_n or t.round_windows[w].seq != q) return error.ToyMisuse,
+-            }
+-            try q.head.appendSlice(t.gpa, q.tokens.items[q.absorbed..]);
+-            q.absorbed = q.tokens.items.len;
+-            try q.head.append(t.gpa, r.next[r.next.len - 1]);
+-            r.drafted = 0;
+-            const pos0 = q.tokens.items.len + 1;
+-            var stop: decode.Stop = .{ .c = r.confidence };
+-            for (0..@min(r.count, r.out.len)) |j| {
+-                const g = t.guessOn(q, r.sampling, pos0 + j);
+-                const take = stop.take(j, g.prob);
+-                if (!take.propose) break;
+-                r.out[r.drafted] = g.token;
+-                r.drafted += 1;
+-                if (!take.more) break;
+-                try q.head.append(t.gpa, g.token);
+-            }
+-        }
+-    }
+-
+-    fn guess(t: *Toy, position: u64) decode.Draw {
+-        return t.guessOn(t.seq(), t.seq().sampling, position);
+-    }
+-
+-    fn guessOn(t: *Toy, q: *Seq, sampling: ?lanes.Sampling, position: u64) decode.Draw {
+-        const h_items = q.head.items;
+-        const want = next(h_items[0..q.absorbed], h_items[q.absorbed..], sampling, position);
+-        var h = std.hash.Wyhash.init(t.head_err);
+-        h.update(std.mem.asBytes(&position));
+-        h.update(std.mem.sliceAsBytes(h_items[q.absorbed..]));
+-        const r = h.final() % 10;
+-        return if (r < 7) .{ .token = want, .prob = if (r == 0) 0.6 else 0.9 } else .{ .token = (want + 1) % 50, .prob = if (r == 9) 0.5 else 0.8 };
+-    }
+-    pub fn sampleDraft(t: *Toy, position: u64) !decode.Draw {
+-        return t.guess(position);
+-    }
+-    pub fn drawDraft(t: *Toy, position: u64) !u32 {
+-        return t.guess(position).token;
+-    }
+-    pub fn isEos(_: *Toy, token: u32) bool {
+-        return token == 49;
+-    }
+-};
++pub const Toy = toy_part.Toy;
+ 
+ const Case = struct { prompt: []const u32, max_new: u32, sampling: ?lanes.Sampling = null, drafts: bool = true };
+ 
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_core.zig b/zig/src/families/flashnext_mia/cuda_lanes_core.zig
+new file mode 100644
+index 000000000..52711a8d7
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_lanes_core.zig
+@@ -0,0 +1,290 @@
++//! Flash Next lanes' core: the generic Lanes type, its fields and vtable, and its shared round helpers.
++const std = @import("std");
++const envs = @import("cuda_env.zig");
++const lanes = @import("lanes");
++const cl = @import("cuda_lanes.zig");
++const fill_part = @import("cuda_lanes_fill.zig");
++const keep_part = @import("cuda_lanes_keep.zig");
++const rounds_part = @import("cuda_lanes_rounds.zig");
++const costs_part = @import("cuda_lanes_costs.zig");
++
++const be = lanes.backend;
++const max_rows = cl.max_rows;
++const default_confidence = cl.default_confidence;
++const draft_prior = cl.draft_prior;
++const ring = cl.ring;
++const shared_points = cl.shared_points;
++const Gate = cl.Gate;
++const Notes = cl.Notes;
++const max_drafts = cl.max_drafts;
++
++pub fn Lanes(comptime E: type) type {
++    return struct {
++        const Self = @This();
++        /// the engine's sequence handle, as newSeq returns it
++        const SeqPtr = @typeInfo(@typeInfo(@TypeOf(E.newSeq)).@"fn".return_type.?).error_union.payload;
++
++        /// prefillWith's result and its kept state (cuda_engine's Prefilled / Snapshot)
++        const Prefilled = @typeInfo(@typeInfo(@TypeOf(E.prefillWith)).@"fn".return_type.?).error_union.payload;
++        pub const SnapPtr = @typeInfo(@FieldType(Prefilled, "kept")).optional.child;
++        /// the engine's prompt fill (fillBegin / fillStep / fillFree), when it has one
++        const FillPtr = if (@hasDecl(E, "fillBegin")) @typeInfo(@typeInfo(@TypeOf(E.fillBegin)).@"fn".return_type.?).error_union.payload else *anyopaque;
++
++        /// A kept prompt state: engine snapshot at `at` plus a keeper sequence; `key` is rank 0's address of it.
++        pub const Kept = struct {
++            snap: SnapPtr,
++            keeper: ?SeqPtr,
++            at: u32,
++            bytes: u64,
++            key: u64 = 0,
++            src: ?SeqPtr = null,
++            broken: bool = false,
++        };
++
++        const Tentative = struct { at: u32, kept: *Kept, adopted: bool = false };
++
++        pub const Lane = struct {
++            seq: SeqPtr,
++            /// the last verify's uncommitted rows of this stream (kept only on drops; a shared round drafts first)
++            pending_rows: ?usize = null,
++            /// this stream's window in the round `round` (the engine's sampleWindow / commitWindow index)
++            index: usize = 0,
++            round: u64 = 0,
++            held: [max_drafts]u32 = undefined,
++            held_n: usize = 0,
++            /// the caches of this stream's whole window, reserved at admission (the guaranteed class)
++            reserved: usize = 0,
++            /// the prompt filling between rounds (sliced fills), null once it is in
++            fill: ?Filling = null,
++            /// the first token's handle of a burst's prompt (firstFn gives it once; else the last one taken)
++            first: ?u64 = null,
++        };
++
++        /// A prompt filling in slices: the engine fill of the current segment, its resume state and the pass position.
++        pub const Filling = struct {
++            fl: FillPtr,
++            cur: ?SnapPtr = null,
++            owned: bool = false,
++            at: usize = 0,
++            final: bool = false,
++        };
++
++        gpa: std.mem.Allocator,
++        e: *E,
++        drafting: bool,
++        context: usize,
++        /// a window's rows at most: the engine's depth + 1 (its buffers' rows and the kernel set's windows)
++        window: usize,
++        /// streams a shared forward holds (--parallel; the engine's Options.streams)
++        streams: usize = 1,
++        confidence: f64 = default_confidence,
++        /// running product (confidence < 0) while at most this many streams draft, per-draft `wide_confidence` above
++        product_streams: usize = std.math.maxInt(usize),
++        wide_confidence: f64 = 0.5,
++        gate: ?Gate = null,
++        /// admit only if the window's caches fit the budget; `overcommit` (TF_FLASHNEXT_OVERCOMMIT=1) uses free now
++        overcommit: bool = false,
++        reserved: usize = 0,
++        /// kept prompt states: every live one (the store's), the last pass's not yet adopted ones, their bytes
++        kept: std.ArrayList(*Kept) = .empty,
++        tentative: std.ArrayList(Tentative) = .empty,
++        kept_bytes: u64 = 0,
++        /// the prompt cache's budget on this rank (cuda_native.cacheBudget; snap_ready hands f212's store this much)
++        cache_budget: u64 = 0,
++        /// keep a pass's last state late, after the first token (TF_FLASHNEXT_KEEP_LATE=0 off; the copy is the same)
++        late_keep: bool = true,
++        late: std.ArrayList(*Kept) = .empty,
++        /// rank 1 at two ranks: the last pass's kept states wait for rank 0's note of which the store took
++        follower: bool = false,
++        /// rank 0 at two ranks: where the store's decisions go to rank 1 (cuda_mirror's Leader.note)
++        notes: ?Notes = null,
++        /// prompts fill in slices between rounds (prefill_begin / prefill_step), `fill_layers` layers a step
++        sliced: bool = false,
++        fill_layers: usize = 8,
++        lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
++        /// the last verify's lanes whose windows wait for their commits: committed before the next forward
++        opened: std.ArrayList(*Lane) = .empty,
++        round: u64 = 0,
++        drawn: [ring]u32 = undefined,
++        next: u64 = 0,
++        costs: [max_rows]lanes.config.Cost = undefined,
++        cost_count: usize = 0,
++        shared: [shared_points]lanes.config.Cost = undefined,
++        shared_count: usize = 0,
++        mtp_ms: f64 = 0,
++
++        pub const fillStepFn = fill_part.Fill(E).fillStepFn;
++        pub const prefillBeginFn = fill_part.Fill(E).prefillBeginFn;
++        pub const startSegment = fill_part.Fill(E).startSegment;
++        pub const prefillStepFn = fill_part.Fill(E).prefillStepFn;
++        pub const stopFill = fill_part.Fill(E).stopFill;
++        pub const prefillFn = fill_part.Fill(E).prefillFn;
++        pub const prefillManyFn = fill_part.Fill(E).prefillManyFn;
++        pub const burstLost = fill_part.Fill(E).burstLost;
++        pub const pass = fill_part.Fill(E).pass;
++        pub const keep = keep_part.Keep(E).keep;
++        pub const keepAt = keep_part.Keep(E).keepAt;
++        pub const fillLate = keep_part.Keep(E).fillLate;
++        pub const freeKept = keep_part.Keep(E).freeKept;
++        pub const endPass = keep_part.Keep(E).endPass;
++        pub const dropTentative = keep_part.Keep(E).dropTentative;
++        pub const keptOf = keep_part.Keep(E).keptOf;
++        pub const agreeOn = keep_part.Keep(E).agreeOn;
++        pub const cacheHooks = keep_part.Keep(E).cacheHooks;
++        pub const bytesFn = keep_part.Keep(E).bytesFn;
++        pub const saveFn = keep_part.Keep(E).saveFn;
++        pub const restoreFn = keep_part.Keep(E).restoreFn;
++        pub const dropFn = keep_part.Keep(E).dropFn;
++        pub const forgetKept = keep_part.Keep(E).forgetKept;
++        pub const applyNote = keep_part.Keep(E).applyNote;
++        pub const savedFor = keep_part.Keep(E).savedFor;
++        pub const Admission = rounds_part.Rounds(E).Admission;
++        pub const admit = rounds_part.Rounds(E).admit;
++        pub const makeLane = rounds_part.Rounds(E).makeLane;
++        pub const footprint = rounds_part.Rounds(E).footprint;
++        pub const budget = rounds_part.Rounds(E).budget;
++        pub const dropLane = rounds_part.Rounds(E).dropLane;
++        pub const forget = rounds_part.Rounds(E).forget;
++        pub const firstFn = rounds_part.Rounds(E).firstFn;
++        pub const queueFn = rounds_part.Rounds(E).queueFn;
++        pub const readFn = rounds_part.Rounds(E).readFn;
++        pub const verifyFn = rounds_part.Rounds(E).verifyFn;
++        pub const prepareVerify = rounds_part.Rounds(E).prepareVerify;
++        pub const keepFn = rounds_part.Rounds(E).keepFn;
++        pub const draftFn = rounds_part.Rounds(E).draftFn;
++        pub const confidenceNow = rounds_part.Rounds(E).confidenceNow;
++        pub const prepareDraft = rounds_part.Rounds(E).prepareDraft;
++        pub const heldFn = rounds_part.Rounds(E).heldFn;
++        pub const releaseFn = rounds_part.Rounds(E).releaseFn;
++        pub const measure = costs_part.Measure(E).measure;
++
++        pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
++            const late = if (envs.get("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, v, "0") else true;
++            return .{ .gpa = gpa, .e = e, .drafting = drafting, .context = context, .window = @max(1, @min(window, max_rows)), .late_keep = late };
++        }
++
++        pub fn deinit(self: *Self) void {
++            var it = self.lanes.valueIterator();
++            while (it.next()) |l| {
++                self.stopFill(l.*);
++                self.e.freeSeq(l.*.seq);
++                self.gpa.destroy(l.*);
++            }
++            self.lanes.deinit(self.gpa);
++            self.opened.deinit(self.gpa);
++            self.dropTentative();
++            self.tentative.deinit(self.gpa);
++            for (self.kept.items) |k| self.freeKept(k);
++            self.kept.deinit(self.gpa);
++            self.late.deinit(self.gpa);
++        }
++
++        pub fn backend(self: *Self) be.Backend {
++            if (@hasDecl(E, "fillBegin") and self.sliced) return .{ .ptr = self, .vtable = &.{
++                .prefill = prefillFn,
++                .first = firstFn,
++                .queue = queueFn,
++                .read = readFn,
++                .verify = verifyFn,
++                .keep = keepFn,
++                .draft = draftFn,
++                .tree = heldFn,
++                .release = releaseFn,
++                .prefill_step = fillStepFn,
++            } };
++            return .{ .ptr = self, .vtable = &.{
++                .prefill = prefillFn,
++                .first = firstFn,
++                .queue = queueFn,
++                .read = readFn,
++                .verify = verifyFn,
++                .keep = keepFn,
++                .draft = draftFn,
++                .tree = heldFn,
++                .release = releaseFn,
++                .prefill_many = if (@hasDecl(E, "prefillMany")) prefillManyFn else null,
++            } };
++        }
++
++        /// Round loop setup facts: windows up to `window` rows (16 max), `streams` per forward, this GPU's costs.
++        pub fn facts(self: *const Self) lanes.Model {
++            const many = self.streams > 1;
++            return .{
++                .exact_width = if (self.drafting) @intCast(self.window) else 1,
++                .gpu_tokens = false,
++                .mtp = self.drafting,
++                .speculate = self.drafting,
++                .speculate_early = false,
++                .draft_prior = &draft_prior,
++                .drafts = @intCast(self.window - 1),
++                .window_costs = self.costs[0..self.cost_count],
++                .mtp_step_ms = self.mtp_ms,
++                .streams_exact = true,
++                .hidden_rows = many,
++                .batch_rows = @intCast(self.streams * self.window),
++                .max_streams = @intCast(self.streams),
++                .shared_costs = self.shared[0..self.shared_count],
++                .draft_streams = many,
++                // the running-product rule (confidence < 0) stops each chain itself: the round loop asks the most
++                .draft_stops = self.drafting and self.confidence < 0,
++                .draft_stops_most = @intCast(@min(self.product_streams, std.math.maxInt(u32))),
++                // each sequence keeps its prompt's last streams until its first drafts: joiners draft together
++                .join_batch = self.drafting,
++            };
++        }
++
++        /// The lane, its sequence bound and its stream's sampling set.
++        pub fn lane(self: *Self, s: *const lanes.Stream) !*Lane {
++            const l = self.lanes.get(s) orelse return error.UnknownStream;
++            self.e.bind(l.seq);
++            if (@hasDecl(E, "setSampling")) self.e.setSampling(s.sampling);
++            return l;
++        }
++
++        /// Commits every still-uncommitted window of the last verify whole before the next forward overwrites its rows.
++        pub fn settle(self: *Self) !void {
++            defer self.opened.clearRetainingCapacity();
++            for (self.opened.items) |o| {
++                const rows = o.pending_rows orelse continue;
++                o.pending_rows = null;
++                try self.e.commitWindow(o.index, rows);
++            }
++        }
++
++        /// Every rank's prepare done: return this rank's error, or error.OtherRankFailed, before any collective.
++        pub fn agree(self: *Self, failed: ?anyerror) !void {
++            if (self.gate) |g| {
++                const all = g.agree(g.ptr, failed == null) catch |e| {
++                    g.fatal(g.ptr, "the ranks' agreement", e);
++                    return e;
++                };
++                if (!all) return failed orelse error.OtherRankFailed;
++            }
++            if (failed) |e| return e;
++        }
++
++        /// An engine call failed after the agreement: with two ranks this one leaves (they may be apart now).
++        pub fn lost(self: *Self, what: []const u8, err: anyerror) anyerror {
++            if (self.gate) |g| g.fatal(g.ptr, what, err);
++            return err;
++        }
++
++        pub fn take(self: *Self, token: u32) u64 {
++            const h = self.next;
++            self.drawn[h % ring] = token;
++            self.next += 1;
++            return h;
++        }
++
++        pub fn value(self: *const Self, feed: be.Feed) u32 {
++            return switch (feed) {
++                .handle => |h| self.drawn[h % ring],
++                .value => |v| v,
++            };
++        }
++
++        pub fn of(ptr: *anyopaque) *Self {
++            return @ptrCast(@alignCast(ptr));
++        }
++    };
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_costs.zig b/zig/src/families/flashnext_mia/cuda_lanes_costs.zig
+new file mode 100644
+index 000000000..c7d43be49
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_lanes_costs.zig
+@@ -0,0 +1,159 @@
++//! Flash Next lanes' cost tables: verify windows, head levels and shared rounds timed on the engine itself.
++const std = @import("std");
++const cl = @import("cuda_lanes.zig");
++const lanes_core = @import("cuda_lanes_core.zig");
++
++const max_rows = cl.max_rows;
++const max_drafts = cl.max_drafts;
++const max_streams = cl.max_streams;
++const shared_points = cl.shared_points;
++
++pub fn Measure(comptime E: type) type {
++    return struct {
++        const Self = lanes_core.Lanes(E);
++
++        // -- costs ----------------------------------------------------------------------------------------------
++
++        /// Times verify windows, head levels and shared rounds in ms on `ids` (ranks in step) for the cost tables.
++        pub fn measure(self: *Self, io: std.Io, ids: []const u32) !void {
++            if (!self.drafting) return;
++            const reps = 5;
++            const e = self.e;
++            if (ids.len < 3 * max_rows) return error.CostTextTooShort;
++            try self.settle();
++            const top = self.window;
++            // 19 prompt rows: a multiple of 16 asks Triton for an M % 16 variant a capture may not hold
++            const lead = max_rows + 3;
++            const cont = ids[lead..];
++            var c = try Costing(E).init(self.gpa, e, @min(self.context, 4096), 1, ids[0..lead]);
++            defer c.deinit();
++            for (0..32) |_| try c.round(1, cont, null, 0); // the GPU at its working clocks before any window is timed
++            var verify_all: [max_rows + 1]f64 = @splat(0);
++            const verify = verify_all[0 .. top + 1];
++            var times: [reps + 1]f64 = undefined;
++            for (1..top + 1) |w| {
++                for (&times) |*x| try c.round(w, cont, .{ .io = io, .out = x }, 0);
++                verify[w] = median(times[1..]);
++            }
++            var chain: [2]f64 = undefined;
++            const deep = @max(2, @min(8, top - 1));
++            for ([_]usize{ 1, deep }, &chain) |levels, *out| {
++                for (&times) |*x| x.* = try c.chain(io, levels);
++                out.* = median(times[1..]);
++            }
++            // one regime over every width: f212's pooling as hers at db281878 (no regime boundary)
++            const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)), std.math.maxInt(usize));
++            self.cost_count = 0;
++            for (1..k.rows + 1) |w| {
++                self.costs[self.cost_count] = .{ .width = @intCast(w), .ms = k.verify[w] };
++                self.cost_count += 1;
++            }
++            self.mtp_ms = k.level;
++            // shared rounds: n streams' full windows in one forward
++            self.shared_count = 0;
++            var n: usize = 2;
++            while (n <= self.streams and self.shared_count < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
++                var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
++                defer many.deinit();
++                try many.round(1, cont, null, 0);
++                // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
++                for (&times) |*x| try many.round(top, cont, .{ .io = io, .out = x }, top - 1);
++                self.shared[self.shared_count] = .{ .width = @intCast(n * top), .ms = median(times[1..]) };
++                self.shared_count += 1;
++            }
++        }
++    };
++}
++
++/// The cost measurement's sequences and rounds: `n` streams each prefilled with `lead` and its head in step.
++fn Costing(comptime E: type) type {
++    return struct {
++        const Self = @This();
++        const SeqPtr = @typeInfo(@typeInfo(@TypeOf(E.newSeq)).@"fn".return_type.?).error_union.payload;
++        e: *E,
++        seqs: [max_streams]SeqPtr = undefined,
++        pending: [max_streams]u32 = undefined,
++        n: usize = 0,
++
++        fn init(gpa: std.mem.Allocator, e: *E, limit: usize, n: usize, lead: []const u32) !Self {
++            _ = gpa;
++            var c: Self = .{ .e = e };
++            errdefer c.deinit();
++            for (0..n) |i| {
++                c.seqs[i] = try e.newSeq(limit);
++                c.n += 1;
++                e.bind(c.seqs[i]);
++                if (@hasDecl(E, "setSampling")) e.setSampling(null);
++                c.pending[i] = try e.prefill(lead, null);
++            }
++            var reqs: [max_streams]E.DraftReq = undefined;
++            var firsts: [max_streams][1]u32 = undefined;
++            var none: [1]u32 = undefined;
++            for (0..n) |i| {
++                firsts[i] = .{c.pending[i]};
++                reqs[i] = .{ .seq = c.seqs[i], .source = .prefill_last, .next = &firsts[i], .count = 0, .out = &none };
++            }
++            try e.draftMany(reqs[0..n]);
++            return c;
++        }
++
++        fn deinit(c: *Self) void {
++            for (c.seqs[0..c.n]) |q| c.e.freeSeq(q);
++            c.n = 0;
++        }
++
++        const Timing = struct { io: std.Io, out: *f64 };
++
++        /// One round of every stream's `w`-row window, first row kept and absorbed, then `levels` drafts, timed.
++        fn round(c: *Self, w: usize, text: []const u32, timing: ?Timing, levels: usize) !void {
++            const e = c.e;
++            var ids: [max_streams][max_rows]u32 = undefined;
++            var wins: [max_streams]E.Window = undefined;
++            for (0..c.n) |i| {
++                ids[i][0] = c.pending[i];
++                @memcpy(ids[i][1..w], text[0 .. w - 1]);
++                wins[i] = .{ .seq = c.seqs[i], .tokens = ids[i][0..w] };
++            }
++            var sampled: [max_streams][max_rows]u32 = undefined;
++            const t0 = if (timing) |t| std.Io.Timestamp.now(t.io, .awake) else undefined;
++            try e.verifyMany(wins[0..c.n]);
++            for (0..c.n) |i| try e.sampleWindow(i, null, sampled[i][0..w]);
++            if (timing != null and levels == 0) timing.?.out.* = msSince(timing.?.io, t0);
++            var reqs: [max_streams]E.DraftReq = undefined;
++            var drafts: [max_streams][max_drafts]u32 = undefined;
++            for (0..c.n) |i| {
++                try e.commitWindow(i, 1);
++                c.pending[i] = sampled[i][0];
++                reqs[i] = .{ .seq = c.seqs[i], .source = .{ .window = i }, .next = sampled[i][0..1], .count = levels, .confidence = 0, .out = &drafts[i] };
++            }
++            try e.draftMany(reqs[0..c.n]);
++            if (timing != null and levels > 0) timing.?.out.* = msSince(timing.?.io, t0);
++        }
++
++        /// One stream's kept row, then its head chaining `levels` drafts (greedy, confidence 0), timed.
++        fn chain(c: *Self, io: std.Io, levels: usize) !f64 {
++            const e = c.e;
++            var ids = [1]u32{c.pending[0]};
++            var sampled: [1]u32 = undefined;
++            try e.verifyMany(&.{.{ .seq = c.seqs[0], .tokens = &ids }});
++            try e.sampleWindow(0, null, &sampled);
++            try e.commitWindow(0, 1);
++            c.pending[0] = sampled[0];
++            var drafts: [max_drafts]u32 = undefined;
++            var reqs = [1]E.DraftReq{.{ .seq = c.seqs[0], .source = .{ .window = 0 }, .next = &sampled, .count = levels, .confidence = 0, .out = &drafts }};
++            const t0 = std.Io.Timestamp.now(io, .awake);
++            try e.draftMany(&reqs);
++            return msSince(io, t0);
++        }
++    };
++}
++
++fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
++    const d = t0.durationTo(std.Io.Timestamp.now(io, .awake));
++    return @as(f64, @floatFromInt(d.nanoseconds)) / 1e6;
++}
++
++fn median(xs: []f64) f64 {
++    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
++    return if (xs.len % 2 == 1) xs[xs.len / 2] else (xs[xs.len / 2 - 1] + xs[xs.len / 2]) / 2;
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_fill.zig b/zig/src/families/flashnext_mia/cuda_lanes_fill.zig
+new file mode 100644
+index 000000000..56c5cc61b
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_lanes_fill.zig
+@@ -0,0 +1,284 @@
++//! Flash Next lanes' prompt fills: sliced fills between rounds, prefills, bursts and the marked prompt pass.
++const std = @import("std");
++const lanes = @import("lanes");
++const envs = @import("cuda_env.zig");
++const media_mod = @import("cuda_media.zig");
++const cl = @import("cuda_lanes.zig");
++const lanes_core = @import("cuda_lanes_core.zig");
++
++const max_rows = cl.max_rows;
++const late_keep_rows = cl.late_keep_rows;
++const FillState = cl.FillState;
++
++pub fn Fill(comptime E: type) type {
++    return struct {
++        const Self = lanes_core.Lanes(E);
++        const Kept = Self.Kept;
++        const Lane = Self.Lane;
++        const Filling = Self.Filling;
++        const SnapPtr = Self.SnapPtr;
++        const Admission = Self.Admission;
++        const of = Self.of;
++
++        // -- prompts filling between rounds (the lanes core's prefill_begin / prefill_step) --------------------
++
++        /// f212's prefill_step: the first call begins the fill, each steps it `fill_layers` layers; true once in.
++        pub fn fillStepFn(ptr: *anyopaque, s: *lanes.Stream, cap: u32) anyerror!bool {
++            _ = cap;
++            const self = of(ptr);
++            if (self.lanes.get(s) == null) try prefillBeginFn(ptr, s);
++            var state: [1]FillState = .{.filling};
++            try prefillStepFn(ptr, &.{s}, &state);
++            return state[0] == .done;
++        }
++
++        /// The prefill's admission and agreements, its resume made, the first segment's fill started.
++        pub fn prefillBeginFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
++            const self = of(ptr);
++            self.fillLate();
++            const e = self.e;
++            const a = self.admit(s, 0) catch |err| {
++                try self.agree(err);
++                unreachable;
++            };
++            try self.agree(null);
++            const l = self.makeLane(s, a) catch |err| return self.lost("a prompt's sequence", err);
++            const requested = s.reuse.at > 0;
++            var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
++            if (requested) {
++                if (!(try self.agreeOn(from != null))) from = null;
++            }
++            var f: Filling = .{ .fl = undefined };
++            if (from) |k| {
++                e.copyPrefix(l.seq, k.keeper.?, k.snap.pos, k.snap.mtp_len) catch |err| {
++                    self.dropLane(s, l);
++                    return self.lost("a prompt's resume", err);
++                };
++                f.cur = k.snap;
++                f.at = k.snap.pos;
++            }
++            s.cached = @intCast(f.at);
++            s.reuse_failed = requested and from == null;
++            self.dropTentative();
++            self.startSegment(s, l, &f) catch |err| {
++                self.dropLane(s, l);
++                // a media attachment both ranks refused together (memory, bad rows): this request fails, not the server
++                if (err == error.MediaRefused) return err;
++                return self.lost("a prompt's fill", err);
++            };
++            l.fill = f;
++        }
++
++        /// The next segment's fill: up to the next mark (its state kept there), else to the prompt's end.
++        pub fn startSegment(self: *Self, s: *lanes.Stream, l: *Lane, f: *Filling) !void {
++            const ids = s.prompt();
++            const next_mark: ?u32 = for (s.reuse.marks) |m| {
++                if (m > f.at and m < ids.len) break m;
++            } else null;
++            if (next_mark) |m| {
++                f.fl = try self.e.fillBegin(l.seq, ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = f.cur });
++                f.final = false;
++            } else {
++                f.fl = try self.e.fillBegin(l.seq, ids, s.sampling, .{ .resume_from = f.cur, .media = media_mod.of(s) });
++                f.final = true;
++            }
++        }
++
++        /// `fill_layers` more layers of every filling prompt; segments keep their marks, a done prompt draws `first`.
++        pub fn prefillStepFn(ptr: *anyopaque, streams: []const *lanes.Stream, states: []FillState) anyerror!void {
++            const self = of(ptr);
++            self.fillLate();
++            try self.agree(null); // nothing to prepare: the ranks only meet before the slices' collectives
++            for (streams, states) |s, *st| {
++                const l = self.lanes.get(s) orelse return error.UnknownStream;
++                const f = &(l.fill orelse return error.NotFilling);
++                const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
++                if (!done) continue;
++                if (!f.final) {
++                    const m: u32 = @intCast(f.fl.prompt.len);
++                    const snap = f.fl.kept orelse return self.lost("a prompt's fill", error.NoStateKept);
++                    f.fl.kept = null; // the pass's now
++                    self.e.fillFree(f.fl);
++                    if (f.owned) self.e.freeSnapshot(f.cur.?);
++                    f.cur = snap;
++                    f.owned = true;
++                    if (self.keep(l, snap, m)) |k| {
++                        f.owned = false;
++                        self.tentative.append(self.gpa, .{ .at = m, .kept = k }) catch |err| return self.lost("a prompt's fill", err);
++                    } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
++                    if (s.reuse.hook) |h| h.at(h.ptr, s, m);
++                    f.at = m;
++                    self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
++                    continue;
++                }
++                _ = self.take(f.fl.first);
++                self.e.fillFree(f.fl);
++                if (f.owned) self.e.freeSnapshot(f.cur.?);
++                l.fill = null;
++                self.endPass();
++                st.* = .done;
++            }
++        }
++
++        pub fn stopFill(self: *Self, l: *Lane) void {
++            if (comptime !@hasDecl(E, "fillBegin")) return; // an engine without fills never starts one
++            const f = l.fill orelse return;
++            self.e.fillFree(f.fl);
++            if (f.owned) self.e.freeSnapshot(f.cur.?);
++            l.fill = null;
++        }
++
++        // -- the vtable -----------------------------------------------------------------------------------------
++
++        /// A new sequence for the stream, its prompt, and the first draw at the prompt's length with its sampling.
++        pub fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
++            const self = of(ptr);
++            self.fillLate();
++            const e = self.e;
++            const a = self.admit(s, 0) catch |err| {
++                try self.agree(err);
++                unreachable;
++            };
++            try self.agree(null);
++            const l = self.makeLane(s, a) catch |err| return self.lost("a prompt's sequence", err);
++            // a resume both ranks can make (each holds the state), else both prefill from the start
++            const requested = s.reuse.at > 0;
++            var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
++            if (requested) {
++                if (!(try self.agreeOn(from != null))) from = null;
++            }
++            e.bind(l.seq);
++            const first = self.pass(s, l, from) catch |err| {
++                self.dropLane(s, l);
++                if (err == error.MediaRefused) return err;
++                return self.lost("a prompt's prefill", err);
++            };
++            _ = self.take(first);
++        }
++
++        /// A prompt burst: admit all first (a refusal: false, prefill singly), then share prefillMany passes.
++        pub fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
++            const self = of(ptr);
++            if (comptime !@hasDecl(E, "prefillMany")) return false;
++            const e = self.e;
++            if (ss.len < 2 or ss.len > max_rows) return false;
++            // an image or video prompt prefills alone (attachMedia, the MODE 2 prompt rows)
++            for (ss) |s| if (s.reuse.at > 0 or s.reuse.marks.len > 0 or media_mod.of(s) != null) return false;
++            var ls: [max_rows]*Lane = undefined;
++            var adm: [max_rows]Admission = undefined;
++            var admitted: usize = 0;
++            var ahead: usize = 0; // the burst's earlier streams' reservations, not made yet
++            var failure: ?anyerror = null;
++            for (ss) |s| {
++                adm[admitted] = self.admit(s, ahead) catch |err| {
++                    failure = err;
++                    break;
++                };
++                ahead += adm[admitted].need;
++                admitted += 1;
++            }
++            self.agree(failure) catch return false;
++            var made: usize = 0;
++            for (ss, adm[0..ss.len]) |s, a| {
++                ls[made] = self.makeLane(s, a) catch |err| return self.burstLost(ss, ls[0..made], err);
++                made += 1;
++            }
++            for (ss) |s| {
++                s.cached = 0;
++                s.reuse_failed = false;
++            }
++            self.dropTentative();
++            var i: usize = 0;
++            while (i < ss.len) {
++                var j = i;
++                var rows: usize = 0;
++                while (j < ss.len and rows + ss[j].prompt().len <= e.prefill_rows) : (j += 1) rows += ss[j].prompt().len;
++                if (j - i >= 2) {
++                    var items: [max_rows]E.ManyPrompt = undefined;
++                    for (items[0 .. j - i], ss[i..j], ls[i..j]) |*it, s, l| it.* = .{ .seq = l.seq, .prompt = s.prompt(), .sampling = s.sampling };
++                    if (e.manyFit(items[0 .. j - i])) {
++                        var firsts: [max_rows]u32 = undefined;
++                        e.prefillMany(items[0 .. j - i], &firsts) catch |err| return self.burstLost(ss, ls[0..made], err);
++                        for (ls[i..j], firsts[0 .. j - i]) |l, f| l.first = self.take(f);
++                        i = j;
++                        continue;
++                    }
++                }
++                e.bind(ls[i].seq);
++                const r = e.prefillWith(ss[i].prompt(), ss[i].sampling, .{}) catch |err| return self.burstLost(ss, ls[0..made], err);
++                ls[i].first = self.take(r.first);
++                i += 1;
++            }
++            self.endPass();
++            return true;
++        }
++
++        pub fn burstLost(self: *Self, ss: []const *lanes.Stream, ls: []*Lane, err: anyerror) anyerror {
++            for (ss[0..ls.len], ls) |s, l| self.dropLane(s, l);
++            return self.lost("a burst's prefill", err);
++        }
++
++        /// The prompt pass from a kept state or 0, cut at each mark to keep a tentative state, then to the end.
++        pub fn pass(self: *Self, s: *lanes.Stream, l: *Lane, from: ?*Kept) !u32 {
++            const e = self.e;
++            const ids = s.prompt();
++            var cur: ?SnapPtr = null; // the state the next segment resumes
++            var owned = false; // `cur` is this pass's own (no Kept holds it)
++            defer if (owned) e.freeSnapshot(cur.?);
++            var at: usize = 0;
++            if (from) |k| {
++                try e.copyPrefix(l.seq, k.keeper.?, k.snap.pos, k.snap.mtp_len);
++                cur = k.snap;
++                at = k.snap.pos;
++            }
++            s.cached = @intCast(at);
++            s.reuse_failed = s.reuse.at > 0 and from == null;
++            self.dropTentative();
++            // TF_FLASHNEXT_PASS_TIMES=1: each part's wall time (the stream drained at each edge), in the log
++            const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
++            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
++            var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
++            var parts: [3]f64 = @splat(0); // to the marks, keeping, the rest
++            for (s.reuse.marks) |m| {
++                if (m <= at or m >= ids.len) continue;
++                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = cur });
++                if (times) parts[0] += passSince(e, &t_last);
++                if (owned) e.freeSnapshot(cur.?);
++                cur = r.kept.?;
++                owned = true;
++                // late only the pass's last mark: the source's rows and key ring stay until the next call
++                const last = for (s.reuse.marks) |n| {
++                    if (n > m and n < ids.len) break false;
++                } else true;
++                const late = self.late_keep and last and ids.len - m <= late_keep_rows;
++                if (self.keepAt(l, cur.?, m, late)) |k| {
++                    owned = false; // the Kept holds it now
++                    try self.tentative.append(self.gpa, .{ .at = m, .kept = k });
++                } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
++                if (s.reuse.hook) |h| h.at(h.ptr, s, m);
++                at = m;
++                if (times) parts[1] += passSince(e, &t_last);
++            }
++            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = cur, .media = media_mod.of(s) });
++            self.endPass();
++            if (times) {
++                parts[2] = passSince(e, &t_last);
++                std.log.info("pass times: {d} tokens from {d}, marks {any}: to the marks {d:.1} ms, keeping {d:.1} ms, the rest {d:.1} ms", .{ ids.len, s.cached, s.reuse.marks, parts[0], parts[1], parts[2] });
++            }
++            return r.first;
++        }
++    };
++}
++
++pub fn passNow(e: anytype) std.Io.Timestamp {
++    e.stream.synchronize() catch {};
++    return std.Io.Timestamp.now(e.io, .awake);
++}
++
++/// ms since `last` (the stream drained first), and `last` moved to now.
++pub fn passSince(e: anytype, last: *std.Io.Timestamp) f64 {
++    const now = passNow(e);
++    const d = last.durationTo(now);
++    last.* = now;
++    return @as(f64, @floatFromInt(d.nanoseconds)) / 1e6;
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_keep.zig b/zig/src/families/flashnext_mia/cuda_lanes_keep.zig
+new file mode 100644
+index 000000000..da68ef96f
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_lanes_keep.zig
+@@ -0,0 +1,220 @@
++//! Flash Next lanes' kept prompt states: keepers, late fills, the prompt cache's hooks and rank 1's notes.
++const std = @import("std");
++const envs = @import("cuda_env.zig");
++const cl = @import("cuda_lanes.zig");
++const lanes_core = @import("cuda_lanes_core.zig");
++const fill_part = @import("cuda_lanes_fill.zig");
++
++const Note = cl.Note;
++const CacheHooks = cl.CacheHooks;
++const passNow = fill_part.passNow;
++const passSince = fill_part.passSince;
++
++pub fn Keep(comptime E: type) type {
++    return struct {
++        const Self = lanes_core.Lanes(E);
++        const Kept = Self.Kept;
++        const Lane = Self.Lane;
++        const SnapPtr = Self.SnapPtr;
++        const of = Self.of;
++
++        /// A tentative Kept of the pass at `at`: a keeper sequence takes the prompt's first `at` rows.
++        pub fn keep(self: *Self, l: *Lane, snap: SnapPtr, at: u32) !*Kept {
++            return self.keepAt(l, snap, at, false);
++        }
++
++        pub fn keepAt(self: *Self, l: *Lane, snap: SnapPtr, at: u32, late: bool) !*Kept {
++            const e = self.e;
++            if (late) {
++                const k = try self.gpa.create(Kept);
++                errdefer self.gpa.destroy(k);
++                k.* = .{ .snap = snap, .keeper = null, .src = l.seq, .at = at, .bytes = self.footprint(at) };
++                k.key = @intFromPtr(k);
++                try self.late.append(self.gpa, k);
++                self.kept_bytes += k.bytes;
++                return k;
++            }
++            const timed = comptime @hasField(E, "io") and @hasField(E, "stream");
++            const times = timed and envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
++            var t_last: std.Io.Timestamp = if (times) passNow(e) else undefined;
++            const keeper = try e.newSeq(at + 1);
++            errdefer e.freeSeq(keeper);
++            const t_new = if (times) passSince(e, &t_last) else 0;
++            try e.copyPrefix(keeper, l.seq, at, snap.mtp_len);
++            if (times) std.log.info("keep at {d}: new sequence {d:.1} ms, copy {d:.1} ms", .{ at, t_new, passSince(e, &t_last) });
++            // the keeper now holds `at` rows: say so, or a later copyPrefix from it refuses (PrefixPastSource)
++            if (@hasField(E, "f")) {
++                try e.f.setPos(&keeper.st, at);
++                try e.f.setMtpLen(&keeper.st, snap.mtp_len);
++            }
++            const k = try self.gpa.create(Kept);
++            k.* = .{ .snap = snap, .keeper = keeper, .at = at, .bytes = self.footprint(at) };
++            k.key = @intFromPtr(k);
++            self.kept_bytes += k.bytes;
++            return k;
++        }
++
++        /// Fills late Kepts' keepers at the start of collective calls; rank 1 follows rank 0's order and adopt note.
++        pub fn fillLate(self: *Self) void {
++            if (self.late.items.len == 0) return;
++            const e = self.e;
++            for (self.late.items) |k| {
++                const src = k.src orelse continue;
++                k.src = null;
++                const keeper = e.newSeq(k.at + 1) catch |err| {
++                    k.broken = true;
++                    std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k.at, @errorName(err) });
++                    continue;
++                };
++                e.copyPrefix(keeper, src, k.at, k.snap.mtp_len) catch |err| {
++                    e.freeSeq(keeper);
++                    k.broken = true;
++                    std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k.at, @errorName(err) });
++                    continue;
++                };
++                if (@hasField(E, "f")) {
++                    e.f.setPos(&keeper.st, k.at) catch {};
++                    e.f.setMtpLen(&keeper.st, k.snap.mtp_len) catch {};
++                }
++                k.keeper = keeper;
++            }
++            self.late.clearRetainingCapacity();
++        }
++
++        pub fn freeKept(self: *Self, k: *Kept) void {
++            self.kept_bytes -= k.bytes;
++            if (std.mem.indexOfScalar(*Kept, self.late.items, k)) |i| _ = self.late.orderedRemove(i);
++            if (k.keeper) |kp| self.e.freeSeq(kp);
++            self.e.freeSnapshot(k.snap);
++            self.gpa.destroy(k);
++        }
++
++        /// Pass end: rank 0 frees what the store did not adopt and tells rank 1, which keeps them all until that note.
++        pub fn endPass(self: *Self) void {
++            if (self.follower) return;
++            if (self.notes) |n| if (self.tentative.items.len > 0) {
++                var buf: [1 + 4 + 64 * 12]u8 = undefined;
++                var len: usize = 5;
++                buf[0] = @backingInt(Note.pass);
++                var count: u32 = 0;
++                for (self.tentative.items) |t| if (t.adopted and len + 12 <= buf.len) {
++                    std.mem.writeInt(u32, buf[len..][0..4], t.at, .little);
++                    std.mem.writeInt(u64, buf[len + 4 ..][0..8], t.kept.key, .little);
++                    len += 12;
++                    count += 1;
++                };
++                std.mem.writeInt(u32, buf[1..5], count, .little);
++                n.send(n.ptr, buf[0..len]);
++            };
++            self.dropTentative();
++        }
++
++        /// The last pass's states the store did not adopt.
++        pub fn dropTentative(self: *Self) void {
++            for (self.tentative.items) |t| if (!t.adopted) self.freeKept(t.kept);
++            self.tentative.clearRetainingCapacity();
++        }
++
++        pub fn keptOf(self: *Self, saved: ?*anyopaque) ?*Kept {
++            const p = saved orelse return null;
++            for (self.kept.items) |k| if (@as(*anyopaque, @ptrCast(k)) == p) return if (k.keeper == null) null else k;
++            return null;
++        }
++
++        /// Both ranks' answer to a yes/no both must share (one rank: its own).
++        pub fn agreeOn(self: *Self, ok: bool) !bool {
++            const g = self.gate orelse return ok;
++            return g.agree(g.ptr, ok) catch |e| {
++                g.fatal(g.ptr, "the ranks' agreement", e);
++                return e;
++            };
++        }
++
++        // -- the prompt cache's family (core/prompt_cache.zig Snapshots; native/cuda.zig makes the Store) ------
++
++        pub fn cacheHooks(self: *Self, cache_budget: u64) CacheHooks {
++            return .{ .ptr = self, .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .budget = cache_budget };
++        }
++
++        pub fn bytesFn(ptr: *anyopaque, at: u32) u64 {
++            return of(ptr).footprint(at);
++        }
++
++        /// The store keeps the pass's state at `at`: the tentative Kept made there.
++        pub fn saveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
++            _ = owner;
++            const self = of(ptr);
++            for (self.tentative.items) |*t| if (t.at == at and !t.adopted) {
++                t.adopted = true;
++                try self.kept.append(self.gpa, t.kept);
++                return t.kept;
++            };
++            return error.NoStateKept;
++        }
++
++        /// The backend restores inside its pass (LaneHost's lookup, not begin).
++        pub fn restoreFn(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
++            return error.RestoredInThePass;
++        }
++
++        pub fn dropFn(ptr: *anyopaque, saved: *anyopaque) void {
++            const self = of(ptr);
++            const k = self.keptOf(saved) orelse return;
++            // Store.keep may evict a Kept this pass made before rank 1 adopted it: unadopt it so endPass frees it
++            for (self.tentative.items) |*t| if (t.kept == k and t.adopted) {
++                t.adopted = false;
++                if (std.mem.indexOfScalar(*Kept, self.kept.items, k)) |i| _ = self.kept.swapRemove(i);
++                return;
++            };
++            if (self.notes) |n| {
++                var buf: [9]u8 = undefined;
++                buf[0] = @backingInt(Note.drop);
++                std.mem.writeInt(u64, buf[1..9], k.key, .little);
++                n.send(n.ptr, &buf);
++            }
++            self.forgetKept(k);
++        }
++
++        pub fn forgetKept(self: *Self, k: *Kept) void {
++            if (std.mem.indexOfScalar(*Kept, self.kept.items, k)) |i| _ = self.kept.swapRemove(i);
++            self.freeKept(k);
++        }
++
++        // -- rank 1: rank 0's prompt cache decisions ----------------------------------------------------------
++
++        /// A note of rank 0's store (cuda_mirror carries it): the last pass's adopted states, or a dropped one.
++        pub fn applyNote(self: *Self, bytes: []const u8) !void {
++            if (bytes.len == 0) return error.BadNote;
++            switch (@as(Note, @fromBackingInt(bytes[0]))) {
++                .pass => {
++                    if (bytes.len < 5) return error.BadNote;
++                    const n = std.mem.readInt(u32, bytes[1..5], .little);
++                    if (bytes.len != 5 + 12 * @as(usize, n)) return error.BadNote;
++                    for (0..n) |i| {
++                        const at = std.mem.readInt(u32, bytes[5 + 12 * i ..][0..4], .little);
++                        const key = std.mem.readInt(u64, bytes[9 + 12 * i ..][0..8], .little);
++                        for (self.tentative.items) |*t| if (t.at == at and !t.adopted) {
++                            t.adopted = true;
++                            t.kept.key = key;
++                            try self.kept.append(self.gpa, t.kept);
++                            break;
++                        };
++                    }
++                    self.dropTentative();
++                },
++                .drop => {
++                    if (bytes.len != 9) return error.BadNote;
++                    const key = std.mem.readInt(u64, bytes[1..9], .little);
++                    for (self.kept.items) |k| if (k.key == key) return self.forgetKept(k);
++                },
++                _ => return error.BadNote,
++            }
++        }
++
++        /// Rank 1's own state for rank 0's key (null: it holds none; the resume then runs from 0 on both).
++        pub fn savedFor(self: *Self, key: u64) ?*anyopaque {
++            for (self.kept.items) |k| if (k.key == key) return k;
++            return null;
++        }
++    };
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_rounds.zig b/zig/src/families/flashnext_mia/cuda_lanes_rounds.zig
+new file mode 100644
+index 000000000..1281b09d2
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_lanes_rounds.zig
+@@ -0,0 +1,296 @@
++//! Flash Next lanes' rounds: admission and lane lifetimes, shared verify windows, commits, drafts and release.
++const std = @import("std");
++const lanes = @import("lanes");
++const media_mod = @import("cuda_media.zig");
++const cl = @import("cuda_lanes.zig");
++const lanes_core = @import("cuda_lanes_core.zig");
++
++const be = lanes.backend;
++const max_rows = cl.max_rows;
++const ring = cl.ring;
++const max_streams = cl.max_streams;
++
++pub fn Rounds(comptime E: type) type {
++    return struct {
++        const Self = lanes_core.Lanes(E);
++        const Lane = Self.Lane;
++        const of = Self.of;
++
++        /// An admitted prompt's window and reservation (admit), for its lane (makeLane).
++        pub const Admission = struct { limit: usize, need: usize, before: usize };
++
++        /// Local prefill admission (no collective); ranks agree before makeLane so none waits alone in a collective.
++        pub fn admit(self: *Self, s: *lanes.Stream, ahead: usize) !Admission {
++            const ids = s.prompt();
++            const limit = ids.len + s.max_new + self.window;
++            if (ids.len == 0 or limit > self.context) return error.PromptTooLong;
++            // an image or video prompt also holds its rotary table and features while it fills (attachMedia)
++            const media_bytes: usize = if (media_mod.of(s)) |m| std.mem.alignForward(usize, ids.len * 12, 256) + std.mem.alignForward(usize, m.featureBytes(), 256) else 0;
++            const need = self.footprint(limit) + media_bytes;
++            const before = if (self.lanes.get(s)) |old| old.reserved else 0;
++            if (!self.overcommit and self.reserved - before + ahead + need + self.kept_bytes > self.budget()) return error.NoRoom;
++            return .{ .limit = limit, .need = need, .before = before };
++        }
++
++        /// The agreed prefill's steps: the last round's commits, the stream's lane and a new sequence.
++        pub fn makeLane(self: *Self, s: *lanes.Stream, a: Admission) !*Lane {
++            const e = self.e;
++            const limit = a.limit;
++            const need = a.need;
++            const before = a.before;
++            try self.settle();
++            const l = if (self.lanes.get(s)) |old| blk: {
++                e.freeSeq(old.seq);
++                break :blk old;
++            } else blk: {
++                const l = try self.gpa.create(Lane);
++                errdefer self.gpa.destroy(l);
++                try self.lanes.put(self.gpa, s, l);
++                break :blk l;
++            };
++            self.reserved -= before;
++            l.* = .{ .seq = e.newSeq(limit) catch |err| {
++                _ = self.lanes.remove(s);
++                self.gpa.destroy(l);
++                return err;
++            } };
++            l.reserved = need;
++            self.reserved += need;
++            return l;
++        }
++
++        /// A stream's caches at its whole window (the engine's seqBytes; 0 for an engine that does not say).
++        pub fn footprint(self: *const Self, rows: usize) usize {
++            return if (@hasDecl(E, "seqBytes")) self.e.seqBytes(rows) else 0;
++        }
++
++        /// The bytes the sequences' caches may take on this rank (the engine's budget; unbounded without one).
++        pub fn budget(self: *const Self) usize {
++            return if (@hasField(E, "budget")) self.e.budget.limit else std.math.maxInt(usize);
++        }
++
++        pub fn dropLane(self: *Self, s: *const lanes.Stream, l: *Lane) void {
++            for (self.late.items) |k| if (k.src == l.seq) {
++                k.src = null;
++                k.broken = true;
++            };
++            _ = self.lanes.remove(s);
++            self.stopFill(l);
++            self.reserved -= l.reserved;
++            self.forget(l);
++            self.e.freeSeq(l.seq);
++            self.gpa.destroy(l);
++        }
++
++        pub fn forget(self: *Self, l: *Lane) void {
++            for (self.opened.items, 0..) |o, i| if (o == l) {
++                _ = self.opened.swapRemove(i);
++                return;
++            };
++        }
++
++        pub fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
++            const self = of(ptr);
++            if (position != s.prompt_len) return error.PositionMismatch;
++            if (self.lanes.get(s)) |l| if (l.first) |h| {
++                l.first = null;
++                return h;
++            };
++            if (self.next == 0) return error.NoFirstToken;
++            return self.next - 1;
++        }
++
++        pub fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
++            _ = .{ ptr, s, feed, position };
++            return error.NotPipelined;
++        }
++
++        pub fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
++            const self = of(ptr);
++            if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
++            return self.drawn[handle % ring];
++        }
++
++        /// Every stream's window in one forward, each row drawn at its position; extra held drafts cost rows, not bits.
++        pub fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++            const self = of(ptr);
++            self.fillLate();
++            var ids: [max_streams][max_rows]u32 = undefined;
++            var wins: [max_streams]E.Window = undefined;
++            var ls: [max_streams]*Lane = undefined;
++            self.prepareVerify(windows, &ids, &wins, &ls) catch |err| {
++                try self.agree(err);
++                unreachable;
++            };
++            try self.agree(null);
++            const e = self.e;
++            const n = windows.len;
++            e.verifyMany(wins[0..n]) catch |err| return self.lost("a round's forward", err);
++            self.round += 1;
++            for (windows, out, ls[0..n], 0..) |w, o, l, i| {
++                const rows = w.rows();
++                e.sampleWindow(i, w.stream.sampling, o.sampled[0..rows]) catch |err| return self.lost("a window's draws", err);
++                @memcpy(o.drafts[0 .. rows - 1], ids[i][1..rows]);
++                l.held_n = 0;
++                l.pending_rows = rows;
++                l.index = i;
++                l.round = self.round;
++                self.opened.append(self.gpa, l) catch |err| return self.lost("a window's bookkeeping", err);
++            }
++        }
++
++        /// The windows' checks and rows, the last round committed.
++        pub fn prepareVerify(self: *Self, windows: []const be.Window, ids: *[max_streams][max_rows]u32, wins: *[max_streams]E.Window, ls: *[max_streams]*Lane) !void {
++            if (windows.len == 0 or windows.len > self.streams) return error.TooManyStreams;
++            try self.opened.ensureTotalCapacity(self.gpa, windows.len);
++            try self.settle();
++            for (windows, 0..) |w, i| {
++                if (w.parents != null) return error.TreesNotBuilt;
++                const rows = w.rows();
++                if (rows > self.window) return error.WindowTooWide;
++                const l = try self.lane(w.stream);
++                for (windows[0..i]) |v| if (v.stream == w.stream) return error.StreamTwiceInRound;
++                for (w.positions, 0..) |p, r| if (p != self.e.pos() + 1 + r) return error.PositionMismatch;
++                ids[i][0] = w.pending;
++                for (ids[i][1..][0..w.held], 0..) |*d, j| d.* = if (j < l.held_n) l.held[j] else if (l.held_n > 0) l.held[l.held_n - 1] else w.pending;
++                @memcpy(ids[i][1 + w.held ..][0..w.tokens.len], w.tokens);
++                wins[i] = .{ .seq = l.seq, .tokens = ids[i][0..rows] };
++                ls[i] = l;
++            }
++        }
++
++        /// Each window keeps its path's rows (a window its draft already committed is left as it is).
++        pub fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
++            const self = of(ptr);
++            if (windows.len != paths.len) return error.PathsWindowsMismatch;
++            for (windows, paths) |w, path| {
++                if (path.len == 0) return error.EmptyPath;
++                for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
++                const l = self.lanes.get(w.stream) orelse return error.UnknownStream;
++                const rows = l.pending_rows orelse continue;
++                if (path.len > rows) return error.PathTooLong;
++                l.pending_rows = null;
++                // a commit runs no collective, but a failed one leaves this rank's caches apart from the other's
++                self.e.commitWindow(l.index, path.len) catch |err| return self.lost("a window's commit", err);
++            }
++        }
++
++        /// Heads absorb each request's kept rows, then chain up to `depth` drafts in shared steps; `tree` gets counts.
++        pub fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++            const self = of(ptr);
++            self.fillLate();
++            self.prepareDraft(requests) catch |err| {
++                try self.agree(err);
++                unreachable;
++            };
++            try self.agree(null);
++            const e = self.e;
++            var reqs: [max_streams]E.DraftReq = undefined;
++            var firsts: [max_streams][1]u32 = undefined;
++            var ls: [max_streams]*Lane = undefined;
++            const conf = self.confidenceNow();
++            for (requests, 0..) |r, i| {
++                const l = self.lanes.get(r.stream).?;
++                ls[i] = l;
++                // a shared round drafts before it keeps: the kept rows are this request's, commit them first
++                if (r.rows) |rows| if (l.pending_rows) |_| {
++                    l.pending_rows = null;
++                    e.commitWindow(l.index, rows.len) catch |err| return self.lost("a window's commit", err);
++                };
++                l.held_n = 0;
++                const depth = @min(r.depth, self.window - 1);
++                if (r.rows == null) firsts[i] = .{self.value(r.first.?)};
++                reqs[i] = .{
++                    .seq = l.seq,
++                    .source = if (r.rows != null) .{ .window = l.index } else .prefill_last,
++                    .next = if (r.rows != null) r.follow else &firsts[i],
++                    .count = depth,
++                    .sampling = r.stream.sampling,
++                    .confidence = conf,
++                    .out = &l.held,
++                };
++            }
++            e.draftMany(reqs[0..requests.len]) catch |err| return self.lost("the head's drafts", err);
++            for (reqs[0..requests.len], ls[0..requests.len]) |q, l| l.held_n = q.drafted;
++        }
++
++        /// Draft stop rule now: running product while few streams draft, per-draft rule above (same on both ranks).
++        pub fn confidenceNow(self: *const Self) f64 {
++            if (self.confidence >= 0) return self.confidence;
++            var live: usize = 0;
++            var it = self.lanes.valueIterator();
++            while (it.next()) |l| live += @intFromBool(l.*.fill == null);
++            return if (live <= self.product_streams) self.confidence else self.wide_confidence;
++        }
++
++        /// The drafts' checks: each request's window is the last round's, its draft lands after its kept rows.
++        pub fn prepareDraft(self: *Self, requests: []const be.DraftRequest) !void {
++            if (!self.drafting) return error.NoDraftHead;
++            if (requests.len > self.streams) return error.TooManyStreams;
++            for (requests) |r| {
++                if (r.lanes != null or r.early) return error.TreesNotBuilt;
++                const l = try self.lane(r.stream);
++                var after = self.e.pos();
++                if (r.rows) |rows| {
++                    for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
++                    if (r.follow.len != rows.len or rows.len == 0) return error.FollowMismatch;
++                    if (l.round != self.round) return error.NoWindowThisRound;
++                    if (l.pending_rows) |pending| {
++                        if (rows.len > pending) return error.PathTooLong;
++                        after += rows.len;
++                    }
++                } else if (r.first == null) return error.NoFirstToken;
++                if (r.position != after + 1) return error.PositionMismatch;
++            }
++        }
++
++        /// The drafts held for the stream's next window: the chain's length (it may stop short of the depth asked).
++        pub fn heldFn(ptr: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
++            _ = gpa;
++            const self = of(ptr);
++            const l = self.lanes.get(s) orelse return null;
++            return .{ .count = @intCast(l.held_n) };
++        }
++
++        pub fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
++            const self = of(ptr);
++            const kv = self.lanes.fetchRemove(s) orelse return;
++            // a late Kept of this lane takes its sequence as keeper: release runs no collective, so none is made here
++            var kept_seq = false;
++            var i: usize = 0;
++            while (i < self.late.items.len) {
++                const k = self.late.items[i];
++                if (k.src != kv.value.seq) {
++                    i += 1;
++                    continue;
++                }
++                _ = self.late.orderedRemove(i);
++                k.src = null;
++                if (kept_seq) { // a second late Kept of one lane (one pass keeps at most one near its end)
++                    k.broken = true;
++                    continue;
++                }
++                if (@hasField(E, "f")) {
++                    self.e.f.setPos(&kv.value.seq.st, k.at) catch {
++                        k.broken = true;
++                        continue;
++                    };
++                    self.e.f.setMtpLen(&kv.value.seq.st, k.snap.mtp_len) catch {
++                        k.broken = true;
++                        continue;
++                    };
++                }
++                k.keeper = kv.value.seq;
++                kept_seq = true;
++            }
++            if (kv.value.fill != null) {
++                self.stopFill(kv.value); // a cancelled fill (the host discards it between steps, on both ranks)
++                self.dropTentative();
++            }
++            self.reserved -= kv.value.reserved;
++            self.forget(kv.value);
++            if (!kept_seq) self.e.freeSeq(kv.value.seq);
++            self.gpa.destroy(kv.value);
++        }
++    };
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_toy.zig b/zig/src/families/flashnext_mia/cuda_lanes_toy.zig
+new file mode 100644
+index 000000000..0a67f2aa7
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_lanes_toy.zig
+@@ -0,0 +1,304 @@
++//! Flash Next lanes' toy engine for tests: several sequences, a hashed target and a head that guesses it mostly.
++const std = @import("std");
++const lanes = @import("lanes");
++const media_mod = @import("cuda_media.zig");
++const decode = @import("cuda_decode.zig");
++const cl = @import("cuda_lanes.zig");
++
++const max_rows = cl.max_rows;
++const max_streams = cl.max_streams;
++const default_confidence = cl.default_confidence;
++
++/// Toy target: draws from a hash of the sequence, window rows and position; the head guesses it right mostly.
++pub const Toy = struct {
++    pub const Seq = struct {
++        tokens: std.ArrayList(u32) = .empty,
++        sampling: ?lanes.Sampling = null,
++        head: std.ArrayList(u32) = .empty, // the committed tokens the head absorbed, then its chain
++        absorbed: usize = 0,
++        limit: usize,
++    };
++
++    pub const Window = struct { seq: *Seq, tokens: []const u32 };
++    pub const DraftSource = union(enum) { prefill_last, window: usize };
++    pub const DraftReq = struct {
++        seq: *Seq,
++        source: DraftSource,
++        next: []const u32,
++        count: usize,
++        sampling: ?lanes.Sampling = null,
++        confidence: f64 = default_confidence,
++        out: []u32,
++        drafted: usize = 0,
++    };
++    const Held = struct { seq: *Seq, tokens: [max_rows]u32, n: usize };
++
++    gpa: std.mem.Allocator,
++    stream: ?*anyopaque = null, // the engine's stream (cuda_native's records run on it)
++    budget: struct { limit: usize } = .{ .limit = std.math.maxInt(usize) },
++    round_windows: [max_streams]Held = undefined,
++    round_n: usize = 0,
++    rounds: usize = 0,
++    widest: usize = 0,
++    snaps: usize = 0,
++    passes: usize = 0,
++    resumed: usize = 0,
++    fills: usize = 0,
++    bound: ?*Seq = null,
++    window: [max_rows]u32 = undefined,
++    rows: usize = 0,
++    seqs: usize = 0,
++    forwards: usize = 0,
++    head_err: u64 = 1,
++
++    pub fn next(done: []const u32, extra: []const u32, s: ?lanes.Sampling, position: u64) u32 {
++        var h = std.hash.Wyhash.init(11);
++        h.update(std.mem.sliceAsBytes(done));
++        h.update(std.mem.sliceAsBytes(extra));
++        if (s) |smp| {
++            h.update(std.mem.asBytes(&smp.seed));
++            h.update(std.mem.asBytes(&position));
++        }
++        return @intCast(h.final() % 50);
++    }
++
++    /// As cuda_engine's Engine.init, for cuda_native.openOn's tests.
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: anytype, dir: []const u8, kernels: []const u8, o: anytype) !*Toy {
++        _ = .{ io, ctx, dir, kernels, o.context, o.mtp, o.rank, o.world, o.comm, o.yarn, o.depth, o.streams };
++        const t = try gpa.create(Toy);
++        t.* = .{ .gpa = gpa };
++        return t;
++    }
++    pub fn deinit(t: *Toy) void {
++        t.gpa.destroy(t);
++    }
++
++    /// A sequence's caches at `rows` rows (cuda_engine's seqBytes): 100 bytes a row here.
++    pub fn seqBytes(_: *const Toy, rows: usize) usize {
++        return rows * 100;
++    }
++
++    pub fn newSeq(t: *Toy, limit: usize) !*Seq {
++        const s = try t.gpa.create(Seq);
++        s.* = .{ .limit = limit };
++        t.seqs += 1;
++        return s;
++    }
++    pub fn freeSeq(t: *Toy, s: *Seq) void {
++        if (t.bound == s) t.bound = null;
++        s.tokens.deinit(t.gpa);
++        s.head.deinit(t.gpa);
++        t.gpa.destroy(s);
++        t.seqs -= 1;
++    }
++    pub fn bind(t: *Toy, s: *Seq) void {
++        t.bound = s;
++    }
++    fn seq(t: *Toy) *Seq {
++        return t.bound.?;
++    }
++    pub fn prefill(t: *Toy, prompt: []const u32, s: ?lanes.Sampling) !u32 {
++        return (try t.prefillWith(prompt, s, .{})).first;
++    }
++
++    // -- kept prompt states (cuda_engine's Snapshot, prefillWith, copyPrefix, freeSnapshot) --
++
++    pub const Snapshot = struct { pos: usize, mtp_len: usize, tokens: []u32 };
++    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, media: ?*const media_mod.Media = null };
++    pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
++
++    /// The prompt from 0 or a kept state, keeping keep_at's state; first draw; the head holds all but the last row.
++    pub fn prefillWith(t: *Toy, prompt: []const u32, s: ?lanes.Sampling, o: PrefillOptions) !Prefilled {
++        const q = t.seq();
++        if (prompt.len == 0 or prompt.len > q.limit) return error.ToyMisuse;
++        if (o.resume_from) |snap| {
++            if (snap.pos >= prompt.len or !std.mem.eql(u32, snap.tokens, prompt[0..snap.pos])) return error.ResumeOtherPrompt;
++            if (q.tokens.items.len < snap.pos or !std.mem.eql(u32, q.tokens.items[0..snap.pos], prompt[0..snap.pos])) return error.CachesNotThePrompts;
++            q.tokens.shrinkRetainingCapacity(snap.pos);
++            t.resumed += 1;
++        } else q.tokens.clearRetainingCapacity();
++        q.sampling = s;
++        try q.tokens.appendSlice(t.gpa, prompt[q.tokens.items.len..]);
++        // the head takes every prompt row but the last (its row waits for the first token)
++        q.head.clearRetainingCapacity();
++        try q.head.appendSlice(t.gpa, prompt[0 .. prompt.len - 1]);
++        q.absorbed = prompt.len - 1;
++        t.rows = 0;
++        var kept: ?*Snapshot = null;
++        if (o.keep_at) |k| {
++            if (k == 0 or k > prompt.len) return error.BadKeepPoint;
++            const snap = try t.gpa.create(Snapshot);
++            snap.* = .{ .pos = k, .mtp_len = k - 1, .tokens = try t.gpa.dupe(u32, prompt[0..k]) };
++            t.snaps += 1;
++            kept = snap;
++        }
++        t.passes += 1;
++        return .{ .first = next(q.tokens.items, &.{}, s, prompt.len), .kept = kept };
++    }
++
++    /// cuda_engine's Fill: a prompt filling in layer slices; here `left` layers, then prefillWith's effect.
++    pub const Fill = struct {
++        seq: *Seq,
++        prompt: []u32,
++        sampling: ?lanes.Sampling,
++        opts: PrefillOptions,
++        left: usize = 5,
++        kept: ?*Snapshot = null,
++        first: u32 = 0,
++        done: bool = false,
++    };
++
++    pub fn fillBegin(t: *Toy, q: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !*Fill {
++        if (prompt.len == 0 or prompt.len > q.limit) return error.ToyMisuse;
++        const fl = try t.gpa.create(Fill);
++        fl.* = .{ .seq = q, .prompt = try t.gpa.dupe(u32, prompt), .sampling = sampling, .opts = o };
++        t.fills += 1;
++        return fl;
++    }
++
++    pub fn fillStep(t: *Toy, fl: *Fill, layers: usize) !bool {
++        if (fl.done) return true;
++        fl.left -|= layers;
++        if (fl.left > 0) return false;
++        // the slices' effect: the same pass prefillWith makes, on this fill's sequence
++        const keep = t.bound;
++        t.bound = fl.seq;
++        defer t.bound = keep;
++        const r = try t.prefillWith(fl.prompt, fl.sampling, fl.opts);
++        fl.kept = r.kept;
++        fl.first = r.first;
++        fl.done = true;
++        return true;
++    }
++
++    pub fn fillFree(t: *Toy, fl: *Fill) void {
++        if (fl.kept) |k| t.freeSnapshot(k);
++        t.gpa.free(fl.prompt);
++        t.gpa.destroy(fl);
++        t.fills -= 1;
++    }
++
++    pub fn copyPrefix(t: *Toy, dst: *Seq, src: *Seq, rows: usize, mtp_rows: usize) !void {
++        _ = mtp_rows;
++        if (rows > src.tokens.items.len) return error.PrefixPastSource;
++        dst.tokens.clearRetainingCapacity();
++        try dst.tokens.appendSlice(t.gpa, src.tokens.items[0..rows]);
++    }
++
++    pub fn freeSnapshot(t: *Toy, snap: *Snapshot) void {
++        t.gpa.free(snap.tokens);
++        t.gpa.destroy(snap);
++        t.snaps -= 1;
++    }
++    pub fn pos(t: *Toy) u64 {
++        return t.seq().tokens.items.len;
++    }
++    pub fn forward(t: *Toy, tokens: []const u32) !void {
++        if (t.seq().tokens.items.len + tokens.len > t.seq().limit) return error.SeqFull;
++        @memcpy(t.window[0..tokens.len], tokens);
++        t.rows = tokens.len;
++        t.forwards += 1;
++    }
++    pub fn sample(t: *Toy, rows: usize, first: u64, out: []u32) !void {
++        const q = t.seq();
++        if (first != q.tokens.items.len + 1 or rows != t.rows) return error.ToyMisuse;
++        for (0..rows) |i| out[i] = next(q.tokens.items, t.window[0 .. i + 1], q.sampling, first + i);
++    }
++    pub fn commit(t: *Toy, rows: usize, keep: usize) !void {
++        if (keep < 1 or keep > rows or rows != t.rows) return error.ToyMisuse;
++        try t.seq().tokens.appendSlice(t.gpa, t.window[0..keep]);
++        t.rows = 0;
++    }
++    pub fn absorb(t: *Toy, source: decode.Source, next_tokens: []const u32) !void {
++        const q = t.seq();
++        // the head drops its last chain and must take exactly the rows committed since it last absorbed
++        q.head.shrinkRetainingCapacity(q.absorbed);
++        const behind = q.tokens.items.len - q.absorbed;
++        if (behind != next_tokens.len) return error.HeadOutOfStep;
++        if (source == .prefill_last and behind != 1) return error.HeadOutOfStep;
++        try q.head.appendSlice(t.gpa, q.tokens.items[q.absorbed..]);
++        q.absorbed = q.tokens.items.len;
++        // the head's input after the kept rows is the token the target drew after the last of them
++        try q.head.append(t.gpa, next_tokens[next_tokens.len - 1]);
++    }
++    pub fn chain(t: *Toy, token: u32, _: usize) !void {
++        try t.seq().head.append(t.gpa, token);
++    }
++    // -- the shared rounds (cuda_engine's verifyMany / sampleWindow / commitWindow / draftMany) --
++
++    pub fn verifyMany(t: *Toy, windows: []const Window) !void {
++        if (windows.len == 0 or windows.len > max_streams) return error.ToyMisuse;
++        for (windows, 0..) |w, i| {
++            if (w.seq.tokens.items.len + w.tokens.len > w.seq.limit) return error.SeqFull;
++            t.round_windows[i] = .{ .seq = w.seq, .tokens = undefined, .n = w.tokens.len };
++            @memcpy(t.round_windows[i].tokens[0..w.tokens.len], w.tokens);
++        }
++        t.round_n = windows.len;
++        t.rounds += 1;
++        t.forwards += 1;
++        t.widest = @max(t.widest, windows.len);
++    }
++    pub fn sampleWindow(t: *Toy, i: usize, s: ?lanes.Sampling, out: []u32) !void {
++        if (i >= t.round_n) return error.ToyMisuse;
++        const w = t.round_windows[i];
++        const done = w.seq.tokens.items;
++        for (0..w.n) |r| out[r] = next(done, w.tokens[0 .. r + 1], s, done.len + 1 + r);
++    }
++    pub fn commitWindow(t: *Toy, i: usize, keep: usize) !void {
++        if (i >= t.round_n) return error.ToyMisuse;
++        const w = &t.round_windows[i];
++        if (keep < 1 or keep > w.n) return error.ToyMisuse;
++        try w.seq.tokens.appendSlice(t.gpa, w.tokens[0..keep]);
++        w.n = 0; // committed once
++    }
++    pub fn draftMany(t: *Toy, reqs: []DraftReq) !void {
++        for (reqs) |*r| {
++            const q = r.seq;
++            q.head.shrinkRetainingCapacity(q.absorbed);
++            const behind = q.tokens.items.len - q.absorbed;
++            if (behind != r.next.len) return error.HeadOutOfStep;
++            switch (r.source) {
++                .prefill_last => if (behind != 1) return error.HeadOutOfStep,
++                .window => |w| if (w >= t.round_n or t.round_windows[w].seq != q) return error.ToyMisuse,
++            }
++            try q.head.appendSlice(t.gpa, q.tokens.items[q.absorbed..]);
++            q.absorbed = q.tokens.items.len;
++            try q.head.append(t.gpa, r.next[r.next.len - 1]);
++            r.drafted = 0;
++            const pos0 = q.tokens.items.len + 1;
++            var stop: decode.Stop = .{ .c = r.confidence };
++            for (0..@min(r.count, r.out.len)) |j| {
++                const g = t.guessOn(q, r.sampling, pos0 + j);
++                const take = stop.take(j, g.prob);
++                if (!take.propose) break;
++                r.out[r.drafted] = g.token;
++                r.drafted += 1;
++                if (!take.more) break;
++                try q.head.append(t.gpa, g.token);
++            }
++        }
++    }
++
++    fn guess(t: *Toy, position: u64) decode.Draw {
++        return t.guessOn(t.seq(), t.seq().sampling, position);
++    }
++
++    fn guessOn(t: *Toy, q: *Seq, sampling: ?lanes.Sampling, position: u64) decode.Draw {
++        const h_items = q.head.items;
++        const want = next(h_items[0..q.absorbed], h_items[q.absorbed..], sampling, position);
++        var h = std.hash.Wyhash.init(t.head_err);
++        h.update(std.mem.asBytes(&position));
++        h.update(std.mem.sliceAsBytes(h_items[q.absorbed..]));
++        const r = h.final() % 10;
++        return if (r < 7) .{ .token = want, .prob = if (r == 0) 0.6 else 0.9 } else .{ .token = (want + 1) % 50, .prob = if (r == 9) 0.5 else 0.8 };
++    }
++    pub fn sampleDraft(t: *Toy, position: u64) !decode.Draw {
++        return t.guess(position);
++    }
++    pub fn drawDraft(t: *Toy, position: u64) !u32 {
++        return t.guess(position).token;
++    }
++    pub fn isEos(_: *Toy, token: u32) bool {
++        return token == 49;
++    }
++};

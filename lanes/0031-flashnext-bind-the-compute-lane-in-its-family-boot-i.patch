@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:21:24 +0700
+Subject: [PATCH 31/79] flashnext: bind the compute lane in its family, boot it
+ on the CUDA host
+
+Flash-Next's binding (generic TF_COMPUTE_LANE*, the python tool) moves from
+core/compute_binding.zig to families/flashnext/compute_binding.zig and the
+family Namespace declares it as compute. The generic CUDA host sets
+Info.compute and Info.compute_tool for any family that declares compute.
+DeepSeek-V4.1's binding and tests are unchanged.
+---
+ zig/build/cuda_fault_host.zig                 |  1 +
+ zig/src/core/compute_binding.zig              |  4 +--
+ zig/src/core/compute_lane_unit_test.zig       | 14 +++-------
+ .../families/flashnext/compute_binding.zig    | 26 +++++++++++++++++++
+ zig/src/families/flashnext/cuda_lanes.zig     |  1 +
+ zig/src/families/flashnext/cuda_launch.zig    |  1 +
+ zig/src/native/cuda.zig                       |  2 ++
+ zig/src/native/cuda_device.zig                | 10 +++++++
+ 8 files changed, 45 insertions(+), 14 deletions(-)
+ create mode 100644 zig/src/families/flashnext/compute_binding.zig
+
+diff --git a/zig/build/cuda_fault_host.zig b/zig/build/cuda_fault_host.zig
+index f33c59023..717950cce 100644
+--- a/zig/build/cuda_fault_host.zig
++++ b/zig/build/cuda_fault_host.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ pub fn steps(b: *std.Build, cuda: *std.Build.Module, flashnext: *std.Build.Module, native: *std.Build.Module) void {
+     b.step("test-cuda-context-health-host", "Sticky CUDA context faults and real graph-instantiation refusal without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "CUDA context health:", "CUDA graph refusal:" } })).step);
+     b.step("test-flashnext-loader-host", "The threaded NVFP4 expert loader: the loop's words, no pinned or device memory left after a failed load, geometry first").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next expert loader:"} })).step);
++    b.step("test-flashnext-compute-host", "Flash Next's compute lane binding: the generic knob names and the python tool").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next compute lane:"} })).step);
+     b.step("test-flashnext-completion-host", "Actual CUDA sequence rollback drains asynchronous destinations before release").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = flashnext, .filters = &.{"Flash Next completion:"} })).step);
+     b.step("test-cuda-fault-admission-host", "Sticky context health reaches native status and queue admission").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"CUDA context health:"} })).step);
+     b.step("test-cuda-readiness-host", "Real native readiness and synchronous startup preparation without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"family readiness reaches"} })).step);
+diff --git a/zig/src/core/compute_binding.zig b/zig/src/core/compute_binding.zig
+index ab9b028be..6d6d8b24e 100644
+--- a/zig/src/core/compute_binding.zig
++++ b/zig/src/core/compute_binding.zig
+@@ -32,7 +32,5 @@ fn anySet(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8)
+     return false;
+ }
+ 
+-/// DeepSeek-V4.1: the generic names, or TF_DSV41_COMPUTE_LANE* as before.
++/// DeepSeek-V4.1: the generic names, or TF_DSV41_COMPUTE_LANE* as before (Flash-Next: families/flashnext).
+ pub const dsv41: Binding = .{ .alias = "TF_DSV41_COMPUTE_LANE" };
+-/// Qwen3.8 Flash-Next (`qwen4_exp`): the generic names only. Its serve engine does not read it yet.
+-pub const flashnext: Binding = .{};
+diff --git a/zig/src/core/compute_lane_unit_test.zig b/zig/src/core/compute_lane_unit_test.zig
+index d6701de91..22a272548 100644
+--- a/zig/src/core/compute_lane_unit_test.zig
++++ b/zig/src/core/compute_lane_unit_test.zig
+@@ -61,17 +61,9 @@ test "compute lane binding: generic names or the family's alias, not both; the t
+     try std.testing.expectError(error.BadKnob, dsv41.parse(&lookup));
+     knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_DSV41_COMPUTE_LANE", "" } }; // empty is unset
+     try expect((try dsv41.parse(&lookup)) != null);
+-    // Flash-Next reads the generic names only
+-    const flashnext = lane.bindings.flashnext;
+-    knobs = &.{.{ "TF_DSV41_COMPUTE_LANE", "1" }};
+-    try expectEqual(null, try flashnext.parse(&lookup));
+-    knobs = &.{.{ "TF_COMPUTE_LANE", "1" }};
+-    try expect((try flashnext.parse(&lookup)) != null);
+-    inline for (.{ dsv41, flashnext }) |b| {
+-        try expectEqualStrings("python", b.tool.name);
+-        try expectEqualStrings("code_interpreter", b.tool.opt_in);
+-        try expectEqual(@as(i64, 1024), b.tool.min_tokens);
+-    }
++    try expectEqualStrings("python", dsv41.tool.name);
++    try expectEqualStrings("code_interpreter", dsv41.tool.opt_in);
++    try expectEqual(@as(i64, 1024), dsv41.tool.min_tokens);
+ }
+ 
+ test "compute lane config: every knob parses" {
+diff --git a/zig/src/families/flashnext/compute_binding.zig b/zig/src/families/flashnext/compute_binding.zig
+new file mode 100644
+index 000000000..619ec284c
+--- /dev/null
++++ b/zig/src/families/flashnext/compute_binding.zig
+@@ -0,0 +1,26 @@
++//! Qwen3.8 Flash-Next's (`qwen4_exp`) binding of the compute lane: the generic TF_COMPUTE_LANE* names, the python tool.
++const std = @import("std");
++const lane = @import("engine_api").hold.compute_lane;
++
++/// The native CUDA host boots it when the family declares `compute` (native/cuda.zig).
++pub const binding: lane.Binding = .{};
++
++var knobs: []const [2][]const u8 = &.{};
++fn lookup(name: []const u8) ?[]const u8 {
++    for (knobs) |kv| if (std.mem.eql(u8, kv[0], name)) return kv[1];
++    return null;
++}
++
++test "Flash Next compute lane: the generic names only, the python tool" {
++    knobs = &.{};
++    try std.testing.expectEqual(null, try binding.parse(&lookup));
++    knobs = &.{.{ "TF_DSV41_COMPUTE_LANE", "1" }}; // DeepSeek-V4.1's alias is not Flash-Next's
++    try std.testing.expectEqual(null, try binding.parse(&lookup));
++    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_COMPUTE_LANE_WORKERS", "2" } };
++    try std.testing.expectEqual(@as(u8, 2), (try binding.parse(&lookup)).?.workers);
++    knobs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_COMPUTE_LANE_DEFAULT", "maybe" } };
++    try std.testing.expectError(error.BadKnob, binding.parse(&lookup));
++    try std.testing.expectEqualStrings("python", binding.tool.name);
++    try std.testing.expectEqualStrings("code_interpreter", binding.tool.opt_in);
++    try std.testing.expectEqual(@as(i64, 1024), binding.tool.min_tokens);
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index ee6c4ff3d..056eb51dc 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -27,6 +27,7 @@ pub fn Namespace(comptime Tri: type) type {
+     return struct {
+         pub const model_type = "qwen4_exp";
+         pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed" };
++        pub const compute = @import("compute_binding.zig").binding; // TF_COMPUTE_LANE*: the host boots it
+         // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
+         pub const default_context: i64 = @intCast(prompt.max_tokens);
+         // a prompt runs on the batched pass in chunks of this many rows, one a prefill_step: no staggered segments
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 8fb1e343d..2503121f1 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -481,6 +481,7 @@ test {
+     _ = pocket;
+     _ = train;
+     _ = @import("living.zig");
++    _ = @import("compute_binding.zig");
+ }
+ 
+ test "embed grid is one program per row and per group of 32" {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index b49624635..8848bc3a2 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -465,6 +465,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .slide_conversations = conversations,
+         .readouts = readouts,
+         .text_generation = readouts == null, // a readout engine answers its readouts only (Clef's /v1/systemone)
++        .compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null, // replies hold at EOS
++        .compute_tool = if (@hasDecl(F, "compute")) F.compute.tool else .{},
+     }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0 or share, if (paged) |p| p.taken else 0, std.log); // TF_KV_SHARE: no copied rows
+diff --git a/zig/src/native/cuda_device.zig b/zig/src/native/cuda_device.zig
+index 384ed1c8f..6be8b9cdf 100644
+--- a/zig/src/native/cuda_device.zig
++++ b/zig/src/native/cuda_device.zig
+@@ -30,6 +30,16 @@ pub fn getenv(name: [:0]const u8) ?[]const u8 {
+     return std.mem.span(std.c.getenv(name) orelse return null);
+ }
+ 
++/// A knob a family binding names at run time (compute_lane.Binding.parse): blank is unset.
++pub fn knob(name: []const u8) ?[]const u8 {
++    var buf: [64]u8 = undefined;
++    if (name.len >= buf.len) return null;
++    @memcpy(buf[0..name.len], name);
++    buf[name.len] = 0;
++    const v = (@import("sys").environment.Process{}).get(buf[0..name.len :0]) orelse return null;
++    return if (std.mem.trim(u8, v, " \t\r\n").len == 0) null else v;
++}
++
+ /// The same strict setting contract as the direct CLI, with flags taking precedence over environment text.
+ pub fn setting(a: Allocator, flag: ?u32, comptime name: [:0]const u8, default: u32, problem: *[]const u8) !?u32 {
+     const settings = @import("sys").environment;

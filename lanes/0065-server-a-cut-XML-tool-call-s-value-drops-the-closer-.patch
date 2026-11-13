@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:59:38 +0700
+Subject: [PATCH 65/79] server: a cut XML tool call's value drops the closer it
+ began
+
+When max_tokens cut a reply inside a <parameter=...> value, finishCut sent
+the bytes it held back for the closer as argument text, so a cut that ended
+on the closer's first tokens streamed them: agentshape2 mixed12k-s0-t1 sent
+`echo \"no /work\"\n</` as the bash command's tail. A cut value now drops a
+start of </parameter> at its end and the framing newline before it, as a
+closed value drops its framing newline and as the GLM and DSML cuts already
+drop their closers. Bytes the value wrote stay; finish_reason stays length.
+
+Tests (test-tool-cut-host): the receipt's 63 answer tokens replayed as their
+decoded bytes, one event per token, whole and streamed; cuts inside the
+closer at each of its prefixes, typed and untyped; complete calls, the
+receipt's included, unchanged byte for byte.
+---
+ zig/build/cuda_server_host.zig   |   1 +
+ zig/src/server/tool_cut_test.zig | 110 +++++++++++++++++++++++++++++++
+ zig/src/server/tool_stream.zig   |   4 +-
+ 3 files changed, 114 insertions(+), 1 deletion(-)
+
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+index 2a33644f2..ee6a76036 100644
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -60,6 +60,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+     b.step("test-compute-lane-http-host", "The compute lane through the chat route: a held python call's result forced in (S3 too)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "compute lane:", "compute runner:" } })).step);
+     b.step("test-runner-server-host", "The in-model runner through the chat route: guide, live records, field anchors, thinking chats only").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "runner guide:", "runner commit ask:", "runner projection:", "runner live records:", "runner thinking only:" } })).step);
++    b.step("test-tool-cut-host", "Tool calls max_tokens cuts: whole and streamed replies agree, closers never in a cut value").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "tool cut:", "XML cut", "max_tokens cuts" } })).step);
+     b.step("test-request-deadline-host", "deadline_s: the server ends a reply at its deadline with usage and ids").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request deadline:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     @import("request_starts_host.zig").steps(b, native_modules.engines, server_tests);
+diff --git a/zig/src/server/tool_cut_test.zig b/zig/src/server/tool_cut_test.zig
+index 1bfa25ca7..7c2591a66 100644
+--- a/zig/src/server/tool_cut_test.zig
++++ b/zig/src/server/tool_cut_test.zig
+@@ -1,5 +1,6 @@
+ //! A reply that max_tokens cuts inside a tool call: the whole reply gives what the stream gave (#1238).
+ const std = @import("std");
++const api = @import("engine_api");
+ const pre = @import("stream_preflight_test.zig");
+ const TestText = pre.TestText;
+ const CallEngine = pre.CallEngine;
+@@ -102,3 +103,112 @@ test "a chunked XML cut drops only the pending framing newline" {
+     }
+     try expectCut(before ++ "\n\nThe histor", 1, "{\"path\":\"notes.txt\",\"content\":\"\\nThe histor", "", "");
+ }
++
++test "tool cut: an XML cut inside a value's closer drops the closer's bytes, as a GLM or DSML cut does" {
++    const args = "{\"path\":\"notes.txt\",\"content\":\"The history of";
++    inline for (.{ "\n</", "\n</param", "\n</parameter", "</par", "\n<", "\n" }) |tail| try expectCut(opened ++ tail, 1, args, "", "");
++    // bytes the value wrote stay, and a value its schema types is JSON up to the closer
++    try expectCut(opened ++ " a<b", 1, args ++ " a<b", "", "");
++    try expectCut(opened ++ "\n\n</", 1, args ++ "\\n", "", "");
++    try expectCut("<tool_call>\n<function=write_file>\n<parameter=limit>\n12\n</", 1, "{\"limit\":12", "", "");
++}
++
++/// The receipt's answer tokens as written, one engine event per token, then ``after``: the bytes it never reached.
++const PieceEngine = struct {
++    pieces: []const []const u8,
++    after: []const u8,
++
++    fn engine(e: *@This()) api.Engine {
++        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 4096 };
++    }
++
++    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const e: *PieceEngine = @ptrCast(@alignCast(ctx));
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        var ids: [64]u32 = undefined;
++        for (e.pieces) |piece| send(sink, id, piece, &ids);
++        send(sink, id, e.after, &ids);
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
++    }
++
++    fn send(sink: api.Sink, id: api.Id, piece: []const u8, ids: *[64]u32) void {
++        for (piece, ids[0..piece.len]) |byte, *t| t.* = byte;
++        sink.event(sink.ctx, id, &.{ .tokens = ids[0..piece.len] });
++    }
++
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++// agentshape2 mixed12k-s0-t1's answer as 188d9c63c cut it at max_tokens 384 (done line sha=cf988c151b1a): its tokens
++const receipt_ids = [_]u32{ 248058, 198, 27, 1628, 21402, 956, 29, 198, 27, 15704, 28, 5454, 29, 198, 24751, 976, 18997, 471, 4120, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 198, 248058, 198, 27, 1628, 21402, 956, 29, 198, 27, 15704, 28, 5454, 29, 198, 4577, 471, 4120, 593, 1715, 220, 17, 17566, 3464, 18710, 1321, 1627, 328, 2083, 593, 1715, 1, 198, 510 };
++// ...as the Flash-Next tokenizer decodes each, the reply's tokens 321..383
++const receipt = [_][]const u8{
++    "<tool_call>", "\n", "<",  "function", "=b", "ash", ">", "\n", "<", "parameter", "=", "command", ">", "\n", "pwd", " &&", " ls", " -", "la",   "\n", "</", "parameter", ">",   "\n",    "</",  "function", ">",   "\n", "</tool_call>", "\n",
++    "<tool_call>", "\n", "<",  "function", "=b", "ash", ">", "\n", "<", "parameter", "=", "command", ">", "\n", "ls",  " -",  "la",  " /", "work", " ",  "2",  ">/",        "dev", "/null", " ||", " echo",    " \"", "no", " /",           "work",
++    "\"",          "\n", "</",
++};
++comptime {
++    if (receipt.len != receipt_ids.len) @compileError("one piece per receipt token");
++}
++const bash = "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"," ++
++    "\"properties\":{\"command\":{\"type\":\"string\"}}}}}]";
++
++/// ``pieces`` then ``after``, max_tokens ``max``: whole and streamed replies give ``calls``, ``arguments``, ``finish``.
++fn expectPieces(pieces: []const []const u8, after: []const u8, max: usize, calls: usize, arguments: []const u8, finish: []const u8) !void {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const body = try std.fmt.allocPrint(a, "{{\"model\":\"test-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],{s},\"max_tokens\":{d}", .{ bash, max });
++    var backend: PieceEngine = .{ .pieces = pieces, .after = after };
++    const whole = try sendWith(backend.engine(), .chat, try std.mem.concat(a, u8, &.{ body, ",\"stream\":false}" }), .{});
++    const streamed = try sendWith(backend.engine(), .chat, try std.mem.concat(a, u8, &.{ body, ",\"stream\":true}" }), .{});
++    try std.testing.expectEqual(@as(?u16, 200), whole.status);
++    for ([_]@TypeOf(whole){ whole, streamed }) |seen| {
++        try std.testing.expectEqual(calls, seen.calls);
++        try std.testing.expectEqualStrings(arguments, seen.arguments[0..seen.arguments_len]);
++        try std.testing.expectEqualStrings(finish, @tagName(seen.finish.?));
++    }
++}
++
++fn byteLen(pieces: []const []const u8) usize {
++    var n: usize = 0;
++    for (pieces) |p| n += p.len;
++    return n;
++}
++
++const first_call = "{\"command\":\"pwd && ls -la\"}";
++
++test "tool cut: the agentshape2 receipt's cut call ends at the bytes the value wrote, with finish length" {
++    // 188d9c63c sent ``...echo \"no /work\"\n</``: the framing newline and the closer's first token
++    try expectPieces(&receipt, "parameter>\n</function>\n</tool_call>", byteLen(&receipt), 2, first_call ++ "{\"command\":\"ls -la /work 2>/dev/null || echo \\\"no /work\\\"", "length");
++}
++
++test "tool cut: complete calls stay byte for byte: the receipt's calls closed, and values that hold closer-like bytes" {
++    const closed = "parameter>\n</function>\n</tool_call>";
++    try expectPieces(&receipt, closed, 1024, 2, first_call ++ "{\"command\":\"ls -la /work 2>/dev/null || echo \\\"no /work\\\"\"}", "tool_calls");
++    // a value whose own bytes end like a closer's start, or in newlines before its framing one, keeps them
++    const values = [_]struct { []const u8, []const u8 }{
++        .{ "echo \"</\"\n", "echo \\\"</\\\"\\n" },
++        .{ "a <", "a <" },
++        .{ "x\n\n", "x\\n\\n" },
++        .{ "  \n", "  \\n" },
++    };
++    for (values) |v| {
++        const call = [_][]const u8{ "<tool_call>\n<function=bash>\n<parameter=command>\n", v[0], "\n</parameter>\n</function>\n</tool_call>" };
++        var buf: [96]u8 = undefined;
++        const want = try std.fmt.bufPrint(&buf, "{{\"command\":\"{s}\"}}", .{v[1]});
++        try expectPieces(&call, "", 1024, 1, want, "tool_calls");
++    }
++}
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index 70c1a76f5..eeaf31944 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -356,7 +356,7 @@ pub const Streamer = struct {
+         }
+     }
+ 
+-    /// ``feed`` of the reply's final text; a value it cuts sends the bytes held back for a closer that never came.
++    /// ``feed`` of the reply's final text; a cut value sends its held bytes less the start of a closer they end with.
+     pub fn finishCut(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
+         try s.feed(text, out);
+         if (s.state == .glm) return tool_glm_stream.cut(s, text, out); // a GLM value's held bytes
+@@ -364,6 +364,8 @@ pub const Streamer = struct {
+         if (s.state != .value) return;
+         var cut = try std.mem.concat(s.a, u8, &.{ if (s.typed) s.buffer.items else "", s.held, text[@min(s.pos, text.len)..] });
+         if (s.lead and cut.len > 0 and cut[0] == '\n') cut = cut[1..];
++        cut = cut[0 .. cut.len - reply_text.partialTag(cut, "</parameter>")];
++        if (std.mem.endsWith(u8, cut, "\n")) cut = cut[0 .. cut.len - 1]; // the framing newline, as a closed value drops it
+         s.lead = false;
+         s.pos = text.len;
+         s.held = "";

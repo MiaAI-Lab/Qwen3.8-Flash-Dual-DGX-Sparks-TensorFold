@@ -1,0 +1,440 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:36:08 +0700
+Subject: [PATCH 66/79] lanes: a backend names the prompts it holds mid-chunk;
+ the fill picker finishes an open chunk before switching
+
+Backend.open_fills (0: any; wrappers copy it) and Stream.fill_open (the backend's word after each prefill_step).
+When the open chunks are at the limit, lane_host_fill's pick and the fcfs oldest-long pick take only those, so an
+aged prompt no longer begins while another prompt's chunk holds the buffers. flashnext_mia's sliced fill
+(TF_FLASHNEXT_FILL=1) declares one: its fillStep refuses a second prompt mid-chunk (PromptBuffersBusy), which
+both TP2 ranks treated as fatal at the first c4 burst. The fake's stepped mode takes the same limit; the new test
+replays that sequence (four short prompts of seven calls each). lane_host_fill's Share-only tests move to
+lane_host_fill_open_test.zig with it.
+---
+ zig/src/core/lane_host_fill.zig               |  85 ++++---------
+ zig/src/core/lane_host_fill_open_test.zig     | 115 ++++++++++++++++++
+ zig/src/core/lanes/backend.zig                |   2 +
+ zig/src/core/lanes/drafted.zig                |   2 +-
+ zig/src/core/lanes/fake.zig                   |  17 ++-
+ zig/src/core/lanes/recorder.zig               |   2 +-
+ zig/src/core/lanes/stream.zig                 |   1 +
+ .../flashnext_mia/cuda_lanes_core.zig         |   2 +-
+ .../flashnext_mia/cuda_lanes_fill.zig         |   7 ++
+ .../flashnext_mia/cuda_mirror_ranks.zig       |   2 +-
+ 10 files changed, 166 insertions(+), 69 deletions(-)
+ create mode 100644 zig/src/core/lane_host_fill_open_test.zig
+
+diff --git a/zig/src/core/lane_host_fill.zig b/zig/src/core/lane_host_fill.zig
+index a1253dd14..7b3afa979 100644
+--- a/zig/src/core/lane_host_fill.zig
++++ b/zig/src/core/lane_host_fill.zig
+@@ -20,9 +20,11 @@ fn took(h: *const LaneHost, at: usize) usize {
+ 
+ /// The fill `next` takes among `among`, its waits untouched; null when none waits.
+ fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
++    const held = atOpenLimit(h); // the backend holds all the open chunks it can: only theirs may step
+     var found: ?usize = null;
+     for (h.filling.items, 0..) |j, i| {
+         if (among != .all and short(j) != (among == .short)) continue;
++        if (held and !open(j)) continue;
+         const at = found orelse {
+             found = i;
+             continue;
+@@ -41,6 +43,20 @@ fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
+     return found;
+ }
+ 
++/// A begun fill whose chunk the backend still holds open (`Backend.open_fills`).
++fn open(j: *const LaneHost.Job) bool {
++    return j.fill_began and j.stream.fill_open;
++}
++
++/// The backend's open chunks are at its limit: the next prompt call must continue one of them.
++fn atOpenLimit(h: *const LaneHost) bool {
++    const limit = h.core.backend.open_fills;
++    if (limit == 0) return false;
++    var n: usize = 0;
++    for (h.filling.items) |j| n += @intFromBool(open(j));
++    return n >= limit;
++}
++
+ fn remaining(h: *const LaneHost, j: *const LaneHost.Job) u64 {
+     const completed = if (j.fill_began and h.core.backend.vtable.reports_fill)
+         @max(j.stream.cached, j.stream.fill_at.load(.monotonic))
+@@ -200,6 +216,7 @@ fn policyRun(h: *LaneHost) void {
+ 
+ /// The first long prompt in `filling`, which is in admission order: admitOne appends, removal keeps the order.
+ fn oldestLong(h: *const LaneHost) ?usize {
++    if (atOpenLimit(h)) return pick(h, .long); // the open long prompt, or none while a short one holds the chunk
+     for (h.filling.items, 0..) |j, i| if (!short(j)) return i;
+     return null;
+ }
+@@ -317,50 +334,6 @@ fn runnable(h: *const LaneHost) usize {
+     return n;
+ }
+ 
+-test "a share of 0.5 owes the decoders a step's time; 1 owes nothing; rounds pay it down" {
+-    var s: Share = .{ .p = 0.5 };
+-    s.stepped(1000, true);
+-    try std.testing.expectEqual(@as(i64, 1000), s.debt_ns);
+-    s.stepped(1000, false);
+-    try std.testing.expectEqual(@as(i64, 1000), s.debt_ns);
+-    s.rounded(400);
+-    s.rounded(800);
+-    try std.testing.expectEqual(@as(i64, 0), s.debt_ns);
+-    var one: Share = .{};
+-    one.stepped(1000, true);
+-    try std.testing.expectEqual(@as(i64, 0), one.debt_ns);
+-    var q: Share = .{ .p = 0.25 };
+-    q.stepped(1000, true);
+-    try std.testing.expectEqual(@as(i64, 3000), q.debt_ns);
+-}
+-
+-test "a share below the floor, NaN and inf fall back to 1; the floor and 1 stand" {
+-    for ([_][]const u8{ "1e-12", "0.0099", "0", "-0.5", "nan", "inf", "-inf", "2", "x", "" }) |text| {
+-        try std.testing.expectEqual(@as(f64, 1), Share.fromText(text).p);
+-    }
+-    try std.testing.expectEqual(@as(f64, 0.01), Share.fromText("0.01").p);
+-    try std.testing.expectEqual(@as(f64, 1), Share.fromText("1").p);
+-}
+-
+-test "prefill service: TENSORFOLD_PREFILL_BUDGET is whole rows; unset, 0 or anything else is none, main's order" {
+-    for ([_][]const u8{ "", "0", "x", "-512", "+512", "5e2", "4294967296" }) |text| {
+-        try std.testing.expectEqual(@as(u64, 0), Share.budget(text));
+-    }
+-    try std.testing.expectEqual(@as(u64, 512), Share.budget("512"));
+-    try std.testing.expectEqual(@as(u64, 1), Share.budget(" 1\t"));
+-    try std.testing.expectEqual(@as(u64, 0), (Share{}).rows);
+-}
+-
+-test "a step's debt saturates instead of overflowing" {
+-    var s: Share = .{ .p = Share.min_share };
+-    s.stepped(std.math.maxInt(i64), true);
+-    try std.testing.expect(s.debt_ns > 0);
+-    s.stepped(std.math.maxInt(i64), true);
+-    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), s.debt_ns);
+-    s.rounded(1000);
+-    try std.testing.expect(s.debt_ns < std.math.maxInt(i64));
+-}
+-
+ test "prefill service: charge respects restored floors, stale progress and terminal removal" {
+     const lanes = @import("lanes");
+     const api = @import("engine_api.zig");
+@@ -446,6 +419,10 @@ test "prefill service: aged long priority keeps the existing stable winner over
+     try std.testing.expectEqual(@as(u64, 512), b.stream.fill_at.load(.monotonic));
+ }
+ 
++test {
++    _ = @import("lane_host_fill_open_test.zig");
++}
++
+ // TENSORFOLD_PREFILL_POLICY tests (the env is parsed in Share.fromEnv; these set host.share).
+ const PolicyCalls = struct {
+     host: *LaneHost,
+@@ -500,26 +477,6 @@ fn policyHost(comptime body: fn (*LaneHost, *PolicyCalls) anyerror!void, decoder
+     try body(&host, &calls);
+ }
+ 
+-test "prefill service: policy text and rows; unset or unknown is the default order, TOKENS clamped" {
+-    for ([_][]const u8{ "", "stock", "FCFS", "lifo", "batched", "x" }) |text| try std.testing.expectEqual(Share.Policy.stock, Share.policyOf(text));
+-    try std.testing.expectEqual(Share.Policy.fcfs, Share.policyOf("fcfs"));
+-    try std.testing.expectEqual(Share.Policy.fcfs, Share.policyOf(" fcfs\t"));
+-    try std.testing.expectEqual(Share.Policy.stock, (Share{}).policy);
+-    try std.testing.expectEqual(@as(u32, 2048), (Share{}).tokens);
+-    for ([_][]const u8{ "", "0", "x", "-1", "4294967296" }) |text| try std.testing.expectEqual(@as(u32, 2048), Share.tokensOf(text));
+-    for ([_]u32{ 2048, 4096, 8192, 16384 }) |n| { // the default and the measured options pass through unchanged
+-        var buf: [8]u8 = undefined;
+-        try std.testing.expectEqual(n, Share.tokensOf(try std.fmt.bufPrint(&buf, "{d}", .{n})));
+-    }
+-    try std.testing.expectEqual(@as(u32, 64), Share.tokensOf("1"));
+-    try std.testing.expectEqual(@as(u32, 64), Share.tokensOf("63"));
+-    try std.testing.expectEqual(@as(u32, 1000), Share.tokensOf("1000"));
+-    try std.testing.expectEqual(@as(u32, 8193), Share.tokensOf("8193"));
+-    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("16384"));
+-    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("16385"));
+-    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("65536"));
+-}
+-
+ test "prefill service: stock policy keeps the default hint and its one long step, call_rows or not" {
+     try policyHost(struct {
+         fn body(host: *LaneHost, calls: *PolicyCalls) !void {
+diff --git a/zig/src/core/lane_host_fill_open_test.zig b/zig/src/core/lane_host_fill_open_test.zig
+new file mode 100644
+index 000000000..6828e980e
+--- /dev/null
++++ b/zig/src/core/lane_host_fill_open_test.zig
+@@ -0,0 +1,115 @@
++//! lane_host_fill's Share parsing and its open-chunk rule (Backend.open_fills).
++const std = @import("std");
++const fill = @import("lane_host_fill.zig");
++const LaneHost = @import("lane_host.zig").LaneHost;
++const Share = fill.Share;
++
++test "a share of 0.5 owes the decoders a step's time; 1 owes nothing; rounds pay it down" {
++    var s: Share = .{ .p = 0.5 };
++    s.stepped(1000, true);
++    try std.testing.expectEqual(@as(i64, 1000), s.debt_ns);
++    s.stepped(1000, false);
++    try std.testing.expectEqual(@as(i64, 1000), s.debt_ns);
++    s.rounded(400);
++    s.rounded(800);
++    try std.testing.expectEqual(@as(i64, 0), s.debt_ns);
++    var one: Share = .{};
++    one.stepped(1000, true);
++    try std.testing.expectEqual(@as(i64, 0), one.debt_ns);
++    var q: Share = .{ .p = 0.25 };
++    q.stepped(1000, true);
++    try std.testing.expectEqual(@as(i64, 3000), q.debt_ns);
++}
++
++test "a share below the floor, NaN and inf fall back to 1; the floor and 1 stand" {
++    for ([_][]const u8{ "1e-12", "0.0099", "0", "-0.5", "nan", "inf", "-inf", "2", "x", "" }) |text| {
++        try std.testing.expectEqual(@as(f64, 1), Share.fromText(text).p);
++    }
++    try std.testing.expectEqual(@as(f64, 0.01), Share.fromText("0.01").p);
++    try std.testing.expectEqual(@as(f64, 1), Share.fromText("1").p);
++}
++
++test "prefill service: TENSORFOLD_PREFILL_BUDGET is whole rows; unset, 0 or anything else is none, main's order" {
++    for ([_][]const u8{ "", "0", "x", "-512", "+512", "5e2", "4294967296" }) |text| {
++        try std.testing.expectEqual(@as(u64, 0), Share.budget(text));
++    }
++    try std.testing.expectEqual(@as(u64, 512), Share.budget("512"));
++    try std.testing.expectEqual(@as(u64, 1), Share.budget(" 1\t"));
++    try std.testing.expectEqual(@as(u64, 0), (Share{}).rows);
++}
++
++test "a step's debt saturates instead of overflowing" {
++    var s: Share = .{ .p = Share.min_share };
++    s.stepped(std.math.maxInt(i64), true);
++    try std.testing.expect(s.debt_ns > 0);
++    s.stepped(std.math.maxInt(i64), true);
++    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), s.debt_ns);
++    s.rounded(1000);
++    try std.testing.expect(s.debt_ns < std.math.maxInt(i64));
++}
++
++test "prefill service: policy text and rows; unset or unknown is the default order, TOKENS clamped" {
++    for ([_][]const u8{ "", "stock", "FCFS", "lifo", "batched", "x" }) |text| try std.testing.expectEqual(Share.Policy.stock, Share.policyOf(text));
++    try std.testing.expectEqual(Share.Policy.fcfs, Share.policyOf("fcfs"));
++    try std.testing.expectEqual(Share.Policy.fcfs, Share.policyOf(" fcfs\t"));
++    try std.testing.expectEqual(Share.Policy.stock, (Share{}).policy);
++    try std.testing.expectEqual(@as(u32, 2048), (Share{}).tokens);
++    for ([_][]const u8{ "", "0", "x", "-1", "4294967296" }) |text| try std.testing.expectEqual(@as(u32, 2048), Share.tokensOf(text));
++    for ([_]u32{ 2048, 4096, 8192, 16384 }) |n| { // the default and the measured options pass through unchanged
++        var buf: [8]u8 = undefined;
++        try std.testing.expectEqual(n, Share.tokensOf(try std.fmt.bufPrint(&buf, "{d}", .{n})));
++    }
++    try std.testing.expectEqual(@as(u32, 64), Share.tokensOf("1"));
++    try std.testing.expectEqual(@as(u32, 64), Share.tokensOf("63"));
++    try std.testing.expectEqual(@as(u32, 1000), Share.tokensOf("1000"));
++    try std.testing.expectEqual(@as(u32, 8193), Share.tokensOf("8193"));
++    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("16384"));
++    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("16385"));
++    try std.testing.expectEqual(@as(u32, 16384), Share.tokensOf("65536"));
++}
++
++const OpenFills = struct {
++    fn event(_: *anyopaque, _: @import("engine_api.zig").Id, _: *const @import("engine_api.zig").Event) void {}
++};
++
++/// `n` short prompts admitted at once to a stepped fake that holds `open` chunks (0: any), filled to the end.
++fn fillShort(n: usize, open: u32) !struct { busy: usize, live: usize, steps: usize } {
++    const lanes = @import("lanes");
++    const api = @import("engine_api.zig");
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    // seven calls a prompt, as flashnext_mia's 8-layer slices of a short prompt
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 7, .open_fills = open };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
++    defer {
++        @import("lane_host_end.zig").closeAll(&host);
++        host.stop();
++    }
++    const prompt: [46]u32 = @splat(3);
++    var requests: [4]api.Request = undefined;
++    for (0..n) |i| {
++        requests[i] = .{ .prompt = &prompt, .max_tokens = 64, .drafts = false };
++        try host.engine().submit(@intCast(10 + i), &requests[i], .{ .ctx = &host, .event = OpenFills.event });
++        try std.testing.expect(host.admitOne());
++    }
++    var visits: usize = 0;
++    while (host.filling.items.len > 0 and visits < 64) : (visits += 1) fill.run(&host);
++    return .{ .busy = target.busy, .live = core.live.items.len, .steps = target.prefill_count };
++}
++
++test "prefill service: one open chunk at a time; aged prompts wait for it to end (FILL=1 PromptBuffersBusy)" {
++    // the lane trace's c4 wave: the first prompt's seven calls aged the others, and an aged one began mid-chunk
++    const one = try fillShort(4, 1);
++    try std.testing.expectEqual(@as(usize, 0), one.busy);
++    try std.testing.expectEqual(@as(usize, 4), one.live);
++    try std.testing.expectEqual(@as(usize, 4 * 7), one.steps);
++    // no limit: the picks may switch prompts mid-chunk, as such a backend allows
++    const any = try fillShort(4, 0);
++    try std.testing.expectEqual(@as(usize, 0), any.busy);
++    try std.testing.expectEqual(@as(usize, 4), any.live);
++}
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index bda839563..4e1f081b0 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -83,6 +83,8 @@ pub const Backend = struct {
+     penalties: bool = false,
+     /// Prompt fill gives the same tokens at any chunk cut, so --decode-share may cap its chunk rows; wrappers copy it.
+     chunk_invariant: bool = false,
++    /// Prompts prefill_step may hold mid-chunk at once (`Stream.fill_open`; 0: any); wrappers copy it.
++    open_fills: u32 = 0,
+     ptr: *anyopaque,
+     vtable: *const VTable,
+ 
+diff --git a/zig/src/core/lanes/drafted.zig b/zig/src/core/lanes/drafted.zig
+index e199b907d..1644e6b5b 100644
+--- a/zig/src/core/lanes/drafted.zig
++++ b/zig/src/core/lanes/drafted.zig
+@@ -71,7 +71,7 @@ pub const Drafted = struct {
+     };
+     pub fn backend(x: *Drafted) be.Backend {
+         const planned = if (x.drafter.proposal_head) |service| service.mode != .legacy and x.drafter.vtable.hold_planned != null and x.drafter.vtable.clear_proposals != null else false;
+-        return .{ .proposal_head = x.drafter.proposal_head, .ptr = x, .round_observer = x.target.round_observer, .first_before_draft = x.target.first_before_draft, .penalties = x.target.penalties, .chunk_invariant = x.target.chunk_invariant, .vtable = vtableFor(planned, x.target.vtable.prefill_step != null and x.target.vtable.reports_fill and x.target.vtable.features != null, x.target.vtable.cancel_prefill != null) };
++        return .{ .proposal_head = x.drafter.proposal_head, .ptr = x, .round_observer = x.target.round_observer, .first_before_draft = x.target.first_before_draft, .penalties = x.target.penalties, .chunk_invariant = x.target.chunk_invariant, .open_fills = x.target.open_fills, .vtable = vtableFor(planned, x.target.vtable.prefill_step != null and x.target.vtable.reports_fill and x.target.vtable.features != null, x.target.vtable.cancel_prefill != null) };
+     }
+ 
+     const cancellable: [4]be.Backend.VTable = blk: {
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 0d1abe1ca..8aade8591 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -67,6 +67,8 @@ pub const Fake = struct {
+     answer_cycles: bool = false,
+     prefill_chunks: usize = 0,
+     prefill_count: usize = 0,
++    open_fills: u32 = 0, // stepped(): a pass is one chunk; past this many open ones a step fails PromptBuffersBusy
++    busy: usize = 0, // prefill_step calls refused for open_fills
+     fail_pieces: usize = 0, // the next this many `piece` calls fail with error.Unbound
+     many_passes: usize = 0, // prefill_many calls that took their streams (batched())
+     many_streams: usize = 0, // streams those calls prefilled
+@@ -137,7 +139,7 @@ pub const Fake = struct {
+ 
+     /// The same target filling its prompt a chunk a call (`prefill_chunks`), as a backend with `prefill_step`.
+     pub fn stepped(x: *Fake) be.Backend {
+-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true };
++        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true }, .chunk_invariant = true, .open_fills = x.open_fills };
+     }
+ 
+     pub fn batchedSteps(x: *Fake) be.Backend {
+@@ -304,6 +306,10 @@ pub const Fake = struct {
+     fn prefillStep(ptr: *anyopaque, s: *Stream, max_rows: u32) anyerror!bool {
+         const x = self(ptr);
+         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
++        if (x.open_fills > 0 and !s.fill_open and x.openFills() >= x.open_fills) {
++            x.busy += 1; // as an engine with one set of prompt buffers refuses a second prompt mid-chunk
++            return error.PromptBuffersBusy;
++        }
+         if (x.memory_lanes) |n| if (!x.lanes.contains(s) and x.lanes.count() >= n) return error.LaneMemory;
+         const got = try x.newLane(s);
+         if (got.found_existing and !got.value_ptr.filling) freeLane(x.gpa, got.value_ptr);
+@@ -314,6 +320,7 @@ pub const Fake = struct {
+         if (s.isCancelled()) return error.Cancelled;
+         l.filled += 1;
+         const chunks: usize = @intCast(chunksFor(s.prompt_len, x.prefill_chunks, max_rows));
++        s.fill_open = x.open_fills > 0 and l.filled < chunks;
+         const at = @min(@as(u64, @intCast(s.prompt_len)), s.prompt_len * l.filled / @as(u64, @intCast(chunks)));
+         s.fill_at.store(@intCast(at), .monotonic);
+         try x.seed(l, s); // the kept rows are held from the first step, as the steps' features are asked for them
+@@ -324,6 +331,14 @@ pub const Fake = struct {
+         return true;
+     }
+ 
++    /// Streams whose pass is mid-chunk (a stepped pass is one chunk here).
++    fn openFills(x: *Fake) u32 {
++        var n: u32 = 0;
++        var it = x.lanes.keyIterator();
++        while (it.next()) |k| n += @intFromBool(k.*.fill_open);
++        return n;
++    }
++
+     /// The pass's chunk count: the configured one, more when the caller caps each chunk's rows.
+     fn chunksFor(prompt_len: u64, configured: usize, max_rows: u32) usize {
+         if (max_rows == 0) return @max(1, configured);
+diff --git a/zig/src/core/lanes/recorder.zig b/zig/src/core/lanes/recorder.zig
+index a21b8bc25..d56e3bd33 100644
+--- a/zig/src/core/lanes/recorder.zig
++++ b/zig/src/core/lanes/recorder.zig
+@@ -239,7 +239,7 @@ pub const Recorded = struct {
+     pub fn backend(x: *Recorded) be.Backend {
+         const v = x.inner.vtable;
+         x.table = .{ .prefill = prefill, .prefill_step = if (v.prefill_step != null) prefillStep else null, .cancel_prefill = if (v.cancel_prefill != null) cancelPrefill else null, .prefill_many = if (v.prefill_many != null) prefillMany else null, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .draft_capacity = if (v.draft_capacity != null) draftCapacity else null, .proposal_draft = if (v.proposal_draft != null) plannedDraft else null, .clear_proposals = if (v.clear_proposals != null) clearProposals else null, .unspeculate = if (v.unspeculate != null) unspeculate else null, .probabilities = if (v.probabilities != null) probabilities else null, .tree = if (v.tree != null) tree else null, .alternatives = if (v.alternatives != null) alternatives else null, .prepare_features = if (v.prepare_features != null) prepareFeatures else null, .features = features, .first_row = if (v.first_row != null) firstRow else null, .first_masked = if (v.first_masked != null) firstMasked else null, .score = if (v.score != null) score else null, .held = if (v.held != null) held else null, .prompt_rows = v.prompt_rows, .release = release };
+-        return .{ .proposal_head = x.inner.proposal_head, .ptr = x, .round_observer = x.inner.round_observer, .vtable = &x.table, .first_before_draft = x.inner.first_before_draft, .penalties = x.inner.penalties, .chunk_invariant = x.inner.chunk_invariant };
++        return .{ .proposal_head = x.inner.proposal_head, .ptr = x, .round_observer = x.inner.round_observer, .vtable = &x.table, .first_before_draft = x.inner.first_before_draft, .penalties = x.inner.penalties, .chunk_invariant = x.inner.chunk_invariant, .open_fills = x.inner.open_fills };
+     }
+ 
+     fn of(p: *anyopaque) *Recorded {
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index b09f23da6..2f524e292 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -171,6 +171,7 @@ pub const Stream = struct {
+     key: []const u32 = &.{},
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     fill_at: std.atomic.Value(u32) = .init(0), // prompt tokens the pass has prefilled; the engine thread writes
++    fill_open: bool = false, // a prefill_step chunk begun and not ended, as a backend with open_fills sets it
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+     reuse_error: ?anyerror = null, // the rejected restore's reason, logged once when its cache borrow is reported
+     context: std.ArrayList(u32) = .empty,
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_core.zig b/zig/src/families/flashnext_mia/cuda_lanes_core.zig
+index de78a130f..938ae2903 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes_core.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes_core.zig
+@@ -192,7 +192,7 @@ pub fn Lanes(comptime E: type) type {
+                 .tree = heldFn,
+                 .release = releaseFn,
+                 .prefill_step = fillStepFn,
+-            } };
++            }, .open_fills = 1 }; // the engine holds one prompt's buffers mid-chunk (fillStep: PromptBuffersBusy)
+             return .{ .ptr = self, .vtable = &.{
+                 .prefill = prefillFn,
+                 .first = firstFn,
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_fill.zig b/zig/src/families/flashnext_mia/cuda_lanes_fill.zig
+index 56c5cc61b..0b3598f03 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes_fill.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes_fill.zig
+@@ -93,6 +93,7 @@ pub fn Fill(comptime E: type) type {
+                 const l = self.lanes.get(s) orelse return error.UnknownStream;
+                 const f = &(l.fill orelse return error.NotFilling);
+                 const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
++                s.fill_open = !done and chunkOpen(self.e, f.fl); // the host steps no other prompt until it ends
+                 if (!done) continue;
+                 if (!f.final) {
+                     const m: u32 = @intCast(f.fl.prompt.len);
+@@ -270,6 +271,12 @@ pub fn Fill(comptime E: type) type {
+     };
+ }
+ 
++/// Whether fill `fl` holds the engine's prompt buffers mid-chunk; an engine without them holds none open.
++fn chunkOpen(e: anytype, fl: anytype) bool {
++    if (comptime !@hasField(@TypeOf(e.*), "pfill")) return false;
++    return if (e.pfill) |p| p == fl else false;
++}
++
+ pub fn passNow(e: anytype) std.Io.Timestamp {
+     e.stream.synchronize() catch {};
+     return std.Io.Timestamp.now(e.io, .awake);
+diff --git a/zig/src/families/flashnext_mia/cuda_mirror_ranks.zig b/zig/src/families/flashnext_mia/cuda_mirror_ranks.zig
+index be554674f..70f600549 100644
+--- a/zig/src/families/flashnext_mia/cuda_mirror_ranks.zig
++++ b/zig/src/families/flashnext_mia/cuda_mirror_ranks.zig
+@@ -130,7 +130,7 @@ pub const Leader = struct {
+             .release = releaseFn,
+         };
+         const i = self.inner; // f212's backend flags: the leader serves what its lanes do
+-        return .{ .ptr = self, .vtable = &self.vtable, .first_before_draft = i.first_before_draft, .penalties = i.penalties, .chunk_invariant = i.chunk_invariant };
++        return .{ .ptr = self, .vtable = &self.vtable, .first_before_draft = i.first_before_draft, .penalties = i.penalties, .chunk_invariant = i.chunk_invariant, .open_fills = i.open_fills };
+     }
+ 
+     fn of(p: *anyopaque) *Leader {

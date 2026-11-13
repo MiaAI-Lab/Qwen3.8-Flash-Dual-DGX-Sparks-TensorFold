@@ -33,7 +33,7 @@
 #            STOP_TIMEOUT (stop.sh); LOG_DIR, LOG_KEEP (saved server logs)
 #   ranks    every TENSORFOLD_*, TF_FLASHNEXT_*, TF_TP_*, TF_CUDA_*, TF_RUNNER_* and TF_COMPUTE_LANE_* variable goes
 #            to both ranks (TENSORFOLD_API_KEY by name only, to rank 0)
-#   lanes    ENGINE=lanes (opt-in compute lanes, README "Compute lanes"), LANES_REPO, LANES_REF, LANES_IMAGE
+#   lanes    ENGINE=lanes (opt-in compute lanes, README "Compute lanes"), LANES_REPO, LANES_REF (+ lanes/), LANES_IMAGE
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 # --quant Q (or --quant=Q) picks the checkpoint (QUANT) before the settings are read; the other arguments stay
@@ -117,7 +117,7 @@ printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
 printf '%s  %s (%s) · 2 x DGX Spark · %s at once · %s-token window · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID" "$QUANT_LABEL" \
   "$(arg_value --parallel)" "$(arg_value --context)" "$( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)" "$PORT" "$R"
 printf '%s  KV %s · vision %s · memory reserve %s GiB%s%s\n\n' "$D" "$KV_DTYPE" "$( [[ "$VISION" == 1 ]] && echo on || echo off)" \
-  "$TENSORFOLD_MEMORY_RESERVE_GIB" "$( [[ "$ENGINE" == lanes ]] && echo " · compute lanes (engine ${LANES_REF:0:9})")" "$R"
+  "$TENSORFOLD_MEMORY_RESERVE_GIB" "$( [[ "$ENGINE" == lanes ]] && echo " · compute lanes (engine tree ${LANES_TREE:0:9})")" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 

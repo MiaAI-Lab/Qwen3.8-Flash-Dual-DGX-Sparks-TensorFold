@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:25:21 +0700
+Subject: [PATCH 58/79] core lanes: TF_LANES_BUDGET_LOG prints each round's
+ draft budgets, the head's drafts and the overhead they priced
+
+Off by default and read once at engine init. When it is 1, each shared or lone head round writes one
+[lanes-budget] stderr line: live and round streams, rows, which budget rule ran (pooled, priced, fixed,
+stops, nodes, floor, shared or lone), whether the head's stops size the chains, the depths asked and the
+drafts the head holds per stream, the measured overhead, the rule's overheadMs estimate and its headMs.
+A [lanes-costs] line gives the shared-cost table and the overheads by streams every 32 logged rounds and
+when the table changes. The budgets and overhead events move into trail.zig, so engine.zig keeps its length.
+---
+ docs/environment.md                   |   1 +
+ zig/src/core/lanes/budget_log.zig     | 167 ++++++++++++++++++++++++++
+ zig/src/core/lanes/engine.zig         |  10 +-
+ zig/src/core/lanes/lanes.zig          |   1 +
+ zig/src/core/lanes/trail.zig          |  14 +++
+ zig/src/platform/environment.zig      |   1 +
+ zig/src/platform/environment_test.zig |   2 +
+ 7 files changed, 191 insertions(+), 5 deletions(-)
+ create mode 100644 zig/src/core/lanes/budget_log.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 08e4d6843..b40f0cfb6 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -15,6 +15,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TENSORFOLD_RESTORE_PREFETCH_GIB` | Whole unsigned 64-bit GiB count, capped at 16777216; default 16 |
+ | `TENSORFOLD_RESTORE_PREFETCH_MS` | Whole unsigned 64-bit milliseconds, capped at 1099511627776; default 30000 |
+ | `TENSORFOLD_TOOL_ID_KEY_FILE` | The path of the file that holds the key for tool-call ids ([API](api.md#messages-and-tools)). The file must be a regular file, not a link, that only its owner can read or write (`chmod 600`), with 32 to 4096 bytes in it, and the path must not contain control characters. When this is unset, each server process makes its own random key. If the file is wrong, the server does not start; the message names this setting but never shows the path or what the file holds |
++| `TF_LANES_BUDGET_LOG` | Exactly `0` or `1`; `1` writes a `[lanes-budget]` stderr line each shared or lone head round of the lane engine, and a `[lanes-costs]` line every 32 of them or when its shared-cost table changes; default off |
+ | `TF_CUDA_DEVICE` | Whole ordinal 0 through 4294967295, or empty; default 0 |
+ | `TF_CUDA_SEGMENTS` | Whole count 1 through 4, or empty; default 1 |
+ | `TF_CUDA_CARVEOUT` | Exactly `0` or `1`; default off |
+diff --git a/zig/src/core/lanes/budget_log.zig b/zig/src/core/lanes/budget_log.zig
+new file mode 100644
+index 000000000..63eab8327
+--- /dev/null
++++ b/zig/src/core/lanes/budget_log.zig
+@@ -0,0 +1,167 @@
++//! TF_LANES_BUDGET_LOG=1: one stderr line a shared or lone round with its draft budgets, the head's drafts and costs.
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const Stream = @import("stream.zig").Stream;
++const win = @import("windows.zig");
++
++pub const name = "TF_LANES_BUDGET_LOG";
++const costs_every = 32; // logged rounds between cost tables; a changed shared-cost table prints at once
++
++/// A round as its line prints it; a `got` below 0 is a stream whose head holds no count.
++pub const Line = struct {
++    step: u64,
++    live: usize,
++    streams: usize,
++    rows: u64,
++    path: []const u8,
++    stops: bool,
++    ask: []const i64,
++    got: []const i64,
++    over_ms: f64,
++    est_ms: f64,
++    head_ms: f64,
++};
++
++/// The switch (read once, at engine init) and a shared round's budgets, kept from its budgets to its overhead.
++pub const Log = struct {
++    on: bool = false,
++    logged: u64 = 0,
++    costs_hash: ?u64 = null,
++    path: []const u8 = "",
++    est_ms: f64 = 0,
++    sampled: bool = false,
++    ask: []const i64 = &.{},
++    budgets: []const i64 = &.{}, // the round's own slice, zeroed by root copies as headMs reads it
++    heads: []const *Stream = &.{},
++
++    pub fn init() Log {
++        comptime @import("sys").environment.registered(name);
++        return .{ .on = @import("sys").environment.read(bool, name, false) catch false };
++    }
++};
++
++/// Which budget rule ran, in Rule.budgets' (and the shared draft allocator's) order.
++fn pathName(e: *const Engine) []const u8 {
++    const r = &e.rule;
++    if (e.cfg.allocate_shared_drafts) return "shared";
++    if (r.confidence_floor != null) return "floor";
++    if (r.stopsNow()) return "stops";
++    if (r.node_probabilities) return "nodes";
++    if (r.pooled_budgets) return "pooled";
++    return if (r.draft_step_ms != 0) "priced" else "fixed";
++}
++
++/// At the round's budgets event: what the rule allocated against and the asks, before root copies zero any.
++pub fn budgets(e: *Engine, plans: []const win.Plan, heads: []const usize, depths: []const i64) !void {
++    const a = e.arena.allocator();
++    const ss = try a.alloc(*Stream, heads.len);
++    for (ss, heads) |*s, i| s.* = plans[i].stream;
++    var live: usize = 0;
++    for (plans) |p| live += @intFromBool(!p.stream.finished and !p.stream.paused);
++    const l = &e.blog;
++    l.sampled = win.anySampled(plans);
++    l.path = pathName(e);
++    const n = if (std.mem.eql(u8, l.path, "shared")) live else heads.len;
++    l.est_ms = if (std.mem.eql(u8, l.path, "fixed")) e.rule.fixedMs(n, l.sampled) else e.rule.overheadMs(n, l.sampled);
++    l.ask = try a.dupe(i64, depths);
++    l.budgets = depths;
++    l.heads = ss;
++}
++
++/// At the round's overhead event (`one`: a lone round's stream): the budget line, and the cost table when due.
++pub fn round(e: *Engine, one: ?*Stream, streams: usize, rows: u64, ms: f64) void {
++    const l = &e.blog;
++    var ask1 = [1]i64{0};
++    var got1 = [1]i64{0};
++    var got_buf: [256]i64 = undefined;
++    var line: Line = .{ .step = e.steps, .live = liveCount(e), .streams = streams, .rows = rows, .path = l.path, .stops = e.rule.stopsNow(), .ask = l.ask, .got = &.{}, .over_ms = ms, .est_ms = l.est_ms, .head_ms = 0 };
++    if (one) |s| {
++        ask1[0] = s.held_levels;
++        got1[0] = held(s);
++        line.path = "lone";
++        line.ask = &ask1;
++        line.got = &got1;
++        line.est_ms = e.rule.overheadMs(1, s.sampling != null);
++    } else {
++        const n = @min(l.heads.len, got_buf.len);
++        for (got_buf[0..n], l.heads[0..n]) |*g, s| g.* = held(s);
++        line.got = got_buf[0..n];
++        line.head_ms = e.rule.headMs(l.budgets);
++    }
++    const sampled = if (one) |s| s.sampling != null else l.sampled;
++    const kept = if (sampled) e.rule.overhead.items else e.rule.greedy_overhead.items;
++    const hash = tableHash(e.rule.shared_costs.slots);
++    if (l.logged % costs_every == 0 or (l.costs_hash orelse ~hash) != hash) {
++        var over: [64][3]f64 = undefined;
++        const k = @min(kept.len, over.len);
++        for (over[0..k], kept[0..k]) |*o, x| o.* = .{ @floatFromInt(x.streams), x.ms, x.head };
++        var table: [16384]u8 = undefined;
++        var tw: std.Io.Writer = .fixed(&table);
++        writeCosts(&tw, e.steps, e.rule.shared_costs.slots, over[0..k]) catch {};
++        std.debug.print("{s}\n", .{table[0..tw.end]});
++        l.costs_hash = hash;
++    }
++    l.logged += 1;
++    var buf: [4096]u8 = undefined;
++    var w: std.Io.Writer = .fixed(&buf);
++    writeLine(&w, line) catch {};
++    std.debug.print("{s}\n", .{buf[0..w.end]});
++    if (one == null) l.* = .{ .on = l.on, .logged = l.logged, .costs_hash = l.costs_hash };
++}
++
++fn held(s: *const Stream) i64 {
++    return if (s.next) |h| @intCast(h.count) else -1;
++}
++
++fn liveCount(e: *const Engine) usize {
++    var n: usize = 0;
++    for (e.live.items) |s| n += @intFromBool(!s.finished and !s.paused);
++    return n;
++}
++
++fn tableHash(slots: []const ?f64) u64 {
++    var h = std.hash.Wyhash.init(0);
++    for (slots, 0..) |slot, k| if (slot) |v| {
++        h.update(std.mem.asBytes(&k));
++        h.update(std.mem.asBytes(&v));
++    };
++    return h.final();
++}
++
++fn list(w: *std.Io.Writer, xs: []const i64) !void {
++    for (xs, 0..) |x, i| {
++        if (i > 0) try w.writeAll(",");
++        if (x < 0) try w.writeAll("-") else try w.print("{d}", .{x});
++    }
++}
++
++/// `[lanes-budget] step=.. live=.. streams=.. rows=.. path=.. stops=0|1 ask=a,b got=a,- over_ms= est_ms= head_ms=`.
++pub fn writeLine(w: *std.Io.Writer, x: Line) !void {
++    try w.print("[lanes-budget] step={d} live={d} streams={d} rows={d} path={s} stops={d} ask=", .{ x.step, x.live, x.streams, x.rows, x.path, @intFromBool(x.stops) });
++    try list(w, x.ask);
++    try w.writeAll(" got=");
++    try list(w, x.got);
++    try w.print(" over_ms={d:.3} est_ms={d:.3} head_ms={d:.3}", .{ x.over_ms, x.est_ms, x.head_ms });
++}
++
++/// `[lanes-costs] step=.. rows=R:ms,.. over=N:fixed+head,..`: the shared-cost table and the overheads by streams.
++pub fn writeCosts(w: *std.Io.Writer, step: u64, slots: []const ?f64, over: []const [3]f64) !void {
++    try w.print("[lanes-costs] step={d} rows=", .{step});
++    var first = true;
++    for (slots, 0..) |slot, k| if (slot) |v| {
++        try w.print("{s}{d}:{d:.3}", .{ if (first) "" else ",", k, v });
++        first = false;
++    };
++    try w.writeAll(" over=");
++    for (over, 0..) |o, i| try w.print("{s}{d}:{d:.3}+{d:.3}", .{ if (i == 0) "" else ",", @as(u64, @intFromFloat(o[0])), o[1], o[2] });
++}
++
++test "budget log: a round's line and the cost table print in the format one parser reads for both engines" {
++    var buf: [512]u8 = undefined;
++    var w: std.Io.Writer = .fixed(&buf);
++    try writeLine(&w, .{ .step = 7, .live = 16, .streams = 3, .rows = 9, .path = "pooled", .stops = false, .ask = &.{ 3, 0, 2 }, .got = &.{ 2, -1, 2 }, .over_ms = 1.25, .est_ms = 1.5, .head_ms = 0 });
++    try std.testing.expectEqualStrings("[lanes-budget] step=7 live=16 streams=3 rows=9 path=pooled stops=0 ask=3,0,2 got=2,-,2 over_ms=1.250 est_ms=1.500 head_ms=0.000", buf[0..w.end]);
++    w = .fixed(&buf);
++    try writeCosts(&w, 7, &.{ null, 5.0, 5.25 }, &.{ .{ 1, 0.5, 0 }, .{ 16, 2, 0.25 } });
++    try std.testing.expectEqualStrings("[lanes-costs] step=7 rows=1:5.000,2:5.250 over=1:0.500+0.000,16:2.000+0.250", buf[0..w.end]);
++}
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 127782ac4..062e02f7d 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -39,6 +39,7 @@ pub const Engine = struct {
+     backend: be.Backend,
+     clock: be.Clock,
+     log: ?*ev.Log = null,
++    blog: @import("budget_log.zig").Log = .{}, // TF_LANES_BUDGET_LOG, read at init
+     trim: ?trim.Trim = null, // a family's row policy in place of the built-in allocation (lanes/trim.zig)
+     rule: depth.Rule,
+     live: std.ArrayList(*Stream) = .empty, // admitted streams in admission order (Python `_live`)
+@@ -61,6 +62,7 @@ pub const Engine = struct {
+             .backend = backend,
+             .clock = clock,
+             .arena = std.heap.ArenaAllocator.init(gpa),
++            .blog = .init(),
+             .rule = .{
+                 .gpa = gpa,
+                 .k = cfg.k,
+@@ -248,7 +250,7 @@ pub const Engine = struct {
+         }
+         if (e.cfg.timed and plan.kind == .head) {
+             const ms = e.clock.elapsedMs(.overhead);
+-            try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(1)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
++            try trail.roundOverhead(e, s, 1, rows, ms);
+             try e.rule.observeOverhead(1, rows, ms, s.sampling != null, 0.0);
+         }
+         if (e.backend.round_observer != null) e.backend.observed(&.{o.path});
+@@ -294,9 +296,7 @@ pub const Engine = struct {
+             try @import("shared_drafts.zig").budgets(e, plans, heads.items, budgets)
+         else
+             try e.rule.budgets(whos, win.probe(e), sampled, budgets);
+-        const ids = try a.alloc(ev.Value, heads.items.len);
+-        for (ids, heads.items) |*id, i| id.* = str(plans[i].stream.id);
+-        try trail.event(e, &.{ f("ev", str("budgets")), f("streams", .{ .list = ids }), f("depths", .{ .i64s = budgets }) });
++        try trail.budgets(e, plans, heads.items, budgets);
+         if (heads.items.len > 0 and e.cfg.draft_streams) {
+             // every stream's head in one batch (the backend drafts a depth for all of them at once)
+             const requests = try a.alloc(be.DraftRequest, heads.items.len);
+@@ -319,7 +319,7 @@ pub const Engine = struct {
+             var steps: i64 = 0;
+             for (budgets) |d| steps = if (e.cfg.draft_streams and depth.pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
+             const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
+-            try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
++            try trail.roundOverhead(e, null, plans.len, total, ms);
+             try e.rule.observeOverhead(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets));
+         }
+         if (e.backend.round_observer != null) e.backend.observed(paths);
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index af04bc87b..926e9358a 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -34,6 +34,7 @@ pub const windows = @import("windows.zig");
+ pub const shared_drafts = @import("shared_drafts.zig");
+ pub const row_cost = @import("row_cost.zig");
+ pub const trail = @import("trail.zig");
++pub const budget_log = @import("budget_log.zig");
+ pub const engine = @import("engine.zig");
+ pub const hold = @import("hold.zig");
+ pub const round_trace = @import("round_trace.zig");
+diff --git a/zig/src/core/lanes/trail.zig b/zig/src/core/lanes/trail.zig
+index e68775c1b..218b82d00 100644
+--- a/zig/src/core/lanes/trail.zig
++++ b/zig/src/core/lanes/trail.zig
+@@ -22,6 +22,20 @@ pub fn event(e: *Engine, fields: []const ev.Field) !void {
+     if (e.log) |log| _ = try log.add(fields);
+ }
+ 
++/// A shared round's `budgets` event; under TF_LANES_BUDGET_LOG its budgets are kept for the round's line.
++pub fn budgets(e: *Engine, plans: []const @import("windows.zig").Plan, heads: []const usize, depths: []i64) !void {
++    const ids = try e.arena.allocator().alloc(Value, heads.len);
++    for (ids, heads) |*id, i| id.* = str(plans[i].stream.id);
++    try event(e, &.{ f("ev", str("budgets")), f("streams", .{ .list = ids }), f("depths", .{ .i64s = depths }) });
++    if (e.blog.on) try @import("budget_log.zig").budgets(e, plans, heads, depths);
++}
++
++/// A round's `overhead` event (`one`: a lone round's stream); under TF_LANES_BUDGET_LOG also its budget line.
++pub fn roundOverhead(e: *Engine, one: ?*Stream, streams: usize, rows: u64, ms: f64) !void {
++    try event(e, &.{ f("ev", str("overhead")), f("streams", int(streams)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
++    if (e.blog.on) @import("budget_log.zig").round(e, one, streams, rows, ms);
++}
++
+ pub fn pipe(e: *Engine, s: *Stream, before: ?sm.Mode, got: []const u32) !void {
+     try event(e, &.{ f("ev", str("pipe")), f("stream", str(s.id)), f("mode", modeName(before)), f("after", modeName(s.mode)), f("got", .{ .u32s = got }) });
+ }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index d5c13cf48..e1d8553b9 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -37,6 +37,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH", .scope = .common, .kind = .u64, .trim = " \t", .first_digit = true, .forms = "a whole unsigned 64-bit read count (0 disables reading ahead; capped at 65536)" },
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_GIB", .scope = .common, .kind = .u64, .trim = " \t", .first_digit = true, .forms = "a whole unsigned 64-bit GiB count (capped at 16777216)" },
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_MS", .scope = .common, .kind = .u64, .trim = " \t", .first_digit = true, .forms = "whole unsigned 64-bit milliseconds (capped at 1099511627776)" },
++    .{ .name = "TF_LANES_BUDGET_LOG", .scope = .common, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TENSORFOLD_TOOL_ID_KEY_FILE", .scope = .common, .kind = .path, .forms = "a path without control characters to a file only its owner can read, holding at least 32 key bytes" },
+     .{ .name = "TF_CUDA_DEVICE", .scope = .cuda, .kind = .device, .trim = " ", .forms = "a whole GPU ordinal from 0 to 4294967295, or empty for the default" },
+     .{ .name = "TF_CUDA_SEGMENTS", .scope = .cuda, .kind = .segments, .trim = " ", .forms = "a whole number from 1 to 4, or empty for the default" },
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 8fa77b058..3181f34b7 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -46,6 +46,8 @@ const valid = [_]Case{
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH", .raw = "65537", .n = 65537 },
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_GIB", .raw = "16777217", .n = 16777217 },
+     .{ .name = "TENSORFOLD_RESTORE_PREFETCH_MS", .raw = "1099511627777", .n = 1099511627777 },
++    .{ .name = "TF_LANES_BUDGET_LOG", .raw = "0", .n = 0 },
++    .{ .name = "TF_LANES_BUDGET_LOG", .raw = "1", .n = 1 },
+     .{ .name = "TENSORFOLD_TOOL_ID_KEY_FILE", .raw = "/etc/tensorfold/tool id.key", .n = 0 },
+     .{ .name = "TF_CUDA_DEVICE", .raw = " 3 ", .n = 3 },
+     .{ .name = "TF_CUDA_DEVICE", .raw = "4294967295", .n = std.math.maxInt(u32) },
