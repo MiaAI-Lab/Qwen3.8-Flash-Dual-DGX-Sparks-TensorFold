@@ -1,0 +1,376 @@
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 9f2ec3a..da212a9 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -257,6 +257,14 @@ fn envGet(name: [:0]const u8) ?[]const u8 {
+     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
+ }
+ 
++/// The GPU gather exchanges the two ranks' heads; a single rank supports only the host table.
++/// Shared with the native settings handshake so different placement cannot reach different collectives.
++pub fn ngramOnGpu(world: u32) !bool {
++    const gpu = if (envGet("TF_FLASHNEXT_NGRAM_ON_GPU")) |v| (try std.fmt.parseInt(u1, v, 10)) == 1 else world > 1;
++    if (gpu and world != 2) return error.NgramGpuRequiresTwoRanks;
++    return gpu;
++}
++
+ fn envOff(name: [:0]const u8) bool {
+     const v = envGet(name) orelse return false;
+     return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off");
+@@ -381,6 +389,10 @@ pub const Engine = struct {
+         const t0 = std.Io.Clock.awake.now(io);
+         if (o.world < 1 or o.world > 2 or o.rank >= o.world) return error.BadRank;
+         if (o.world > 1 and o.comm == null) return error.TwoRanksNeedComm;
++        const ngram_on_gpu = try ngramOnGpu(o.world);
++        const ngram_reader = std.meta.stringToEnum(weights.NgramReader, envGet("TF_FLASHNEXT_GATHER_READ") orelse "mmap") orelse return error.BadNgramReadMode;
++        const ngram_threads = if (envGet("TF_FLASHNEXT_GATHER_THREADS")) |v| try std.fmt.parseInt(usize, v, 10) else weights.ngram_max_threads;
++        if (ngram_threads == 0 or ngram_threads > weights.ngram_max_threads) return error.BadNgramThreads;
+         if (o.depth > state.max_rows - 1) return error.DepthPastWindow;
+         const e = try gpa.create(Engine);
+         errdefer gpa.destroy(e);
+@@ -400,8 +412,9 @@ pub const Engine = struct {
+         // and MTP experts; lossy against the bf16 ones, opt-in)
+         var overlay_buf: [1024]u8 = undefined;
+         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
+-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
++        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay, .ngram_on_gpu = ngram_on_gpu, .ngram_reader = ngram_reader, .ngram_threads = ngram_threads });
+         errdefer e.w.deinit();
++        if (e.w.table) |t| std.log.info("n-gram table: {s}, {d:.2} GiB on disk", .{ if (t.gpu == null) "SSD-backed host mapping (reclaimable, no GPU table)" else "GPU resident", @as(f64, @floatFromInt(t.rows * t.width * @as(u64, if (t.fp8) 1 else 2))) / (1 << 30) });
+         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
+         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
+         e.g.kv = o.kv;
+@@ -572,7 +585,14 @@ pub const Engine = struct {
+         // MemAvailable counts the mapped n-gram table's reclaimable pages (they then page from disk, as Python's
+         // admission accepts); the device's own count of free memory leaves them out
+         const free = memAvailable(io) orelse (try ctx.memInfo()).free;
+-        e.budget = .{ .limit = o.kv_budget orelse (free -| reserve -| o.vision_reserve) };
++        var budget = free -| reserve -| o.vision_reserve;
++        if (envGet("TF_FLASHNEXT_KV_GIB")) |v| {
++            const gib = try std.fmt.parseFloat(f64, v);
++            if (!std.math.isFinite(gib) or gib <= 0) return error.BadKvBudget;
++            const bytes = gib * (1 << 30);
++            if (bytes < @as(f64, @floatFromInt(budget))) budget = @intFromFloat(bytes);
++        }
++        e.budget = .{ .limit = o.kv_budget orelse budget };
+         if (o.vision_reserve > 0) std.log.info("vision: {d:.2} GiB kept free for the image tower's workspace", .{@as(f64, @floatFromInt(o.vision_reserve)) / (1 << 30)});
+         // two ranks decide growth together: both take the smaller budget
+         if (o.comm) |cm| {
+diff --git a/zig/src/families/flashnext/cuda_native.zig b/zig/src/families/flashnext/cuda_native.zig
+index f20517a..42f61a3 100644
+--- a/zig/src/families/flashnext/cuda_native.zig
++++ b/zig/src/families/flashnext/cuda_native.zig
+@@ -367,8 +367,8 @@ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kern
+     const yt = if (yarn) |v| try std.fmt.bufPrint(&y, "{d}x{d}/ramp{d}/att{d}", .{ v.factor, v.original, v.ramp_positions, v.attention() }) else "off";
+     const fill = getenv("TF_FLASHNEXT_FILL") orelse "0";
+     const fill_layers = getenv("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
+-    return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} confidence={d}/{d} yarn={s} fill={s}/{s} kv={s} kernels={x}", .{
+-        o.tp, base, snapshot, o.context, o.parallel, o.drafts, depth, @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, @tagName(o.kv_dtype), kernel_set,
++    return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} confidence={d}/{d} yarn={s} fill={s}/{s} kv={s} kernels={x} ngram_gpu={}", .{
++        o.tp, base, snapshot, o.context, o.parallel, o.drafts, depth, @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, @tagName(o.kv_dtype), kernel_set, try @import("cuda_engine.zig").ngramOnGpu(o.tp),
+     });
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_ngram_pool.zig b/zig/src/families/flashnext/cuda_ngram_pool.zig
+new file mode 100644
+index 0000000..7c97d14
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_ngram_pool.zig
+@@ -0,0 +1,111 @@
++//! Adapted from TensorFold v1.2.5 cuda_ple_pool.zig by the TensorFold contributors.
++//! The n-gram gather's parked host workers; parts claimed from one counter, each claim waking one more worker.
++const std = @import("std");
++
++/// The most parts a call may have (the caller beside up to 127 workers).
++pub const max_parts = 128;
++
++/// One part of a call: `run(ctx, part)`.
++pub const Task = struct {
++    ctx: *const anyopaque,
++    run: *const fn (ctx: *const anyopaque, part: usize) anyerror!void,
++};
++
++pub const Pool = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    mutex: std.Io.Mutex = .init, // one call at a time
++    threads: [max_parts - 1]std.Thread = undefined,
++    go: [max_parts - 1]std.atomic.Value(u32) = undefined, // bumped to wake a worker: to claim parts, or to stop
++    spawned: usize = 0,
++    stopping: std.atomic.Value(bool) = .init(false),
++    // the current call: generation << 32 | parts << 16 | parts claimed (a claim is a compare-exchange on all three)
++    state: std.atomic.Value(u64) = .init(0),
++    done: std.atomic.Value(u32) = .init(0), // parts finished
++    waking: std.atomic.Value(u32) = .init(0), // workers woken
++    task: Task = undefined,
++    failed: [max_parts]?anyerror = undefined,
++
++    pub fn create(gpa: std.mem.Allocator, io: std.Io) !*Pool {
++        const p = try gpa.create(Pool);
++        p.* = .{ .gpa = gpa, .io = io };
++        return p;
++    }
++
++    /// Wakes every worker to exit, joins them and frees the pool.
++    pub fn destroy(p: *Pool) void {
++        p.stopping.store(true, .release);
++        for (p.go[0..p.spawned]) |*g| {
++            _ = g.fetchAdd(1, .release);
++            p.io.futexWake(u32, &g.raw, 1);
++        }
++        for (p.threads[0..p.spawned]) |th| th.join();
++        p.gpa.destroy(p);
++    }
++
++    /// Runs parts 0..parts-1 of `task` and returns when all are done: the first failed part's error, in part order.
++    pub fn run(p: *Pool, parts: usize, task: Task) !void {
++        if (parts == 0) return;
++        if (parts > max_parts) return error.TooManyParts;
++        p.mutex.lockUncancelable(p.io);
++        defer p.mutex.unlock(p.io);
++        while (p.spawned < parts - 1) {
++            p.go[p.spawned] = .init(0);
++            p.threads[p.spawned] = try std.Thread.spawn(.{}, work, .{ p, p.spawned });
++            p.spawned += 1;
++        }
++        p.task = task;
++        @memset(p.failed[0..parts], null);
++        p.done.store(0, .monotonic);
++        p.waking.store(0, .monotonic);
++        const gen = (p.state.load(.monotonic) >> 32) +% 1;
++        p.state.store(gen << 32 | @as(u64, parts) << 16, .release);
++        p.drain();
++        while (true) {
++            const done = p.done.load(.acquire);
++            if (done == parts) break;
++            p.io.futexWaitUncancelable(u32, &p.done.raw, done);
++        }
++        for (p.failed[0..parts]) |f| if (f) |err| return err;
++    }
++
++    /// Claims and runs parts of the current call until none is left unclaimed.
++    fn drain(p: *Pool) void {
++        var s = p.state.load(.acquire);
++        while (true) {
++            const parts: u32 = @intCast(s >> 16 & 0xffff);
++            const part: u32 = @intCast(s & 0xffff);
++            if (part >= parts) return;
++            if (p.state.cmpxchgWeak(s, s + 1, .acq_rel, .acquire)) |now| {
++                s = now;
++                continue;
++            }
++            if (part + 1 < parts) p.wakeOne(parts - 1);
++            p.failed[part] = if (p.task.run(p.task.ctx, part)) null else |err| err;
++            if (p.done.fetchAdd(1, .acq_rel) + 1 == parts) p.io.futexWake(u32, &p.done.raw, 1);
++            s = p.state.load(.acquire);
++        }
++    }
++
++    /// Wakes the next parked worker: a call of quick parts stays mostly on the caller, one of slow parts fans out.
++    fn wakeOne(p: *Pool, workers: u32) void {
++        const w = p.waking.fetchAdd(1, .monotonic);
++        if (w >= workers) return;
++        _ = p.go[w].fetchAdd(1, .release);
++        p.io.futexWake(u32, &p.go[w].raw, 1);
++    }
++
++    fn work(p: *Pool, w: usize) void {
++        var seen: u32 = 0;
++        while (true) {
++            const now = p.go[w].load(.acquire);
++            if (now == seen) {
++                p.io.futexWaitUncancelable(u32, &p.go[w].raw, seen);
++                continue;
++            }
++            seen = now;
++            if (p.stopping.load(.acquire)) return;
++            p.drain();
++        }
++    }
++};
+diff --git a/zig/src/families/flashnext/cuda_weights.zig b/zig/src/families/flashnext/cuda_weights.zig
+index e000172..0b96c8d 100644
+--- a/zig/src/families/flashnext/cuda_weights.zig
++++ b/zig/src/families/flashnext/cuda_weights.zig
+@@ -27,12 +27,15 @@ const ngram = @import("cuda_ngram.zig");
+ const ropes = @import("cuda_rope.zig");
+ const fp8 = @import("cuda_fp8.zig");
+ const int4 = @import("cuda_int4.zig");
++const ngram_pool = @import("cuda_ngram_pool.zig");
+ 
+ const Config = cfgs.Config;
+ const st = core.safetensors;
+ const Tensor = st.Tensor;
+ 
+ pub const Mode = enum { device, hash, count };
++pub const NgramReader = enum { mmap, pread };
++pub const ngram_max_threads = ngram_pool.max_parts;
+ 
+ /// The default draft vocabulary (qwen4_exp/cuda/draft_vocab.txt, 79,591 ids), embedded.
+ pub const draft_vocab = @embedFile("cuda_draft_vocab.txt");
+@@ -46,6 +49,9 @@ pub const Options = struct {
+     draft_head: bool = true,
+     /// the n-gram table's rows on the GPU (a rank's heads); null: on the GPU at two ranks, host-mapped at one
+     ngram_on_gpu: ?bool = null,
++    /// Host reader; mmap retains the original path. Positional reads are explicitly selected by the engine.
++    ngram_reader: NgramReader = .mmap,
++    ngram_threads: usize = ngram_max_threads,
+     mode: Mode = .device,
+     /// the CUDA driver (its context current) for `.device`
+     driver: ?*const cuda.Driver = null,
+@@ -114,13 +120,16 @@ pub const Named = struct {
+     }
+ };
+ 
+-/// The FP8 (or bf16) n-gram table: the shards memory-mapped, a gather a lookup at a time (host_table.FP8Table), and
+-/// on the GPU a rank's heads' rows with the LUT.
++/// FP8 (or bf16) rows: mapped on the host, optionally read in parallel with pread, or a rank's heads on the GPU.
++/// The parked pool and distinct-row ordering are adapted from TensorFold v1.2.5's cuda_ple_{pool,gather,reader}.
+ pub const NgramTable = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+     files: std.ArrayList(st.File) = .empty,
+     shards: std.ArrayList([]const u8) = .empty,
++    disk: std.ArrayList(struct { file: std.Io.File, at: u64 }) = .empty,
++    pool: ?*ngram_pool.Pool = null,
++    threads: usize = ngram_pool.max_parts,
+     /// each shard's first global row, then the total
+     starts: std.ArrayList(u64) = .empty,
+     rows: u64 = 0,
+@@ -132,18 +141,25 @@ pub const NgramTable = struct {
+     gpu: ?struct { rows: u64, lut: u64, base: u64, count: u64, head0: u32, heads: u32 } = null,
+ 
+     pub fn deinit(t: *NgramTable) void {
++        if (t.pool) |p| p.destroy();
+         for (t.files.items) |*f| f.close(t.io);
+         t.files.deinit(t.gpa);
+         t.shards.deinit(t.gpa);
++        t.disk.deinit(t.gpa);
+         t.starts.deinit(t.gpa);
+         t.* = undefined;
+     }
+ 
+-    fn row(t: *const NgramTable, id: u64) []const u8 {
++    fn shard(t: *const NgramTable, id: u64) usize {
+         // shards are equal but for the last: a division finds the shard, a step corrects it
+         var s: usize = @intCast(@min(id / (t.starts.items[1] - t.starts.items[0]), t.shards.items.len - 1));
+         while (t.starts.items[s] > id) s -= 1;
+         while (t.starts.items[s + 1] <= id) s += 1;
++        return s;
++    }
++
++    fn row(t: *const NgramTable, id: u64) []const u8 {
++        const s = t.shard(id);
+         const bytes: usize = if (t.fp8) t.width else 2 * t.width;
+         return t.shards.items[s][@intCast((id - t.starts.items[s]) * bytes)..][0..bytes];
+     }
+@@ -151,16 +167,88 @@ pub const NgramTable = struct {
+     /// Rows `ids` (global, as NGram.ids gives them) -> `out[ids.len][width]` bf16 bits, Python's gather exactly.
+     pub fn gather(t: *const NgramTable, ids: []const i64, out: []u16) !void {
+         if (out.len != ids.len * t.width) return error.NgramOutLength;
++        for (ids) |id| if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
++        if (t.pool != null) return t.gatherDistinct(ids, out);
+         for (ids, 0..) |id, i| {
+-            if (id < 0 or id >= t.rows) return error.NgramIdOutOfRange;
+             const src = t.row(@intCast(id));
+             const dst = out[i * t.width ..][0..t.width];
+-            if (t.fp8) {
+-                for (dst, src) |*d, c| d.* = t.lut[c];
+-            } else {
+-                for (dst, 0..) |*d, j| d.* = std.mem.readInt(u16, src[2 * j ..][0..2], .little);
++            t.decode(src, dst);
++        }
++    }
++
++    fn decode(t: *const NgramTable, src: []const u8, dst: []u16) void {
++        if (t.fp8) {
++            for (dst, src) |*d, c| d.* = t.lut[c];
++        } else {
++            for (dst, 0..) |*d, j| d.* = std.mem.readInt(u16, src[2 * j ..][0..2], .little);
++        }
++    }
++
++    /// Use the open mapped file's descriptor and exact byte offset; dequantization keeps the existing LUT.
++    fn readRow(t: *const NgramTable, id: u64, dst: []u16) !void {
++        const s = t.shard(id);
++        const bytes: usize = if (t.fp8) t.width else 2 * t.width;
++        var stack: [512]u8 = undefined;
++        const raw = if (bytes <= stack.len) stack[0..bytes] else try t.gpa.alloc(u8, bytes);
++        defer if (bytes > stack.len) t.gpa.free(raw);
++        const disk = t.disk.items[s];
++        const at = disk.at + (id - t.starts.items[s]) * bytes;
++        if (try disk.file.readPositionalAll(t.io, raw, at) != bytes) return error.NgramShortRead;
++        t.decode(raw, dst);
++    }
++
++    /// Distinct rows are read once in table order; duplicates copy only after every reader has joined.
++    fn gatherDistinct(t: *const NgramTable, ids: []const i64, out: []u16) !void {
++        const order = try t.gpa.alloc(usize, ids.len);
++        defer t.gpa.free(order);
++        const heads = try t.gpa.alloc(usize, ids.len);
++        defer t.gpa.free(heads);
++        for (order, 0..) |*v, i| v.* = i;
++        const Sort = struct {
++            fn less(keys: []const i64, a: usize, b: usize) bool {
++                return keys[a] < keys[b] or (keys[a] == keys[b] and a < b);
++            }
++        };
++        std.sort.pdq(usize, order, ids, Sort.less);
++        var count: usize = 0;
++        for (order, 0..) |index, i| {
++            if (i == 0 or ids[index] != ids[order[i - 1]]) {
++                heads[count] = index;
++                count += 1;
+             }
+         }
++        const Split = struct {
++            table: *const NgramTable,
++            ids: []const i64,
++            out: []u16,
++            heads: []const usize,
++            per: usize,
++            fn part(ctx: *const anyopaque, part_index: usize) anyerror!void {
++                const self: *const @This() = @ptrCast(@alignCast(ctx));
++                const lo = @min(self.heads.len, part_index * self.per);
++                const hi = @min(self.heads.len, lo + self.per);
++                for (self.heads[lo..hi]) |i| try self.table.readRow(@intCast(self.ids[i]), self.out[i * self.table.width ..][0..self.table.width]);
++            }
++        };
++        const parts = @max(1, @min(t.threads, count / 4));
++        const split: Split = .{ .table = t, .ids = ids, .out = out, .heads = heads[0..count], .per = (count + parts - 1) / parts };
++        try t.pool.?.run(parts, .{ .ctx = &split, .run = Split.part });
++        var first: usize = 0;
++        for (order, 0..) |index, i| {
++            if (i == 0 or ids[index] != ids[order[i - 1]]) {
++                first = index;
++            } else @memcpy(out[index * t.width ..][0..t.width], out[first * t.width ..][0..t.width]);
++        }
++    }
++
++    fn enableHostReader(t: *NgramTable, threads: usize) !void {
++        t.threads = threads;
++        if (t.threads == 0 or t.threads > ngram_pool.max_parts) return error.BadNgramThreads;
++        t.pool = try ngram_pool.Pool.create(t.gpa, t.io);
++        if (@import("builtin").os.tag == .linux) for (t.files.items) |file| {
++            _ = std.os.linux.fadvise(file.file.handle, 0, 0, std.os.linux.POSIX_FADV.RANDOM);
++        };
++        std.log.info("n-gram host reader: pread, distinct rows, up to {d} threads", .{t.threads});
+     }
+ };
+ 
+@@ -1230,6 +1318,7 @@ const Loader = struct {
+         w.table = try L.openTable(base, g);
+         const gpu = L.o.ngram_on_gpu orelse (L.o.world > 1);
+         if (gpu) try L.tableToGpu(path, &w.table.?, g);
++        if (!gpu and L.o.mode == .device and L.o.ngram_reader == .pread) try w.table.?.enableHostReader(L.o.ngram_threads);
+         var pb: [192]u8 = undefined;
+         const sd = c.streams * c.hidden;
+         p.key = try L.b16(try std.fmt.bufPrint(&pb, "{s}.key.b.weight", .{path}), try L.nameOf("{s}.key_proj", .{name}), sd, c.ple_dim);
+@@ -1292,6 +1381,8 @@ const Loader = struct {
+             if (t.width == 0) t.width = @intCast(tensor.dim(1));
+             if (tensor.dim(1) != t.width) return error.NgramShardsDiffer;
+             try t.shards.append(L.gpa, tensor.bytes);
++            const file = &t.files.items[own.value_ptr.*];
++            try t.disk.append(L.gpa, .{ .file = file.file, .at = @intFromPtr(tensor.bytes.ptr) - @intFromPtr(file.map.memory.ptr) });
+             try t.starts.append(L.gpa, t.starts.items[t.starts.items.len - 1] + tensor.dim(0));
+         }
+         t.rows = t.starts.items[t.starts.items.len - 1];
