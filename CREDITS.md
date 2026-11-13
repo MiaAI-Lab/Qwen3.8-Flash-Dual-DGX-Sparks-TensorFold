@@ -75,6 +75,12 @@ third-party notices that go with it (TensorFold's MIT and Apache-2.0 notices, Zi
 
 ## Runtime stack
 
+- **Optional SSD n-gram reader (`0013`).** The parked worker pool, distinct-row ordering and positional-read approach
+  are adapted from the TensorFold contributors' Apache-2.0 sources in
+  [v1.2.5](https://github.com/ashhart/TensorFold/tree/v1.2.5/zig/src/families/flashnext)
+  (`cuda_ple_pool.zig`, `cuda_ple_gather.zig`, `cuda_ple_reader.zig`). The adaptation retains this recipe's existing
+  FP8 lookup table and BF16 conversion.
+
 - **[NVIDIA PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)**
   (`nvcr.io/nvidia/pytorch:26.07-py3`), the base of the image, with NVIDIA's CUDA (nvcc builds the engine's kernels),
   NCCL and related libraries. Governed by the NVIDIA Software License Agreement and the Product-Specific Terms for

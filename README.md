@@ -273,6 +273,32 @@ setup that shares a Spark with a 9 GiB job runs at 14; the pool shrinks by the s
 Sparks. `./stop.sh && ./start.sh` brings both ranks back; `docker update --restart=on-failure qwen38-fn-tf` on each Spark
 lets Docker do it (this recipe does not set that up, and has not tested it).
 
+### Optional SSD n-gram reader
+
+To keep the n-gram table off the GPUs, add this to `scripts/local.sh`:
+
+```bash
+WORKER_WEIGHTS=copy
+export TF_FLASHNEXT_NGRAM_ON_GPU=0
+export TF_FLASHNEXT_GATHER_READ=pread
+export TF_FLASHNEXT_KV_GIB=4.5
+```
+
+Each rank reads its local checkpoint through the operating system's file cache. Cached table pages use RAM and
+can be reclaimed. The reader sorts row IDs, reads each distinct row once on a parked worker pool, then copies
+duplicate rows into their original positions. FP8 and BF16 conversion stays unchanged.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `TF_FLASHNEXT_NGRAM_ON_GPU` | `1` at TP=2, `0` at TP=1 | `0` uses the host table. GPU placement requires two ranks; mismatched placement is rejected before NCCL starts. |
+| `TF_FLASHNEXT_GATHER_READ` | `mmap` | `pread` enables parallel positional reads for a host table. |
+| `TF_FLASHNEXT_GATHER_THREADS` | `128` | Maximum participating reader threads, including the caller; accepts 1–128. This is the upstream pool limit, not a tuned optimum. |
+| `TF_FLASHNEXT_KV_GIB` | automatic | Optional KV budget cap per rank, bounded by the normal budget after reserves. Both ranks use the smaller resulting budget. |
+
+Run `./start.sh restart` to rebuild and restart with the patch. Use `WORKER_WEIGHTS=copy` for local SSD reads on both
+ranks; with `nfs`, the worker reads table rows over the network. The startup memory check (`MEM_NEED_GIB`) is separate
+from the KV budget cap. The default GPU-resident table path is unchanged.
+
 ## KV cache: FP8 by default
 
 `KV_DTYPE=fp8` (the default, `--kv-dtype fp8`) stores each cached key and value in FP8 with a scale. It is **lossy**:
