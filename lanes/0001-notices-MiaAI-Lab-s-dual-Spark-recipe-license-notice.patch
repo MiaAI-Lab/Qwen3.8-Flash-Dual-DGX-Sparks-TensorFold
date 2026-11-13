@@ -1,0 +1,444 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 13:48:36 +0700
+Subject: [PATCH 01/79] notices: MiaAI-Lab's dual-Spark recipe license, notice
+ and credits
+
+The license, NOTICE and CREDITS of MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold (dc05c912342e, Apache-2.0)
+ahead of the port of her engine patches, and the THIRD_PARTY_NOTICES entry that names what the port changes.
+---
+ LICENSES/MiaAI-Lab-DualTF-CREDITS.md  | 101 +++++++++++++
+ LICENSES/MiaAI-Lab-DualTF-LICENSE.txt | 202 ++++++++++++++++++++++++++
+ LICENSES/MiaAI-Lab-DualTF-NOTICE.txt  |  81 +++++++++++
+ THIRD_PARTY_NOTICES.md                |  13 ++
+ 4 files changed, 397 insertions(+)
+ create mode 100644 LICENSES/MiaAI-Lab-DualTF-CREDITS.md
+ create mode 100644 LICENSES/MiaAI-Lab-DualTF-LICENSE.txt
+ create mode 100644 LICENSES/MiaAI-Lab-DualTF-NOTICE.txt
+
+diff --git a/LICENSES/MiaAI-Lab-DualTF-CREDITS.md b/LICENSES/MiaAI-Lab-DualTF-CREDITS.md
+new file mode 100644
+index 000000000..add5df02f
+--- /dev/null
++++ b/LICENSES/MiaAI-Lab-DualTF-CREDITS.md
+@@ -0,0 +1,101 @@
++# Credits
++
++This repository is a thin layer of scripts (and, later, patches). Almost everything that makes it work was built by
++others. Its own work is licensed under the Apache License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the
++third-party notices that go with it (TensorFold's MIT and Apache-2.0 notices, Zig, the checkpoint's licenses).
++
++## Model
++
++- **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** by the
++  [Qwen team](https://huggingface.co/Qwen) (Alibaba): the model's design, training and evaluations, its chat template
++  and its MTP head. Its license, the
++  [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE), comes with the
++  weights.
++- **[NVIDIA](https://huggingface.co/nvidia)**: the checkpoint this recipe serves,
++  [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (NVFP4 routed experts,
++  the FP8 n-gram table and MTP experts, bf16 elsewhere), quantized by NVIDIA with
++  [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) (ModelOpt). Governed by the
++  [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/).
++  The weights are not part of this repository; `scripts/prepare.sh` downloads them from Hugging Face.
++- **azampatti** ([azampatti](https://huggingface.co/azampatti)): the INT4-AR checkpoint served with `QUANT=int4ar`,
++  [`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound):
++  its authors cut the routed experts from top-10 to top-5, healed the cut by distilling the shared expert, and
++  published the checkpoint. Under the license on its model card (the Qwen license).
++- **Intel** ([Intel](https://huggingface.co/Intel)): the AutoRound int4 quantization the INT4-AR checkpoint is built on,
++  [`Intel/Qwen3.8-Flash-Next-W4A16-AutoRound`](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound).
++- **Saren-Arterius** ([Saren-Arterius](https://github.com/Saren-Arterius)): the hybrid checkpoint the INT4-AR
++  checkpoint is built from and its FP8 n-gram table,
++  [`Saren/Qwen3.8-Flash-Next-ple-table-fp8`](https://huggingface.co/Saren/Qwen3.8-Flash-Next-ple-table-fp8) (in its
++  `ple-table/`). The recipe uses their weights only, no code from their repositories.
++
++## Inference engine
++
++- **[TensorFold](https://github.com/ashhart/TensorFold)** and its Zig engine (`tensorfold-native`, branch
++  [`zig-flashnext`](https://github.com/ashhart/TensorFold/tree/zig-flashnext)) by Ash Hart
++  ([ashhart](https://github.com/ashhart)) and the TensorFold contributors (Apache 2.0 from v0.6.0; code written before
++  v0.6.0 keeps its MIT notice): the engine that serves the model, its CUDA runtime and kernels, MTP drafting with
++  exact verification and the OpenAI-compatible server. `scripts/prepare.sh` builds it from TensorFold's source at the
++  commit pinned in `scripts/config.sh`.
++  The Flash Next CUDA engine in this recipe is ported from TensorFold's Python Flash Next CUDA engine, written by
++  Ash Hart and the TensorFold contributors ([contributors](https://github.com/ashhart/TensorFold/graphs/contributors));
++  their authorship is recorded in TensorFold's history.
++- **The Zig CUDA serving path and the CUDA family registry** were authored by Jürgen Schmied
++  ([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
++  (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)):
++  `tensorfold-native` serving CUDA families through one registry, which this recipe's engine runs on.
++- TensorFold itself builds on, and credits in its
++  [third-party notices](https://github.com/ashhart/TensorFold/blob/zig-flashnext/THIRD_PARTY_NOTICES.md), the
++  projects whose code it adapts.
++- **Image and video input.** TensorFold's vision code (the Python `vision/` package and the Flash Next CUDA vision
++  path) is by Ash Hart and the TensorFold contributors ([contributors](https://github.com/ashhart/TensorFold/graphs/contributors)).
++  Wiring it into this engine's server is adapted from the patches 0008 and 0009 of MiaAI-Lab's own single-Spark recipe,
++  [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold) (authored by MiaAI-Lab); the settings and their names follow that recipe's "Images and video".
++- **FP8 KV cache.** The FP8 KV format (`--kv-dtype fp8`) is adapted from the patch `0038-glm-kv-fp8` of MiaAI-Lab's own
++  GLM recipe, [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold) (authored by MiaAI-Lab).
++- **[b12x](https://github.com/local-inference-lab/b12x)** by local-inference-lab (Apache-2.0): the one-shot RoCE
++  all-gather (`TF_FLASHNEXT_ROCE`) implements the RoCEnante protocol of b12x by local-inference-lab; our
++  implementation is new code written for this engine. It carries the ranks' small exchanges over both CX7 rails.
++- **[Zig](https://ziglang.org)** by the Zig Software Foundation and the Zig contributors (MIT): the language and
++  compiler TensorFold's Zig engine is written in and built with (0.17.0).
++
++## Recipe
++
++- The scripts (`start.sh`, `stop.sh`, `scripts/`) and the checks in `tools/` (`client.py`, `needle.py`,
++  `toolcheck.py`, `prompt_reuse.py`; `long_context.py` and `exact.py` are new) are MiaAI-Lab's, adapted from
++  MiaAI-Lab's own two-Spark recipe
++  [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
++  (the link and rail detection, the NCCL settings, the image and checkpoint setup, the checks), developed with
++  [Claude Code](https://claude.com/claude-code), under the Apache License 2.0.
++- **Fixes to the engine patches.** `patches/0010` (the prompt cache's eviction inside a pass,
++  [#9](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/9)) and `patches/0011` (the ranks'
++  prefill admission,
++  [#6](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/6)) were written by Drake Lu
++  ([xinlu8439](https://github.com/xinlu8439)), with their regression tests, in those issues; jeff-defuser
++  ([jeff-defuser](https://github.com/jeff-defuser)) confirmed `0010` on a second setup.
++
++## Runtime stack
++
++- **[NVIDIA PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)**
++  (`nvcr.io/nvidia/pytorch:26.07-py3`), the base of the image, with NVIDIA's CUDA (nvcc builds the engine's kernels),
++  NCCL and related libraries. Governed by the NVIDIA Software License Agreement and the Product-Specific Terms for
++  NVIDIA AI Products.
++- **[NCCL](https://github.com/NVIDIA/nccl)** (BSD-3-Clause) and **[rdma-core](https://github.com/linux-rdma/rdma-core)**
++  (libibverbs, GPL-2.0 / BSD-2-Clause): the two ranks' exchanges over the Sparks' ConnectX-7 RoCE link.
++- **[Hugging Face transformers](https://github.com/huggingface/transformers)** (Apache 2.0): the Qwen vision tower and
++  image processor the vision helper runs (`transformers==5.17.0`, installed in the image).
++- **[PyAV](https://github.com/PyAV-Org/PyAV)** (BSD-3-Clause) with **[FFmpeg](https://ffmpeg.org/)** (LGPL): video
++  decoding. **[Pillow](https://python-pillow.org/)** (MIT-CMU): image decoding (from the PyTorch container).
++- **[Triton](https://github.com/triton-lang/triton)** (MIT): the language the engine's Triton kernels are written in;
++  the engine replays their compiled cubins.
++- **[Hugging Face Hub](https://huggingface.co/)**: model hosting, the `hf` CLI and `huggingface_hub` (Apache 2.0), and
++  the [safetensors](https://github.com/huggingface/safetensors) format (Apache 2.0) the checkpoint ships in.
++- **[Docker](https://www.docker.com/)** and the
++  **[NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit)** (Apache 2.0): running the server
++  on the GPU in a container.
++
++## Hardware
++
++- **[NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)** (GB10 Grace Blackwell,
++  128 GB unified memory), two of them linked by their ConnectX-7 ports.
++
++If you believe something here is missing or credited wrongly, please open an issue.
+diff --git a/LICENSES/MiaAI-Lab-DualTF-LICENSE.txt b/LICENSES/MiaAI-Lab-DualTF-LICENSE.txt
+new file mode 100644
+index 000000000..d64569567
+--- /dev/null
++++ b/LICENSES/MiaAI-Lab-DualTF-LICENSE.txt
+@@ -0,0 +1,202 @@
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+diff --git a/LICENSES/MiaAI-Lab-DualTF-NOTICE.txt b/LICENSES/MiaAI-Lab-DualTF-NOTICE.txt
+new file mode 100644
+index 000000000..c9df311f2
+--- /dev/null
++++ b/LICENSES/MiaAI-Lab-DualTF-NOTICE.txt
+@@ -0,0 +1,81 @@
++Qwen3.8-Flash-Next on 2x DGX Spark with TensorFold
++Copyright 2026 MiaAI-Lab
++
++This project's own code, scripts and documentation are licensed under the Apache License, Version 2.0 (see
++LICENSE). If you redistribute this project or a modified version of it, keep this NOTICE file and state what you
++changed (Apache-2.0, section 4).
++
++This project builds on third-party work that keeps its own license:
++
++TensorFold
++  https://github.com/ashhart/TensorFold (branch zig-flashnext)
++  Copyright 2026 TensorFold contributors. Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its
++  MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
++  https://github.com/ashhart/TensorFold".
++  scripts/prepare.sh builds TensorFold's Zig engine (tensorfold-native) from TensorFold's source at the commit pinned
++  in scripts/config.sh; the image carries that build in /opt/tensorfold and TensorFold's LICENSE, LICENSES/, NOTICE and
++  THIRD_PARTY_NOTICES.md in /opt/tensorfold/share/doc/tensorfold. The files in patches/ (when present) modify
++  TensorFold's source and are applied to it with git apply before the build. The changes in patches/ are this
++  project's work under Apache-2.0; the TensorFold code they modify, and quote as diff context, stays under
++  TensorFold's licenses: Apache-2.0, and for code written before 0.6.0 also its MIT notice (TensorFold's
++  LICENSES/MIT.txt), so keep TensorFold's NOTICE and this copyright and permission notice with any copy of a patched
++  tree:
++
++    Copyright (c) 2026 TensorFold contributors
++
++    Permission is hereby granted, free of charge, to any person obtaining a copy
++    of this software and associated documentation files (the "Software"), to deal
++    in the Software without restriction, including without limitation the rights
++    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++    copies of the Software, and to permit persons to whom the Software is
++    furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice shall be included in all
++    copies or substantial portions of the Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++    SOFTWARE.
++
++  The Zig engine's CUDA serving path through tensorfold-native and its CUDA family registry were authored by Jürgen
++  Schmied (jschmied, https://github.com/jschmied) in TensorFold pull request #443
++  (https://github.com/ashhart/TensorFold/pull/443, commit 59e77e8f4b875ce0e863a8c896fc8e424bc539ac), part of
++  TensorFold under its licenses above.
++
++Zig
++  https://ziglang.org
++  Copyright (c) Zig contributors. The MIT License (Expat). Zig is developed by the Zig Software Foundation and the
++  Zig contributors.
++  The image build downloads Zig 0.17.0 (zig-aarch64-linux-0.17.0.tar.xz, checked against its sha256) to compile
++  TensorFold's Zig engine; the compiler is used in the build stage only and is not part of the published image.
++
++Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
++  The checkpoint, nvidia/Qwen3.8-Flash-Next-NVFP4, is NVIDIA's NVFP4 quantization (made with NVIDIA Model Optimizer)
++  of Qwen/Qwen3.8-Flash-Next by the Qwen team (Alibaba). Per its model card, its use is governed by the NVIDIA Open
++  Model License (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/), with the
++  Qwen Community License 1.0 (https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE) as additional
++  information.
++  The INT4-AR checkpoint (QUANT=int4ar), azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, is by azampatti (the
++  top-5 expert cut and the shared-expert healing), built on Intel's AutoRound int4 quantization
++  (Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) and on Saren-Arterius's hybrid checkpoint and FP8 n-gram table
++  (Saren/Qwen3.8-Flash-Next-ple-table-fp8). Per its model card, it is under the Qwen license
++  (https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
++
++Third-party software in the image
++  The prebuilt image (and the one scripts/prepare.sh builds) is based on NVIDIA's PyTorch container
++  nvcr.io/nvidia/pytorch:26.07-py3, redistributed as a value-added runtime image. The NVIDIA software in it is
++  governed by the NVIDIA Software License Agreement
++  (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/) and the
++  Product-Specific Terms for NVIDIA AI Products
++  (https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/), which the
++  container prints at every start; by pulling or running the image you accept them. The image also contains
++  huggingface_hub (Apache 2.0, for the checkpoint download), and for the vision helper Hugging Face transformers
++  (Apache 2.0), PyAV (BSD-3-Clause) with its bundled FFmpeg libraries (LGPL), and TensorFold's Python source (under
++  TensorFold's licenses, above). This project's Apache License covers its own work only
++  (as described above), not the software in the image.
++
++See CREDITS.md for everyone this project builds on.
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index c894ea02b..f4c867319 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -459,6 +459,19 @@ recipe commit e1f564eb915bb5272474b6c1c527aec3b9ed3de6. It credits TensorFold Co
+ arithmetic and staging design. Copyright (c) 2026 MiaAI-Lab and Copyright (c) 2026 TensorFold contributors.
+ The complete original MIT notices and permission text are retained in [Mia-FlashNext-MIT.txt](LICENSES/Mia-FlashNext-MIT.txt).
+ 
++## MiaAI-Lab dual-Spark Flash Next engine
++
++`zig/src/families/flashnext_mia/`, `zig/src/cuda/roce_mia.zig`, `zig/src/cuda/roce_proxy.c`, `zig/src/cuda/roce_proxy_stub.c`,
++the `zig/kernels/cuda/fn_*.cu` kernels she added, `zig/src/cli/flashnext_cuda.zig`, `tools/zig/flashnext_mia/` and her
++edits to the server, native host and core lanes are ported from
++[MiaAI-Lab's dual-Spark recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold), commit
++dc05c912342ec19467b3b7b686888de763f2ada1, patches 0001-0008 and 0010-0012, Apache-2.0, Copyright 2026 MiaAI-Lab.
++Her commits keep her authorship. Changed in the port: her files moved to the paths above, her edits merged onto
++upstream f212eeabd, Python engine edits dropped (that engine was removed), and patch 0009 (vision, Python only) left out.
++Her LICENSE, NOTICE (with TensorFold's MIT notice for pre-0.6.0 code) and CREDITS are in
++`LICENSES/MiaAI-Lab-DualTF-LICENSE.txt`, `LICENSES/MiaAI-Lab-DualTF-NOTICE.txt` and `LICENSES/MiaAI-Lab-DualTF-CREDITS.md`;
++the RoCE one-shot all-gather follows b12x's RoCEnante protocol by local-inference-lab (Apache-2.0), as her CREDITS state.
++
+ ## Ling-3.0-tiny and Ling-3.1-flash
+ 
+ Ling-3.0-tiny and Ling-3.1-flash are MIT licensed by inclusionAI. The host family package

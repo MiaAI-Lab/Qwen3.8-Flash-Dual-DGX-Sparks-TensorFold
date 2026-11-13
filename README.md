@@ -382,9 +382,10 @@ sets a value wins: the environment, then `scripts/local.sh`, then `.env`, then t
 | `SERVED_NAME` / `PORT` / `HOST` | `Qwen3.8-Flash-Next` / `8888` / `0.0.0.0` | the model id in `/v1/models` and replies; where the API listens |
 | `PREPARE` / `PULL` | `auto` / `1` | `start.sh` runs `scripts/prepare.sh` when needed (`1` always, `0` never); `prepare.sh` tries the prebuilt image first (`0`: always build locally) |
 | `WAIT_TIMEOUT` / `STOP_TIMEOUT` | `1800` / `30` | seconds `start.sh` waits for the server, and `stop.sh` gives it to shut down |
+| `ENGINE` | `patches` | `lanes`: the opt-in compute lanes image (needs `VISION=0`; [Compute lanes](#compute-lanes-opt-in)); with `LANES_REPO` and `LANES_REF` (upstream TensorFold and the commit `lanes/` applies to), `LANES_IMAGE` |
 | `LOG_DIR` / `LOG_KEEP` | `~/.cache/tensorfold-qwen38fn/logs` / `10` | where `stop.sh` saves rank 0's log before it removes the container (rank 1's to the same folder on the worker), and how many of each rank's to keep ([Logs of earlier runs](#quick-start)); `0`: none |
 
-Any `TENSORFOLD_*`, `TF_FLASHNEXT_*`, `TF_TP_*` or `TF_CUDA_*` variable is passed to both ranks (export it in
+Any `TENSORFOLD_*`, `TF_FLASHNEXT_*`, `TF_TP_*`, `TF_CUDA_*`, `TF_RUNNER*` or `TF_COMPUTE_LANE*` variable is passed to both ranks (export it in
 `scripts/local.sh`; `.env` lines are). `TENSORFOLD_API_KEY` (the server's API keys) goes to rank 0 by name only,
 never on a command line.
 
@@ -422,7 +423,7 @@ These all work on the Flash Next TP=2 path; `"draft": false` gives the serial re
 - `"draft": false` in a request serves it without drafts, TensorFold's serial reference.
 - Tool calls work (`tools/toolcheck.py`: array arguments whole and streamed, a tool result turn), including
   `tool_choice: "required"` and a named function (Anthropic `tool_choice: {"type": "any"}` too): the reply then always
-  opens a tool call.
+  opens a tool call. With `ENGINE=lanes` only `"auto"` and `"none"` work (see [Compute lanes](#compute-lanes-opt-in)).
 - Prompt reuse: a conversation's next turn resumes from the kept state of its earlier turns instead of prefilling the
   whole prompt again (`tools/prompt_reuse.py`); image and video prompts are not kept.
 - Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not enforce
@@ -451,6 +452,150 @@ checked and failed, 2 when it could not run, 3 when it ran but could not verify 
 | `tools/exact.py` | the same greedy requests one at a time, with `"draft": false`, and all at once: the replies must be identical |
 | `tools/client.py "message"` | one chat request (thinking off unless `--think`), for a quick look |
 
+## Compute lanes (opt-in)
+
+Off by default: `ENGINE=patches` serves the image above, unchanged. With `ENGINE=lanes` the model can compute exactly
+while it thinks. When its reasoning writes a Python cell (a fenced `python` block that prints), or an inline
+expression ending in `=`, the engine runs it and puts the result into the reasoning. The model then continues from
+the exact value instead of working digits by hand. Two parts do this:
+
+- **The compute lane** (`TF_COMPUTE_LANE_*`) runs the cell in a Python interpreter in the rank 0 container.
+- **The in-model runner** (`TF_RUNNER_*`) computes integer arithmetic on a compiled circuit (`calc.tfpc`) and a graph
+  bank, through a RISC-V frontend (clang-18 / lld-18).
+
+Both act only inside the reasoning (`TF_RUNNER_SPANS=reasoning`). Measured against this recipe's image, every
+thinking-off reply had the same tokens. The text can differ only in trailing whitespace: the lane engine's server
+trims the trailing newline of `reasoning_content`. A thinking request that brings no tools of its own gets the
+engine's compute tool in its prompt. Drafting is this recipe's engine: per request it drafted exactly as this
+recipe's image does.
+
+**Enable it.** Set the following in `scripts/local.sh` or `.env`, then run `./start.sh restart`:
+
+```sh
+ENGINE=lanes
+VISION=0
+```
+
+`scripts/prepare.sh` then builds the lane image on the head, on top of the default image, and copies it to the worker
+(`scripts/lanes.sh`). The lane image:
+
+- replaces only `tensorfold-native`, built from the lane engine: upstream TensorFold at `LANES_REF` plus the patches
+  in `lanes/` (the build checks the patched tree against `lanes/series`);
+- keeps everything else of the default image, including the kernel set;
+- adds the runner's frontend and assets. The assets are fetched at a pinned sha256, every file is checked, and the
+  build fails unless the runner computes its probe cells.
+
+The lane engine is upstream TensorFold's Zig engine ([ashhart/TensorFold](https://github.com/ashhart/TensorFold) at
+`LANES_REF`, unmodified) plus the 76 patches in `lanes/`. Patches 0002-0012 there are this recipe's patches 0001-0008
+and 0010-0012 ported, as MiaAI-Lab's own commits (0007's tool_choice call gate too, ported), served as `TF_FLASHNEXT_ENGINE=mia`. The lane keys
+are in `scripts/config.sh` and every one can be overridden.
+
+Limits:
+
+- **Text only.** Patch 0009 (vision) is not in the lane engine, so `ENGINE=lanes` needs `VISION=0`.
+- The KV flag is `--kv-cache`; `start.sh` passes it.
+- **Forced tool calls** work as on this recipe's image: `tool_choice: "required"`, a named function and Anthropic
+  `tool_choice: {"type": "any"}` always open a tool call (patch 0007's call gate, ported into the lane engine;
+  `/v1/models` reports `capabilities.call_gates: true`). `"auto"` and `"none"` are unchanged.
+- **Long inline values.** An inline `<expr> =` gets its exact value spliced in with ` @engine` after it
+  (`TF_RUNNER_INLINE_MARK=1`, the default). Unmarked (`0`), a spliced big integer was sometimes extended by the model
+  (7^222: 1,600 to 29,700 invented digits) until the reply ran out of tokens, and once the model replaced the engine's
+  right value with its own wrong arithmetic; the mark ended both. The lane engine also replaces a digit
+  drawn right after an unmarked owned value, and stops a digit run in the reasoning at 1,024 digits, with a newline
+  (`TF_RUNNER_DIGIT_STOP`, `TF_RUNNER_DIGIT_RUN_MAX`; 0 turns each off) (Compute lanes, "Inline values", below).
+- Structured outputs (`response_format`, `guided_*`) get HTTP 400, as on this recipe's image. The lane image does not
+  include the engine's structured-output library, so its boot log warns that `libtfgrammar.so` is missing. Adding the
+  library would not change these answers: this engine port has no grammar hook yet.
+
+**Startup.** The lane engine times its lane costs (the draft scheduler's table) once per image, GPU, setting and
+environment, and keeps them in a folder beside that image's CUDA cache:
+`~/.cache/tensorfold-qwen38fn/<lane hash>/tensorfold/` on each Spark (`start.sh` mounts it with `ENGINE=lanes`).
+Later starts read them back on both ranks. So the first start of a new lane image takes about 40 s longer, and the
+next ones are faster than `ENGINE=patches`:
+
+| Start, through `./start.sh` (page cache dropped on both Sparks first) | To the first 200 on `/v1/models` |
+| --- | ---: |
+| `ENGINE=patches` (this recipe's default, `VISION=1`), 3 starts | 93.9 / 92.4 / 91.4 s (mean 92.6) |
+| `ENGINE=lanes`, kept lane costs, 2 starts | **77.2 / 77.2 s** |
+| `ENGINE=lanes`, a new image's first start (it times the costs) | 115.9 s |
+
+Starts were alternated, patches then lanes, on 2026-11-12. The published `52f6936c0` (below), fetched from GitHub and
+built by `ENGINE=lanes scripts/prepare.sh`, then started the same way: 117.3 s for its first start, 77.1 s for the
+next, with a passing smoke (thinking on and off, streaming, a tool call) after each. Most of the difference from the default is the image
+tower `VISION=1` loads: `ENGINE=patches` with `VISION=0` (the lanes' feature set) started in 75.7 / 77.1 s in an earlier
+session of the same day. With `ENGINE=lanes` both ranks log where their load spent its time (`rank N: loaded in ...`);
+the checkpoint load is about 65 s of it.
+
+**Measured** on two Sparks, NVFP4, the defaults above (16 at once, FP8 KV, a 1,048,576-token window, MTP drafts),
+through the OpenAI API.
+
+Compute set, 2026-11-11. It has 120 exact-computation tasks: integer, division, modular, aggregation, DP and graph, 20
+of each. Each task asks for its answer as JSON. Settings: thinking on, temperature 1.0, `max_tokens` 8192, 270 s a
+request, 4 at once, seed 101. The set and its answers are private, so it cannot be rerun from this repository. A fixed
+grader reads the reply's final JSON and compares it with the stored answer. A reply with no complete JSON, the wrong
+JSON shape or a wrong value counts as wrong. The same harness reproduced earlier baselines exactly.
+
+Both rows are lane engine `f9f75544a` on two Sparks, the same build and keys as here, with the 20 lane keys removed for
+lanes off. `220e5a068` is `f9f75544a` plus two scheduling commits. The earlier pin `52f6936c0` is
+`220e5a068` plus two startup commits (kept lane costs, a load-stage log line). `9c6c3d04c` is
+`52f6936c0` plus patch 0007's call gate, a thinking-budget fix (a budget cut inside a compute result no longer fails
+the reply) and the digit stop. These are commits of the lane engine's development history; `lanes/` applied to upstream `LANES_REF` gives exactly
+`9c6c3d04c`'s tree. The runs below were measured on a private twin of each, which
+differs only in 9 comment lines (8 files) and some commit message wording, so the built engine is the same code. The
+published `52f6936c0` itself was then built by `scripts/prepare.sh` and started twice by `start.sh` (Startup, above).
+
+| Lanes | Correct | Tokens a task | Median time a task | Cut at 8,192 tokens |
+| --- | ---: | ---: | ---: | ---: |
+| on (`TF_RUNNER_SPANS=reasoning`) | **92/120** | **738** | **12.3 s** | 0 |
+| off | 58/120 | 6,038 | 141 s | 62 |
+
+By family (20 tasks each), lanes off then on:
+
+| aggregation | division | DP | graph | integer | modular |
+| --- | --- | --- | --- | --- | --- |
+| 20 / 18 | 0 / 16 | 18 / 16 | 20 / 16 | 0 / 13 | 0 / 13 |
+
+All 62 lanes-off misses ran out of tokens (finish `length`) before giving an answer. With lanes, 26 misses are JSON
+form and 2 are wrong values. Task by task, lanes gain 44 and lose 10 (in aggregation, DP and graph).
+
+The engine `220e5a068` was also set up exactly as this README says, on 2026-11-12:
+`ENGINE=lanes scripts/prepare.sh` built the lane image on the head and copied it to the worker, and
+`ENGINE=lanes ./start.sh` served it. The same compute set gave 92/120 at 719 tokens a task, with the same tasks right
+and wrong as `f9f75544a`. That run shared the server with another test suite,
+so its 19.0 s median time is not comparable with the table.
+
+Speed, with sparkDash's prose protocol (400-token replies, thinking off). Tokens a second, all requests together,
+against this recipe's image built at `dc05c91`:
+
+| Arm | c1 | c2 | c4 | c8 | c16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| this recipe's image (2026-11-10) | 69.6 | 103.1 | 156.4 | 233.2 | 372.5 |
+| lane engine `1849c2a9d`, lanes off (same session) | 70.1 | 103.5 | 158.0 | 238.5 | 380.6 |
+
+With the lane keys on (engine `f9f75544a`, 2026-11-11), c16 was 382.6 against this recipe's 386.4 in the same session
+(99.0%). An agent-shaped session of tool calls and prompt reuse was within 0.5% on 6k-token prompts. It was 4.3% and
+2.5% slower on the first turn of 15k- and 34k-token prompts, all in the cold prefill of four prompts at once; the
+cached turns were equal. `220e5a068` decodes at 0.998 of `f9f75544a`'s speed (paired server timings, 2026-11-12). Its
+image built and started by this recipe (`ENGINE=lanes`, the lane keys on) measured 69.9 / 101.7 / 156.4 / 237.6 / 383.3
+from c1 to c16. A separately built image of the same engine measured 70.1 / 103.2 / 157.6 / 237.6 / 385.1 in the same
+session, so c16 differs by 0.5%. The pinned `52f6936c0`, built and started by this recipe, measured
+69.8 / 101.6 / 160.4 / 239.1 / 386.5 (2026-11-12, kept lane costs). The same boot passed `tools/toolcheck.py` (3/3),
+`tools/exact.py` (drafted and concurrent replies equal the serial ones) and a 180-request mixed suite (180/180).
+
+**Inline values**, 2026-11-12, on `9c6c3d04c`'s private twin (the same tree; only one commit message differs). It was
+served on two Sparks with these lane keys, by TensorFold's own two-Spark setup rather than this recipe's `start.sh`,
+with `--thinking-budget 8192`:
+
+| `TF_RUNNER_INLINE_MARK` | 7^222 mod 1000003 written to a file by an agent client, 5 fresh sessions | 9 big-power replies (7^222, 3^300 and 2^500, 13^150; 3 seeds) with no digit run past the value | Compute set |
+| --- | ---: | ---: | --- |
+| 0 | 4/5 | 8/9 (one reply: 8 runaways, 10,402 tokens) | not run |
+| 1 | **5/5** | **9/9** (462 to 1,439 tokens a reply) | 92/120, 731 tokens a task, 12.2 s |
+
+With the mark, `tool_choice` required, named and Anthropic `any` each returned a call; `tools/toolcheck.py` passed 3/3,
+`tools/exact.py` passed, and so did the 180-request mixed suite (180/180). The 20 thinking-off replies were byte for
+byte those of `f9f75544a`'s engine. 7^222 with its mark is 191 tokens, under the 512-token limit for an owned value
+(`TF_RUNNER_MAX_TOKENS`); a marked value over it is not spliced, and the log says so.
+
 ## Repository layout
 
 ```
@@ -458,7 +603,7 @@ start.sh      set up (first run) and start both ranks
 stop.sh       stop them
 scripts/      config.sh (all settings), local.sh.example (this setup's WORKER), prepare.sh (image + checkpoint on both
               Sparks), nodes.sh (ssh and the RoCE link), publish-image.sh (push the image to GHCR),
-              banner.sh (start.sh's banner)
+              banner.sh (start.sh's banner), lanes.sh (the opt-in lane image, ENGINE=lanes)
 tools/        checks against the running server (needle, long context, tool calls, prompt reuse, exactness)
 CHANGELOG.md  what changed in each release
 CREDITS.md    who and what this builds on
@@ -512,3 +657,7 @@ The full list, including the runtime stack and licenses, is in [`CREDITS.md`](CR
 - Image and video input: adapted from patches 0008 and 0009 of MiaAI-Lab's [Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold), running TensorFold's vision code by Ash Hart and the TensorFold contributors
 - The FP8 KV cache format: adapted from patch 0038-glm-kv-fp8 of MiaAI-Lab's [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
 - [Zig](https://ziglang.org): by the Zig Software Foundation and the Zig contributors
+- Compute lanes (opt-in, `ENGINE=lanes`): the compute lane, the in-model runner and the port of this recipe's engine
+  patches into TensorFold's Zig engine by Jay Leaton ([jayleaton](https://github.com/jayleaton)), built on MiaAI-Lab's
+  engine and patches here (her commits, credited as hers); the runner's circuit is compiled from
+  [Qwenputer](https://github.com/divagr18/qwenputer) by Divyansh Agrawal (MIT)

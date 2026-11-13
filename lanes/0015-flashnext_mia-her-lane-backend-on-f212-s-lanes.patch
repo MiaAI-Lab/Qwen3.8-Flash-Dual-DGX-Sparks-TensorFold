@@ -1,0 +1,557 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:42:16 +0700
+Subject: [PATCH 15/79] flashnext_mia: her lane backend on f212's lanes
+
+- prefill_many returns false where hers returned error.BurstRefused (f212's host then prefills each
+  stream alone, as hers did).
+- Her layer-sliced fill (TF_FLASHNEXT_FILL=1) is f212's per-stream prefill_step: a stream's first call
+  begins its fill, each call steps it fill_layers layers. FillState lives in cuda_lanes; the mirror
+  sends the spec on a stream's first step and both ranks make the same call.
+- Her Media type moves to cuda_media.zig: f212's lanes.Stream carries no media, so served streams
+  never have any and her image paths stay for her CLI.
+- Costs.measured takes one regime over every width: the pooling hers had at db281878.
+- The mirror's leader copies f212's backend flags; her sliced-fill tests drive Engine.fillStream with
+  f212's stepped fake.
+- The prompt cache's calls are public for the snap_* declarations, and her lanes hold the cache budget.
+---
+ zig/src/families/flashnext_mia/cuda.zig       |  2 +
+ .../families/flashnext_mia/cuda_engine.zig    |  5 +-
+ .../families/flashnext_mia/cuda_forward.zig   |  2 +-
+ zig/src/families/flashnext_mia/cuda_lanes.zig | 70 ++++++++++-----
+ zig/src/families/flashnext_mia/cuda_media.zig | 57 ++++++++++++
+ .../families/flashnext_mia/cuda_mirror.zig    | 87 +++++++++----------
+ 6 files changed, 152 insertions(+), 71 deletions(-)
+ create mode 100644 zig/src/families/flashnext_mia/cuda_media.zig
+
+diff --git a/zig/src/families/flashnext_mia/cuda.zig b/zig/src/families/flashnext_mia/cuda.zig
+index 532500f82..bcf600e3a 100644
+--- a/zig/src/families/flashnext_mia/cuda.zig
++++ b/zig/src/families/flashnext_mia/cuda.zig
+@@ -28,6 +28,7 @@ pub const fp4_serial = @import("cuda_fp4_serial.zig");
+ pub const prof = @import("cuda_prof.zig");
+ pub const moe_prompt = @import("cuda_moe_prompt.zig");
+ pub const fp8 = @import("cuda_fp8.zig");
++pub const media = @import("cuda_media.zig");
+ pub const int4 = @import("cuda_int4.zig");
+ pub const int4_check = @import("cuda_int4_check.zig");
+ pub const Engine = engine.Engine;
+@@ -62,6 +63,7 @@ test {
+     _ = prof;
+     _ = moe_prompt;
+     _ = fp8;
++    _ = media;
+     _ = int4;
+     _ = int4_check;
+ }
+diff --git a/zig/src/families/flashnext_mia/cuda_engine.zig b/zig/src/families/flashnext_mia/cuda_engine.zig
+index 9f2ec3a34..00d315cf9 100644
+--- a/zig/src/families/flashnext_mia/cuda_engine.zig
++++ b/zig/src/families/flashnext_mia/cuda_engine.zig
+@@ -12,6 +12,7 @@
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
++const media_mod = @import("cuda_media.zig");
+ const kern = @import("cuda_kernels.zig");
+ const tri = @import("cuda_triton.zig");
+ const tops = @import("cuda_torch_ops.zig");
+@@ -793,7 +794,7 @@ pub const Engine = struct {
+         /// resume from a kept state of this sequence (the prompt extends its tokens)
+         resume_from: ?*const Snapshot = null,
+         /// the prompt's images and video frames (Python prefill(..., vision=)): fresh prompts only, nothing kept
+-        media: ?*const lanes.Media = null,
++        media: ?*const media_mod.Media = null,
+     };
+ 
+     pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
+@@ -1507,7 +1508,7 @@ pub const Engine = struct {
+         stop_eos: bool = true,
+         arrive: usize = 0,
+         /// the prompt's images and video frames (null: text)
+-        media: ?*const lanes.Media = null,
++        media: ?*const media_mod.Media = null,
+         tokens: std.ArrayList(u32) = .empty,
+         rounds: usize = 0,
+         accepted: usize = 0,
+diff --git a/zig/src/families/flashnext_mia/cuda_forward.zig b/zig/src/families/flashnext_mia/cuda_forward.zig
+index 1bcef901d..98b725945 100644
+--- a/zig/src/families/flashnext_mia/cuda_forward.zig
++++ b/zig/src/families/flashnext_mia/cuda_forward.zig
+@@ -976,7 +976,7 @@ pub const Forward = struct {
+     /// table, the rows and the features reach it by NCCL broadcasts from rank 0 here (nothing large rides the
+     /// control link). Validity, budget and the device allocations are agreed first, so either both ranks refuse
+     /// (error.MediaRefused, before any collective of the prompt) or both run the same broadcasts.
+-    pub fn attachMedia(f: *Forward, seq: *Seq, media: *const @import("lanes").Media, prompt_len: usize) !void {
++    pub fn attachMedia(f: *Forward, seq: *Seq, media: *const @import("cuda_media.zig").Media, prompt_len: usize) !void {
+         const lead = if (f.comm) |cm| cm.rank == 0 else true;
+         var valid = true;
+         media.check(prompt_len) catch {
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes.zig b/zig/src/families/flashnext_mia/cuda_lanes.zig
+index f045479bf..c98dd535a 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes.zig
+@@ -13,6 +13,7 @@
+ //! budget (admission).
+ const std = @import("std");
+ const lanes = @import("lanes");
++const media_mod = @import("cuda_media.zig");
+ const decode = @import("cuda_decode.zig");
+ 
+ const be = lanes.backend;
+@@ -48,6 +49,9 @@ pub const Notes = struct { ptr: *anyopaque, send: *const fn (ptr: *anyopaque, by
+ 
+ pub const Note = enum(u8) { pass = 1, drop = 2, _ };
+ 
++/// A filling stream's state after a step of her layer-sliced fill (her lanes core's FillState; f212 has none).
++pub const FillState = enum { filling, done, cancelled };
++
+ /// The prompt cache's family calls (core/prompt_cache.zig Snapshots.VTable, same signatures) and its budget:
+ /// native/cuda.zig makes the Store from them (this module cannot import the engine API's types).
+ pub const CacheHooks = struct {
+@@ -140,6 +144,8 @@ pub fn Lanes(comptime E: type) type {
+         kept: std.ArrayList(*Kept) = .empty,
+         tentative: std.ArrayList(Tentative) = .empty,
+         kept_bytes: u64 = 0,
++        /// the prompt cache's budget on this rank (cuda_native.cacheBudget; snap_ready hands f212's store this much)
++        cache_budget: u64 = 0,
+         /// keep a pass's last state late (TF_FLASHNEXT_KEEP_LATE=0 off): its keeper sequence is made and filled at
+         /// the next call after the first token, not in the prompt's time to first token (the copy is the same)
+         late_keep: bool = true,
+@@ -195,8 +201,7 @@ pub fn Lanes(comptime E: type) type {
+                 .draft = draftFn,
+                 .tree = heldFn,
+                 .release = releaseFn,
+-                .prefill_begin = prefillBeginFn,
+-                .prefill_step = prefillStepFn,
++                .prefill_step = fillStepFn,
+             } };
+             return .{ .ptr = self, .vtable = &.{
+                 .prefill = prefillFn,
+@@ -214,6 +219,16 @@ pub fn Lanes(comptime E: type) type {
+ 
+         // -- prompts filling between rounds (the lanes core's prefill_begin / prefill_step) --------------------
+ 
++        /// f212's prefill_step: the first call begins the fill, each steps it `fill_layers` layers; true once in.
++        fn fillStepFn(ptr: *anyopaque, s: *lanes.Stream, cap: u32) anyerror!bool {
++            _ = cap;
++            const self = of(ptr);
++            if (self.lanes.get(s) == null) try prefillBeginFn(ptr, s);
++            var state: [1]FillState = .{.filling};
++            try prefillStepFn(ptr, &.{s}, &state);
++            return state[0] == .done;
++        }
++
+         /// The prefill's admission and agreements, its resume made, the first segment's fill started.
+         fn prefillBeginFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+             const self = of(ptr);
+@@ -261,14 +276,14 @@ pub fn Lanes(comptime E: type) type {
+                 f.fl = try self.e.fillBegin(l.seq, ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = f.cur });
+                 f.final = false;
+             } else {
+-                f.fl = try self.e.fillBegin(l.seq, ids, s.sampling, .{ .resume_from = f.cur, .media = s.media });
++                f.fl = try self.e.fillBegin(l.seq, ids, s.sampling, .{ .resume_from = f.cur, .media = media_mod.of(s) });
+                 f.final = true;
+             }
+         }
+ 
+         /// `fill_layers` more layers of every filling prompt; a segment that ends keeps its mark's state and
+         /// starts the next; a prompt that is in draws its first token (`first` returns it).
+-        fn prefillStepFn(ptr: *anyopaque, streams: []const *lanes.Stream, states: []be.FillState) anyerror!void {
++        fn prefillStepFn(ptr: *anyopaque, streams: []const *lanes.Stream, states: []FillState) anyerror!void {
+             const self = of(ptr);
+             self.fillLate();
+             try self.agree(null); // nothing to prepare: the ranks only meet before the slices' collectives
+@@ -424,16 +439,16 @@ pub fn Lanes(comptime E: type) type {
+         }
+ 
+         /// A burst of prompts admitted together (no resumes, no marks): their admissions and sequences made first
+-        /// (a refusal anywhere refuses the burst, nothing run: error.BurstRefused, the host prefills them singly), then
++        /// (a refusal anywhere refuses the burst, nothing run: false, the host prefills them singly), then
+         /// the prompts that fit one pass together share it (Engine.prefillMany), the rest prefill alone. Each stream's
+         /// first token is kept for its own `first`.
+-        fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!void {
++        fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+             const self = of(ptr);
+-            if (comptime !@hasDecl(E, "prefillMany")) return error.BurstRefused;
++            if (comptime !@hasDecl(E, "prefillMany")) return false;
+             const e = self.e;
+-            if (ss.len < 2 or ss.len > max_rows) return error.BurstRefused;
++            if (ss.len < 2 or ss.len > max_rows) return false;
+             // an image or video prompt prefills alone (attachMedia, the MODE 2 prompt rows)
+-            for (ss) |s| if (s.reuse.at > 0 or s.reuse.marks.len > 0 or s.media != null) return error.BurstRefused;
++            for (ss) |s| if (s.reuse.at > 0 or s.reuse.marks.len > 0 or media_mod.of(s) != null) return false;
+             var ls: [max_rows]*Lane = undefined;
+             var adm: [max_rows]Admission = undefined;
+             var admitted: usize = 0;
+@@ -447,7 +462,7 @@ pub fn Lanes(comptime E: type) type {
+                 ahead += adm[admitted].need;
+                 admitted += 1;
+             }
+-            self.agree(failure) catch return error.BurstRefused;
++            self.agree(failure) catch return false;
+             var made: usize = 0;
+             for (ss, adm[0..ss.len]) |s, a| {
+                 ls[made] = self.makeLane(s, a) catch |err| return self.burstLost(ss, ls[0..made], err);
+@@ -480,6 +495,7 @@ pub fn Lanes(comptime E: type) type {
+                 i += 1;
+             }
+             self.endPass();
++            return true;
+         }
+ 
+         fn burstLost(self: *Self, ss: []const *lanes.Stream, ls: []*Lane, err: anyerror) anyerror {
+@@ -530,7 +546,7 @@ pub fn Lanes(comptime E: type) type {
+                 at = m;
+                 if (times) parts[1] += passSince(e, &t_last);
+             }
+-            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = cur, .media = s.media });
++            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = cur, .media = media_mod.of(s) });
+             self.endPass();
+             if (times) {
+                 parts[2] = passSince(e, &t_last);
+@@ -661,12 +677,12 @@ pub fn Lanes(comptime E: type) type {
+             return .{ .ptr = self, .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .budget = cache_budget };
+         }
+ 
+-        fn bytesFn(ptr: *anyopaque, at: u32) u64 {
++        pub fn bytesFn(ptr: *anyopaque, at: u32) u64 {
+             return of(ptr).footprint(at);
+         }
+ 
+         /// The store keeps the pass's state at `at`: the tentative Kept made there.
+-        fn saveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
++        pub fn saveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+             _ = owner;
+             const self = of(ptr);
+             for (self.tentative.items) |*t| if (t.at == at and !t.adopted) {
+@@ -678,11 +694,11 @@ pub fn Lanes(comptime E: type) type {
+         }
+ 
+         /// The backend restores inside its pass (LaneHost's lookup, not begin).
+-        fn restoreFn(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
++        pub fn restoreFn(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
+             return error.RestoredInThePass;
+         }
+ 
+-        fn dropFn(ptr: *anyopaque, saved: *anyopaque) void {
++        pub fn dropFn(ptr: *anyopaque, saved: *anyopaque) void {
+             const self = of(ptr);
+             const k = self.keptOf(saved) orelse return;
+             // Store.keep evicts to fit the pass's next mark, and once older states are gone it takes one this same
+@@ -757,7 +773,7 @@ pub fn Lanes(comptime E: type) type {
+             const limit = ids.len + s.max_new + self.window;
+             if (ids.len == 0 or limit > self.context) return error.PromptTooLong;
+             // an image or video prompt also holds its rotary table and features while it fills (attachMedia)
+-            const media_bytes: usize = if (s.media) |m| std.mem.alignForward(usize, ids.len * 12, 256) + std.mem.alignForward(usize, m.featureBytes(), 256) else 0;
++            const media_bytes: usize = if (media_mod.of(s)) |m| std.mem.alignForward(usize, ids.len * 12, 256) + std.mem.alignForward(usize, m.featureBytes(), 256) else 0;
+             const need = self.footprint(limit) + media_bytes;
+             const before = if (self.lanes.get(s)) |old| old.reserved else 0;
+             if (!self.overcommit and self.reserved - before + ahead + need + self.kept_bytes > self.budget()) return error.NoRoom;
+@@ -1067,7 +1083,8 @@ pub fn Lanes(comptime E: type) type {
+                 for (&times) |*x| x.* = try c.chain(io, levels);
+                 out.* = median(times[1..]);
+             }
+-            const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)));
++            // one regime over every width: f212's pooling as hers at db281878 (no regime boundary)
++            const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)), std.math.maxInt(usize));
+             self.cost_count = 0;
+             for (1..k.rows + 1) |w| {
+                 self.costs[self.cost_count] = .{ .width = @intCast(w), .ms = k.verify[w] };
+@@ -1302,7 +1319,7 @@ pub const Toy = struct {
+     // -- kept prompt states (cuda_engine's Snapshot, prefillWith, copyPrefix, freeSnapshot) --
+ 
+     pub const Snapshot = struct { pos: usize, mtp_len: usize, tokens: []u32 };
+-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, media: ?*const lanes.Media = null };
++    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, media: ?*const media_mod.Media = null };
+     pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
+ 
+     /// The prompt from 0, or from a kept state of this sequence (its first pos rows the prompt's), keeping the
+@@ -1898,16 +1915,23 @@ test "prompts filling in slices between rounds equal serial decoding, the prompt
+     for (cases, &streams) |c, *s| s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .sampling = c.sampling, .drafts = c.drafts });
+     defer for (&streams) |*s| s.deinit(gpa);
+     streams[0].reuse = .{ .marks = &.{ 100, 250 }, .hook = .{ .ptr = &store, .at = KeepAll.hook } };
+-    // the first stream fills alone; the others arrive while it decodes
+-    try std.testing.expect(try engine.beginStream(&streams[0]));
++    // the first stream fills alone; the others arrive while it decodes; f212's host steps each fill between rounds
++    var filling: [cases.len]bool = .{ true, false, false };
++    var fresh: [cases.len]bool = @splat(true);
+     var next: usize = 1;
+     var steps: usize = 0;
+-    while (engine.activeCount() > 0 or engine.fillingCount() > 0 or next < streams.len) : (steps += 1) {
++    while (steps < 10_000) : (steps += 1) {
+         if (next < streams.len and steps % 3 == 2) {
+-            try std.testing.expect(try engine.beginStream(&streams[next]));
++            filling[next] = true;
+             next += 1;
+         }
+-        try engine.step();
++        var any = false;
++        for (&streams, &filling, &fresh) |*s, *fl, *fr| if (fl.*) {
++            any = true;
++            if (try engine.fillStream(s, fr.*)) fl.* = false;
++            fr.* = false;
++        };
++        if (engine.activeCount() > 0) try engine.step() else if (!any and next >= streams.len) break;
+     }
+     for (cases, &streams) |c, *s| {
+         const want = try serialTokens(gpa, c);
+diff --git a/zig/src/families/flashnext_mia/cuda_media.zig b/zig/src/families/flashnext_mia/cuda_media.zig
+new file mode 100644
+index 000000000..1f8680232
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda_media.zig
+@@ -0,0 +1,57 @@
++//! Her vision frontend's prompt media (Python's EncodedVision), kept here: f212's lanes.Stream carries none.
++const std = @import("std");
++const lanes = @import("lanes");
++
++/// Feature rows (ascending), every row's t, h, w rotary positions, the decode offset and the bf16 features.
++pub const Media = struct {
++    rows: []const u32,
++    positions: []const i32,
++    delta: i64,
++    features: []const u8,
++    width: u32,
++    /// a following rank's copy: the feature rows' count only (rows, positions and features arrive by broadcast)
++    follower_rows: u32 = 0,
++
++    pub fn rowCount(m: *const Media) usize {
++        return if (m.follower_rows > 0) m.follower_rows else m.rows.len;
++    }
++
++    pub fn featureBytes(m: *const Media) usize {
++        return m.rowCount() * @as(usize, m.width) * 2;
++    }
++
++    pub fn check(m: *const Media, prompt_len: usize) error{BadMedia}!void {
++        if (m.follower_rows > 0) {
++            if (m.rows.len != 0 or m.positions.len != 0 or m.features.len != 0 or m.width == 0 or m.follower_rows > prompt_len) return error.BadMedia;
++            return;
++        }
++        if (m.rows.len == 0 or m.positions.len != 3 * prompt_len or m.width == 0) return error.BadMedia;
++        if (m.features.len != 0 and m.features.len != m.featureBytes()) return error.BadMedia;
++        var last: ?u32 = null;
++        for (m.rows) |r| {
++            if (r >= prompt_len or (last != null and r <= last.?)) return error.BadMedia;
++            last = r;
++        }
++        for (m.positions) |p| if (p < 0) return error.BadMedia;
++    }
++};
++
++/// A stream's media: always null on f212's lanes (the server sends images to in-engine towers, not to this engine).
++pub fn of(s: *const lanes.Stream) ?*const Media {
++    return if (comptime @hasField(lanes.Stream, "media")) s.media else null;
++}
++
++test "media rows, positions and features must cover the prompt" {
++    const feats: [16]u8 = @splat(0);
++    const pos: [15]i32 = @splat(0);
++    var m: Media = .{ .rows = &.{ 1, 2 }, .positions = &pos, .delta = -1, .features = &feats, .width = 4 };
++    try m.check(5);
++    try std.testing.expectError(error.BadMedia, m.check(4));
++    m.rows = &.{ 2, 1 };
++    try std.testing.expectError(error.BadMedia, m.check(5));
++    m.rows = &.{ 1, 2 };
++    m.features = &.{};
++    try m.check(5);
++    m.features = feats[0..8];
++    try std.testing.expectError(error.BadMedia, m.check(5));
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_mirror.zig b/zig/src/families/flashnext_mia/cuda_mirror.zig
+index 8e62ebeb3..94d87fd6b 100644
+--- a/zig/src/families/flashnext_mia/cuda_mirror.zig
++++ b/zig/src/families/flashnext_mia/cuda_mirror.zig
+@@ -35,6 +35,7 @@
+ //! from the prefill frame to the release frame (prompt, budget, sampling, eos and chunks are all a backend reads).
+ const std = @import("std");
+ const lanes = @import("lanes");
++const media_mod = @import("cuda_media.zig");
+ const cuda = @import("cuda");
+ const Link = @import("cuda_link.zig").Link;
+ const Comm = @import("cuda_comm.zig").Comm;
+@@ -980,12 +981,12 @@ pub const Leader = struct {
+             .probabilities = if (v.probabilities != null) probabilitiesFn else null,
+             .tree = if (v.tree != null) treeFn else null,
+             .alternatives = if (v.alternatives != null) alternativesFn else null,
+-            .prefill_begin = if (v.prefill_begin != null and v.prefill_step != null) prefillBeginFn else null,
+-            .prefill_step = if (v.prefill_begin != null and v.prefill_step != null) prefillStepFn else null,
++            .prefill_step = if (v.prefill_step != null) prefillStepFn else null,
+             .prefill_many = if (v.prefill_many != null) prefillManyFn else null,
+             .release = releaseFn,
+         };
+-        return .{ .ptr = self, .vtable = &self.vtable };
++        const i = self.inner; // f212's backend flags: the leader serves what its lanes do
++        return .{ .ptr = self, .vtable = &self.vtable, .first_before_draft = i.first_before_draft, .penalties = i.penalties, .chunk_invariant = i.chunk_invariant };
+     }
+ 
+     fn of(p: *anyopaque) *Leader {
+@@ -1004,33 +1005,29 @@ pub const Leader = struct {
+             .resume_key = if (s.reuse.saved) |saved| @intFromPtr(saved) else 0,
+             .resume_at = s.reuse.at,
+             .marks = s.reuse.marks,
+-            .media = if (s.media) |m| .{ .rows = @intCast(m.rowCount()), .delta = m.delta, .width = m.width } else null,
++            .media = if (media_mod.of(s)) |m| .{ .rows = @intCast(m.rowCount()), .delta = m.delta, .width = m.width } else null,
+         };
+     }
+ 
+-    fn prefillBeginFn(p: *anyopaque, s: *Stream) anyerror!void {
++    /// f212's prefill_step: the first step sends the spec (rank 1 mirrors it), each step its key, then both step.
++    fn prefillStepFn(p: *anyopaque, s: *Stream, max_rows: u32) anyerror!bool {
+         const self = of(p);
+-        try self.open.put(self.gpa, keyOf(s), {});
+-        try self.send(.{ .prefill_begin = specOf(s) }, true);
+-        self.arm(0);
+-        defer self.disarm();
+-        return self.inner.vtable.prefill_begin.?(self.inner.ptr, s);
+-    }
+-
+-    fn prefillStepFn(p: *anyopaque, streams: []const *Stream, states: []be.FillState) anyerror!void {
+-        const self = of(p);
+-        const keys = try self.scratch().alloc(u64, streams.len);
+-        for (keys, streams) |*k, s| k.* = keyOf(s);
++        if (!self.open.contains(keyOf(s))) {
++            try self.open.put(self.gpa, keyOf(s), {});
++            try self.send(.{ .prefill_begin = specOf(s) }, false);
++        }
++        const keys = try self.scratch().alloc(u64, 1);
++        keys[0] = keyOf(s);
+         try self.send(.{ .prefill_step = keys }, true);
+         self.arm(0);
+         defer self.disarm();
+-        return self.inner.vtable.prefill_step.?(self.inner.ptr, streams, states);
++        return self.inner.vtable.prefill_step.?(self.inner.ptr, s, max_rows);
+     }
+ 
+-    fn prefillManyFn(p: *anyopaque, ss: []const *Stream) anyerror!void {
++    fn prefillManyFn(p: *anyopaque, ss: []const *Stream) anyerror!bool {
+         const self = of(p);
+         // an image or video prompt prefills alone: its table and features go by broadcast inside its own prefill
+-        for (ss) |s| if (s.media != null) return error.BurstRefused;
++        for (ss) |s| if (media_mod.of(s) != null) return false;
+         const specs = try self.scratch().alloc(StreamSpec, ss.len);
+         var seconds: usize = 0;
+         for (specs, ss) |*sp, s| {
+@@ -1149,7 +1146,7 @@ const Mirrored = struct {
+     chunks: []u32,
+     marks: []u32,
+     /// rank 0's media shape (its rows, rotary table and features reach this rank by broadcast)
+-    media: ?*lanes.Media = null,
++    media: ?*media_mod.Media = null,
+ };
+ 
+ /// Rank 1's loop: rank 0's calls on `inner`, until a `stop` frame.
+@@ -1253,11 +1250,11 @@ pub const Follower = struct {
+         m.media = null;
+         errdefer if (m.media) |md| self.gpa.destroy(md);
+         if (p.media) |pm| {
+-            const md = try self.gpa.create(lanes.Media);
++            const md = try self.gpa.create(media_mod.Media);
+             md.* = .{ .rows = &.{}, .positions = &.{}, .delta = pm.delta, .features = &.{}, .width = pm.width, .follower_rows = pm.rows };
+             m.media = md;
+         }
+-        m.stream = try Stream.init(self.gpa, .{ .id = "rank0", .prompt = p.prompt, .max_new = p.max_new, .eos = m.eos, .sampling = p.sampling, .drafts = p.drafts, .chunks = m.chunks, .reuse = .{ .saved = saved, .at = p.resume_at, .marks = m.marks }, .media = m.media });
++        m.stream = try Stream.init(self.gpa, .{ .id = "rank0", .prompt = p.prompt, .max_new = p.max_new, .eos = m.eos, .sampling = p.sampling, .drafts = p.drafts, .chunks = m.chunks, .reuse = .{ .saved = saved, .at = p.resume_at, .marks = m.marks } });
+         const gop = try self.streams.getOrPut(self.gpa, p.key);
+         if (gop.found_existing) {
+             const old = gop.value_ptr.*;
+@@ -1277,19 +1274,12 @@ pub const Follower = struct {
+                 const f = b.vtable.prefill_many orelse return error.NoBursts;
+                 const ss = try a.alloc(*Stream, ps.len);
+                 for (ss, ps) |*x, p| x.* = try self.mirror(p);
+-                try f(b.ptr, ss);
+-            },
+-            .prefill_begin => |p| {
+-                const f = b.vtable.prefill_begin orelse return error.NoFills;
+-                try f(b.ptr, try self.mirror(p));
++                _ = try f(b.ptr, ss); // refused on rank 0 too (the same specs): rank 0 then prefills each alone
+             },
++            .prefill_begin => |p| _ = try self.mirror(p), // its fill begins with its first prefill_step
+             .prefill_step => |keys| {
+                 const f = b.vtable.prefill_step orelse return error.NoFills;
+-                const ss = try a.alloc(*Stream, keys.len);
+-                for (ss, keys) |*x, k| x.* = try self.stream(k);
+-                const states = try a.alloc(be.FillState, keys.len);
+-                @memset(states, .filling);
+-                try f(b.ptr, ss, states);
++                for (keys) |k| _ = try f(b.ptr, try self.stream(k), 0);
+             },
+             .first => |f| _ = try b.first(try self.stream(f.key), f.position),
+             .queue => |q| _ = try b.queue(try self.stream(q.key), q.feed, q.position),
+@@ -1521,7 +1511,7 @@ const Rank1 = struct {
+         defer l.close();
+         var frames: Frames = .{ .gpa = gpa, .link = l };
+         defer frames.deinit();
+-        var f = Follower.init(gpa, if (r.sliced) r.target.backendSliced() else r.target.backend(), frames.channel());
++        var f = Follower.init(gpa, if (r.sliced) r.target.stepped() else r.target.backend(), frames.channel());
+         defer f.deinit();
+         f.run() catch |e| {
+             r.err = e;
+@@ -1900,38 +1890,45 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices
+             var streams: [3]Stream = undefined;
+             for (&streams, prompts, 0..) |*s, p, i| s.* = try Stream.init(gpa, .{ .id = "s", .prompt = p, .max_new = 20 + 5 * @as(u32, @intCast(i)), .eos = &.{96} });
+             defer for (&streams) |*s| s.deinit(gpa);
+-            // one fills alone, then the others arrive two steps apart while it decodes
+-            _ = try engine.beginStream(&streams[0]);
++            // one fills alone, then the others arrive two steps apart while it decodes (f212's host steps fills)
++            var filling: [3]bool = .{ true, false, false };
++            var fresh: [3]bool = @splat(true);
+             var next: usize = 1;
+             var steps: usize = 0;
+-            while (engine.activeCount() > 0 or engine.fillingCount() > 0 or next < 3) : (steps += 1) {
++            while (steps < 10_000) : (steps += 1) {
+                 if (next < 3 and steps % 2 == 1) {
+-                    _ = try engine.beginStream(&streams[next]);
++                    filling[next] = true;
+                     next += 1;
+                 }
+-                try engine.step();
++                var any = false;
++                for (&streams, &filling, &fresh) |*s, *fl, *fr| if (fl.*) {
++                    any = true;
++                    if (try engine.fillStream(s, fr.*)) fl.* = false;
++                    fr.* = false;
++                };
++                if (engine.activeCount() > 0) try engine.step() else if (!any and next >= 3) break;
+             }
+             var out: [3][]u32 = undefined;
+             for (&out, &streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
+             return out;
+         }
+     };
+-    var alone: fake.Fake = .{ .gpa = gpa, .slice = 3 };
++    var alone: fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+     defer alone.deinit();
+-    const want = try Drive.run(alone.backend());
++    const want = try Drive.run(alone.stepped());
+     defer for (want) |w| gpa.free(w);
+ 
+     const server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
+     defer server.close();
+-    var rank1: Rank1 = .{ .target = .{ .gpa = gpa, .slice = 3 }, .sliced = true };
++    var rank1: Rank1 = .{ .target = .{ .gpa = gpa, .prefill_chunks = 3 }, .sliced = true };
+     defer rank1.target.deinit();
+     const t = try std.Thread.spawn(.{}, Rank1.run, .{ &rank1, io, server.port() });
+-    var rank0: fake.Fake = .{ .gpa = gpa, .slice = 3 };
++    var rank0: fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+     defer rank0.deinit();
+     const l = try server.accept(5000);
+     defer l.close();
+     var frames: Frames = .{ .gpa = gpa, .link = l };
+-    var leader = Leader.init(gpa, rank0.backendSliced(), frames.channel());
++    var leader = Leader.init(gpa, rank0.stepped(), frames.channel());
+     const got = Drive.run(leader.backend()) catch |e| {
+         leader.deinit();
+         t.join();
+@@ -1942,8 +1939,8 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices
+     t.join();
+     if (rank1.err) |e| return e;
+     for (want, got) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+-    try std.testing.expect(rank0.fill_steps > 0);
+-    try std.testing.expectEqual(rank0.fill_steps, rank1.target.fill_steps);
++    try std.testing.expect(rank0.prefill_count > 3); // every prompt in 3 steps
++    try std.testing.expectEqual(rank0.prefill_count, rank1.target.prefill_count);
+     try std.testing.expectEqualSlices(u32, rank0.drawn.items, rank1.target.drawn.items);
+     try std.testing.expectEqual(@as(u64, 0), rank1.failed);
+ }

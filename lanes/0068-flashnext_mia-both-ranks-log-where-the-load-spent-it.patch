@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:44:22 +0700
+Subject: [PATCH 68/79] flashnext_mia: both ranks log where the load spent its
+ time
+
+Engine.init's stages (config, kernels, weights, buffers, forward, exchange, page drop, memory) timed and printed in
+one info line a rank, so a slow start shows its stage.
+---
+ .../families/flashnext_mia/cuda_engine.zig    |  1 +
+ .../flashnext_mia/cuda_engine_init.zig        | 52 +++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/zig/src/families/flashnext_mia/cuda_engine.zig b/zig/src/families/flashnext_mia/cuda_engine.zig
+index b9eddeebe..d325370cd 100644
+--- a/zig/src/families/flashnext_mia/cuda_engine.zig
++++ b/zig/src/families/flashnext_mia/cuda_engine.zig
+@@ -515,4 +515,5 @@ test "geometry and dims follow the config's split" {
+ test {
+     std.testing.refAllDecls(@This());
+     std.testing.refAllDecls(Engine);
++    _ = eng_init;
+ }
+diff --git a/zig/src/families/flashnext_mia/cuda_engine_init.zig b/zig/src/families/flashnext_mia/cuda_engine_init.zig
+index 5daec3561..d881f8599 100644
+--- a/zig/src/families/flashnext_mia/cuda_engine_init.zig
++++ b/zig/src/families/flashnext_mia/cuda_engine_init.zig
+@@ -91,10 +91,12 @@ pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u
+     errdefer gpa.destroy(e);
+     e.* = .{ .gpa = gpa, .io = io, .ctx = ctx, .stream = undefined, .k = undefined, .torch = undefined, .set = undefined, .c = undefined, .w = undefined, .g = undefined, .dims = undefined, .buf = undefined, .pbuf = undefined, .f = undefined, .extra = undefined, .main_sample = undefined, .last_logits = 0, .last_cand = 0, .max_len = 0, .depth = if (o.mtp) o.depth else 0, .rank = o.rank, .world = o.world, .prefill_rows = try promptRows(if (o.world == 2 and o.prefill_rows == state.prefill_rows) tp2_prefill_rows else o.prefill_rows), .graphs_on = o.graphs };
+     const d = ctx.d;
++    var marks: Marks = .{ .io = io, .last = t0 };
+     e.c = try cfgs.Config.read(gpa, io, dir, .{ .yarn = if (o.yarn) |y| yarnConfig(y) else null });
+     errdefer e.c.deinit();
+     e.stream = try cuda.Stream.init(d, true);
+     errdefer e.stream.deinit();
++    marks.mark("config");
+     e.k = try kern.Kernels.load(ctx);
+     errdefer e.k.deinit();
+     e.torch = try tops.Ops.load(ctx);
+@@ -102,10 +104,12 @@ pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u
+     e.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, kernels_dir);
+     errdefer e.set.deinit();
+     // TF_FLASHNEXT_INT4AR_FAST=1: INT4-AutoRound's lossy fast-fp8/ variant over the checkpoint (opt-in)
++    marks.mark("kernels");
+     var overlay_buf: [1024]u8 = undefined;
+     const overlay: ?[]const u8 = if (e.c.int4ar() and envs.get("TF_FLASHNEXT_INT4AR_FAST") != null and !envs.off("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
+     e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
+     errdefer e.w.deinit();
++    marks.mark("weights");
+     if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
+     e.g = try geometry(&e.c, o.world, e.w.mtp != null);
+     e.g.kv = o.kv;
+@@ -129,6 +133,7 @@ pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u
+     e.pbuf = .{ .b = try state.Buffers.init(d, e.g, e.prefill_rows + e.prefill_tail, .{ .prefill = true, .capacity = e.max_len }), .y_f32 = false, .attn = tri.AttnGeometry.init(e.max_len, e.g.index_budget, e.g.index_ratio) };
+     errdefer e.pbuf.deinit();
+     try e.initWindows();
++    marks.mark("buffers");
+     const th = e.torch.on(e.stream);
+     e.memo = .{ .gpa = gpa };
+     errdefer e.memo.deinit();
+@@ -175,6 +180,7 @@ pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u
+     // two ranks: prompt glue split by rows (TF_FLASHNEXT_GLUE_SPLIT=0: every rank runs every row)
+     e.f.glue_split = o.world == 2 and !envs.off("TF_FLASHNEXT_GLUE_SPLIT");
+     e.digest = envs.get("TF_FLASHNEXT_PREFILL_DIGEST") != null;
++    marks.mark("forward");
+     // NCCL connects point-to-point channels on first use, so one prompt-sized exchange runs now on both ranks
+     if (e.f.glue_split) if (o.comm) |cm| {
+         const n = @min(e.prefill_rows / 2, 2048) * e.g.hidden;
+@@ -183,7 +189,9 @@ pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u
+         try e.stream.synchronize();
+     };
+     // both ranks loaded: drop the checkpoint's pages from the page cache (TF_FLASHNEXT_DROP_PAGES=0 keeps them)
++    marks.mark("exchange");
+     if (!envs.off("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
++    marks.mark("page drop");
+     e.poison = envs.get("TF_FLASHNEXT_POISON_PADS") != null;
+     e.pass_times = envs.get("TF_FLASHNEXT_PASS_TIMES") != null;
+     e.f.up_mix = !envs.off("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
+@@ -289,10 +297,54 @@ pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u
+     e.own = try e.newSeq(e.max_len);
+     e.bound = e.own;
+     try e.stream.synchronize();
++    marks.mark("memory");
+     e.load_seconds = seconds(io, t0);
++    marks.log(o.rank, e.load_seconds);
+     return e;
+ }
+ 
++/// Engine.init's stages, timed: both ranks print where their load spent its time (a slow start shows its stage).
++const Marks = struct {
++    io: std.Io,
++    last: std.Io.Timestamp,
++    names: [12][]const u8 = undefined,
++    secs: [12]f64 = undefined,
++    n: usize = 0,
++
++    fn mark(m: *Marks, name: []const u8) void {
++        const now = std.Io.Clock.awake.now(m.io);
++        if (m.n < m.names.len) {
++            m.names[m.n] = name;
++            m.secs[m.n] = @as(f64, @floatFromInt(now.toNanoseconds() - m.last.toNanoseconds())) / 1e9;
++            m.n += 1;
++        }
++        m.last = now;
++    }
++
++    fn text(m: *const Marks, buf: []u8) []const u8 {
++        var w: std.Io.Writer = .fixed(buf);
++        for (m.names[0..m.n], m.secs[0..m.n], 0..) |name, s, i| w.print("{s}{s} {d:.1}", .{ if (i > 0) ", " else "", name, s }) catch break;
++        return w.buffered();
++    }
++
++    fn log(m: *const Marks, rank: u32, total: f64) void {
++        var buf: [384]u8 = undefined;
++        std.log.info("rank {d}: loaded in {d:.1} s ({s} s)", .{ rank, total, m.text(&buf) });
++    }
++};
++
++test "load stages: each stage's time in order, after the one before" {
++    const io = std.testing.io;
++    var m: Marks = .{ .io = io, .last = std.Io.Clock.awake.now(io) };
++    m.mark("config");
++    m.mark("weights");
++    try std.testing.expectEqual(@as(usize, 2), m.n);
++    for (m.secs[0..m.n]) |s| try std.testing.expect(s >= 0 and s < 60);
++    var buf: [64]u8 = undefined;
++    const t = m.text(&buf);
++    try std.testing.expect(std.mem.startsWith(u8, t, "config 0.0, weights 0.0"));
++}
++
+ /// The prompt buffers' DeltaNet taps: row r reads [conv state (3) | rows] at r .. r + 3 (Python Buffers.windows).
+ pub fn initWindows(e: *Engine) !void {
+     const b = &e.pbuf.b;

@@ -100,6 +100,52 @@ prebuilt_image() {
 }
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-fn-tf}"           # the same name on both Sparks
 
+# Compute lanes, opt-in (README "Compute lanes"). ENGINE=patches (the default) serves the image above, unchanged.
+# ENGINE=lanes serves the lane image: the image above with tensorfold-native from the lane engine (upstream TensorFold,
+# LANES_REPO at LANES_REF, plus the patches in lanes/; it serves this recipe's engine as TF_FLASHNEXT_ENGINE=mia) and
+# the in-model runner's files
+# (scripts/lanes.sh). Text only (VISION=0). The model can then run exact computation while it thinks: a Python cell,
+# or an inline `<expr> =`, is run by the engine and its result goes back into the reasoning.
+ENGINE="${ENGINE:-patches}"
+case "$ENGINE" in
+  patches|lanes) ;;
+  *) printf '[%s] ERROR: ENGINE is patches or lanes, not %s\n' "$(basename "$0")" "$ENGINE" >&2; exit 1 ;;
+esac
+LANES_REPO="${LANES_REPO:-https://github.com/ashhart/TensorFold.git}"   # upstream TensorFold, unmodified
+LANES_REF="${LANES_REF:-f212eeabde0fc2ac3234ca947a69cc7714abaca2}"   # the commit lanes/ applies to (40 hex digits)
+# the tree lanes/series pins: the patched lane engine's tree, checked at build time
+LANES_TREE=$(awk '$1 == "tree" {print $2}' "$_cfg_root/lanes/series" 2>/dev/null)
+# the runner's circuit and graph bank: one archive at its sha256 (the engine's packaging/runner/assets.release)
+RUNNER_ASSETS_URL="${RUNNER_ASSETS_URL:-https://github.com/jayleaton/deepseek-v41-tensorfold-spark/releases/download/runner-assets-20261107/runner-assets-20261107.tar.gz}"
+RUNNER_ASSETS_SHA256="${RUNNER_ASSETS_SHA256:-b5c40d32bcab0fa896795d08aaa651d55d0574e500f3624e61db23058cdd800f}"
+# shellcheck disable=SC2034  # read by prepare.sh and lanes.sh
+MIA_IMAGE="$IMAGE"            # the default image; the lane image is built on it
+_vision=1
+if [[ "$ENGINE" == lanes ]]; then
+  IMAGE="${LANES_IMAGE:-tensorfold-qwen38fn-lanes:${TF_TAG}-${LANES_TREE:0:9}}"
+  _vision=0
+  # the engine: this recipe's Flash Next engine (patches 0001-0012, ported), not upstream's
+  export TF_FLASHNEXT_ENGINE="${TF_FLASHNEXT_ENGINE:-mia}"
+  # the compute lane: a Python cell the model writes is run and its output returned (TF_COMPUTE_LANE_*), and the
+  # in-model runner computes inline arithmetic exactly (TF_RUNNER_*); both only inside the reasoning
+  # (TF_RUNNER_SPANS=reasoning): a reply without thinking has the same tokens as without lanes
+  _r=/opt/tensorfold/share/runner
+  export TF_COMPUTE_LANE="${TF_COMPUTE_LANE:-1}" TF_COMPUTE_LANE_DEFAULT="${TF_COMPUTE_LANE_DEFAULT:-1}"
+  export TF_RUNNER="${TF_RUNNER:-1}" TF_RUNNER_SPANS="${TF_RUNNER_SPANS:-reasoning}"
+  export TF_RUNNER_CIRCUIT="${TF_RUNNER_CIRCUIT:-$_r/calc.tfpc}" TF_RUNNER_BACKEND="${TF_RUNNER_BACKEND:-graph}"
+  export TF_RUNNER_GRAPH_BANK="${TF_RUNNER_GRAPH_BANK:-$_r/graph-v7-powmod/bank/bank.json}"
+  export TF_RUNNER_FORMS="${TF_RUNNER_FORMS:-fence,repl,inline,trace}" TF_RUNNER_CELLS="${TF_RUNNER_CELLS:-1}"
+  export TF_RUNNER_STATED="${TF_RUNNER_STATED:-0}" TF_RUNNER_INLINE_CHAIN="${TF_RUNNER_INLINE_CHAIN:-0}"
+  export TF_RUNNER_INLINE_MARK="${TF_RUNNER_INLINE_MARK:-1}" TF_RUNNER_SYNC_GRAPH="${TF_RUNNER_SYNC_GRAPH:-0}"
+  export TF_RUNNER_COMPILE_STEPS="${TF_RUNNER_COMPILE_STEPS:-10522}" TF_RUNNER_COMMIT="${TF_RUNNER_COMMIT:-0}"
+  export TF_COMPUTE_LANE_RUNNER="${TF_COMPUTE_LANE_RUNNER:-1}"
+  export TF_COMPUTE_LANE_RUNNER_CIRCUIT="${TF_COMPUTE_LANE_RUNNER_CIRCUIT:-$_r/calc.tfpc}"
+  export TF_COMPUTE_LANE_RUNNER_BACKEND="${TF_COMPUTE_LANE_RUNNER_BACKEND:-graph}"
+  export TF_COMPUTE_LANE_RUNNER_GRAPH_BANK="${TF_COMPUTE_LANE_RUNNER_GRAPH_BANK:-$_r/graph-v7-powmod/bank/bank.json}"
+  export TF_COMPUTE_LANE_RUNNER_SETTLE_US="${TF_COMPUTE_LANE_RUNNER_SETTLE_US:-3000}"
+  unset _r
+fi
+
 SERVED_NAME="${SERVED_NAME:-$_name}"          # the API model id: Qwen3.8-Flash-Next, or -INT4-AR for int4ar
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
@@ -139,7 +185,7 @@ KV_DTYPE="${KV_DTYPE:-fp8}"
 # Image and video (--vision, TensorFold's own vision frontend and tower in a Python helper on rank 0). VISION=0 serves
 # text only and returns the helper's workspace (4 GiB) to the KV pool; VISION_URLS=1 also lets the server fetch public
 # https:// URLs (data URLs only otherwise).
-VISION="${VISION:-1}"
+VISION="${VISION:-$_vision}"   # 1; 0 with ENGINE=lanes
 VISION_URLS="${VISION_URLS:-0}"
 export TENSORFOLD_MAX_IMAGES="${TENSORFOLD_MAX_IMAGES:-50}"          # images a request (--vision-max-images)
 MAX_VIDEOS="${MAX_VIDEOS:-4}"                                        # videos a request (--vision-max-videos)

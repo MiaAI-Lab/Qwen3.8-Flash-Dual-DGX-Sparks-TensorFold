@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:42:16 +0700
+Subject: [PATCH 14/79] native options: a family's own prompt_cache_gib field
+ takes --prompt-cache-gib
+
+Only a CUDA family whose Options declare prompt_cache_gib receives it (MiaAI-Lab's Flash Next keeps
+her own kept-state budget rule); no registry family declares it.
+---
+ zig/src/native/cuda_options.zig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/zig/src/native/cuda_options.zig b/zig/src/native/cuda_options.zig
+index c3d8d9439..eb7321170 100644
+--- a/zig/src/native/cuda_options.zig
++++ b/zig/src/native/cuda_options.zig
+@@ -41,6 +41,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
+     if (comptime @hasField(F.Options, "drafter_bits")) opts.drafter_bits = o.drafter_bits;
+     if (comptime @hasField(F.Options, "rope_yarn")) opts.rope_yarn = o.rope_yarn;
+     if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
++    if (@hasField(F.Options, "prompt_cache_gib")) opts.prompt_cache_gib = o.prompt_cache_gib; // a family's own budget rule
+     if (@hasField(F.Options, "prompt_int8")) opts.prompt_int8 = o.prompt_int8;
+     if (@hasField(F.Options, "loops")) opts.loops = o.loops;
+     return true;

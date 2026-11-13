@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 19:38:05 +0700
+Subject: [PATCH 53/79] core lanes, lane host: opt-in burst split, short
+ prompts' small cache hits dropped to join
+
+Model.burst_split / burst_short (off by default, Config copies them): when the host admits
+several queued requests together, an image prompt, or one at least burst_short tokens long that
+resumes or keeps states, prefills alone; the rest still go to prefill_many in one pass. A
+shorter prompt in the burst drops its resume and marks and prefills from 0 with the others;
+Job.reported releases its looked-up entry untouched. Off, f212's host keeps its rule: a backend
+that refuses a stream refuses the whole burst and every stream prefills alone.
+
+Port: burst admission (0007 lane_host.zig admitAll) from her 0007 (MiaAI-Lab)
+---
+ zig/src/core/lane_host_admit.zig | 15 +++++++++++++++
+ zig/src/core/lanes/config.zig    |  6 ++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/zig/src/core/lane_host_admit.zig b/zig/src/core/lane_host_admit.zig
+index 2674d8614..8b8579652 100644
+--- a/zig/src/core/lane_host_admit.zig
++++ b/zig/src/core/lane_host_admit.zig
+@@ -67,6 +67,14 @@ pub fn batches(h: *LaneHost) bool {
+     return h.queued.items.len >= 2 and lanes_now -| h.admitted.items.len >= 2;
+ }
+ 
++/// Config.burst_split: an image prompt, or one at least burst_short long that resumes or keeps states, goes alone.
++fn splitsAlone(h: *const LaneHost, job: *const Job) bool {
++    if (!h.core.cfg.burst_split) return false;
++    const s = &job.stream;
++    if (s.images.len > 0) return true;
++    return (s.reuse.at > 0 or s.reuse.marks.len > 0) and s.prompt_len >= h.core.cfg.burst_short;
++}
++
+ /// Every queued request a lane is free for, prompts in one pass (lone and warm ones as before); false: none taken.
+ pub fn many(h: *LaneHost) bool {
+     var jobs: [lanes.Engine.max_together]*Job = undefined;
+@@ -84,6 +92,10 @@ pub fn many(h: *LaneHost) bool {
+         };
+         took = true;
+         const at = h.setup(job) orelse continue;
++        if (splitsAlone(h, job)) { // Config.burst_split: resumed or marked, it prefills alone
++            _ = h.launch(job, at);
++            continue;
++        }
+         // a prompt-only job ends through `launch`: after `addStreams` nothing would complete it
+         if (h.startsAlone(job) or job.stream.promptOnly() or (h.core.fills() and !h.core.batchable(&job.stream))) { // long, image, resumed: filled
+             _ = h.launch(job, at);
+@@ -94,6 +106,9 @@ pub fn many(h: *LaneHost) bool {
+         n += 1;
+     }
+     if (n == 1) return h.launch(jobs[0], began[0]);
++    if (h.core.cfg.burst_split) for (jobs[0..n]) |job| {
++        job.stream.reuse = .{}; // a short prompt's resume and marks dropped; Job.reported keeps its entry
++    };
+     var streams: [lanes.Engine.max_together]*lanes.Stream = undefined;
+     for (jobs[0..n], 0..) |job, i| streams[i] = &job.stream;
+     var errs: [lanes.Engine.max_together]?anyerror = undefined;
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index d09b00858..12b115fc3 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -46,6 +46,8 @@ pub const Model = struct {
+     draft_stops: bool = false, // opt-in: the head stops each chain itself (a running product): ask the most drafts
+     draft_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live
+     join_batch: bool = false, // opt-in: joiners' first drafts wait for the next round, in one batch (lanes/join_batch.zig)
++    burst_split: bool = false, // opt-in: a burst's resumed or marked prompts prefill alone, the rest still together
++    burst_short: u32 = 0, // with burst_split: a prompt shorter than this drops its resume and marks to join a burst
+     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
+     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+@@ -89,6 +91,8 @@ pub const Config = struct {
+     head_stops: bool = false, // Model.draft_stops
+     head_stops_most: u32 = std.math.maxInt(u32), // Model.draft_stops_most
+     join_batch: bool = false, // Model.join_batch
++    burst_split: bool = false, // Model.burst_split (the lane host's burst admission reads it)
++    burst_short: u32 = 0, // Model.burst_short
+     /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
+     join_tail: bool = false,
+     /// a round's pieces of several streams in one backend call (Backend.pieces), which may run them as one forward
+@@ -176,6 +180,8 @@ pub const Config = struct {
+             .head_stops = m.draft_stops,
+             .head_stops_most = m.draft_stops_most,
+             .join_batch = m.join_batch,
++            .burst_split = m.burst_split,
++            .burst_short = m.burst_short,
+             .join_tail = m.join_tail,
+             .piece_runs = m.piece_runs,
+             .join_drafts = m.join_drafts,

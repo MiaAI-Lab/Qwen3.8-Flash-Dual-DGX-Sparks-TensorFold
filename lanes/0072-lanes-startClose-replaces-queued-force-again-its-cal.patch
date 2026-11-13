@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:30:16 +0700
+Subject: [PATCH 72/79] lanes: startClose replaces queued force again (its
+ callers cut with none queued); only resumed_rows is kept
+
+commit storage: a failed explicit thinking close retains its forced suffix expects the close to replace a queued
+row; the budget fix needs only the result's remaining row count kept.
+---
+ zig/src/core/lanes/stream.zig | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 2c10d5be0..252a0240e 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -407,10 +407,11 @@ pub const Stream = struct {
+         return s.budgetActive() and s.emitted().len + 1 >= s.think_budget;
+     }
+ 
+-    /// Begin the budget's close: its first token now, the rest forced; callers cut only with no forced row queued.
++    /// Begin the budget's close: its first token now, the rest forced; a result's rows still landing keep their count.
+     pub fn startClose(s: *Stream, gpa: Allocator) !u32 {
+-        try s.force.ensureUnusedCapacity(gpa, s.think_close.len - 1);
++        try s.force.ensureTotalCapacity(gpa, s.think_close.len - 1);
+         s.think_open = false;
++        s.force.clearRetainingCapacity();
+         s.force.appendSliceAssumeCapacity(s.think_close[1..]);
+         return s.think_close[0];
+     }

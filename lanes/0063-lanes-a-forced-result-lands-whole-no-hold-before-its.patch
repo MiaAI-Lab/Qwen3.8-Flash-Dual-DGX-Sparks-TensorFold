@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 20:25:05 +0700
+Subject: [PATCH 63/79] lanes: a forced result lands whole; no hold before its
+ last forced row
+
+A window that takes a forced tail whole (a runner's or a tool's result shorter than the
+window) empties Stream.force before the commit lands it, so commit's can_hold saw no forced
+token and a runner trigger on one of the result's own rows held the stream: the commit broke
+there and the rows after the trigger were dropped. DeepSeek-V4.1's P1 run (c69bca6c1) lost
+the last 4 of 22 rows of an owned `[exact, computed by the engine: 10*12*2*30 = 7200]` note
+this way: its own `10*12*2*30 =` fired an inline cell.
+
+Stream.forced_out counts the rows taken off `force` for the next commit (windows.plan's take,
+hold.popForce); commit lands them first and holds only once none is left behind the token.
+A trigger on a result's last row still holds as before. test-forced-rows-host on the fake
+target: a trigger on each earlier row of a 6-row result never holds and the rows land in order.
+
+A fix applied onto the think-close change.
+
+(cherry picked from commit c8e930375222dee203e9f2c768266cd3507b30f5)
+---
+ zig/build/lane_halt_host.zig                 |  1 +
+ zig/src/core/lanes/forced_rows_hold_test.zig | 68 ++++++++++++++++++++
+ zig/src/core/lanes/hold.zig                  |  7 ++
+ zig/src/core/lanes/lanes.zig                 |  1 +
+ zig/src/core/lanes/stream.zig                | 10 +--
+ zig/src/core/lanes/windows.zig               |  1 +
+ 6 files changed, 83 insertions(+), 5 deletions(-)
+ create mode 100644 zig/src/core/lanes/forced_rows_hold_test.zig
+
+diff --git a/zig/build/lane_halt_host.zig b/zig/build/lane_halt_host.zig
+index 32b30caa5..c4dafce49 100644
+--- a/zig/build/lane_halt_host.zig
++++ b/zig/build/lane_halt_host.zig
+@@ -19,6 +19,7 @@ pub fn steps(b: *std.Build) void {
+     hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"compute hold:"} })).step);
+     b.step("test-runner-abstain-host", "Abstain records: each abstained cell's source, reason and decision point").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner abstain records:"} })).step);
+     b.step("test-settle-fire-host", "PREFIX_SYNC_GRAPH on the fake target: fires settled at their trigger never hold").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"settled fires:"} })).step);
++    b.step("test-forced-rows-host", "A held fire's forced result lands whole on the fake target: no hold inside it").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"forced rows:"} })).step);
+     b.step("test-runner-host", "The in-model runner: scanner, held results and delivery with a fake circuit backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner"} })).step);
+     // proof 2 on the real circuit (TF_RUNNER_CIRCUIT): optimized, since a debug evaluator takes minutes a run
+     const lanes_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
+diff --git a/zig/src/core/lanes/forced_rows_hold_test.zig b/zig/src/core/lanes/forced_rows_hold_test.zig
+new file mode 100644
+index 000000000..635e48e96
+--- /dev/null
++++ b/zig/src/core/lanes/forced_rows_hold_test.zig
+@@ -0,0 +1,68 @@
++//! A held fire's result lands whole: a trigger on one of its forced rows never holds while later rows wait to land
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const fake = @import("fake.zig");
++const hold = @import("hold.zig");
++const shared = @import("engine_test.zig");
++
++const gpa = std.testing.allocator;
++const fire = 20; // the model's trigger token (emitted index)
++const result = [_]u32{ 7, 8, 9, 10, 11, 12 }; // fewer rows than a window: one forced window takes the whole tail
++
++/// Fires at `fire` and again at `again` (an emitted index), whenever the stream may hold there.
++const Hook = struct {
++    seen: usize = 0,
++    again: usize,
++
++    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool, _: bool) bool {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        defer h.seen += 1;
++        return can_hold and (h.seen == fire or h.seen == h.again);
++    }
++};
++
++const Run = struct { tokens: []u32, holds: u32 };
++
++fn run(again: usize) !Run {
++    var cfg = try shared.modelWith(true);
++    defer cfg.deinit(gpa);
++    cfg.forced_drafts = true;
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    var hook: Hook = .{ .again = again };
++    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &shared.p1, .max_new = 60, .drafts = true, .runner = .{ .ptr = &hook, .token = Hook.token } });
++    defer s.deinit(gpa);
++    try engine.addStream(&s);
++    var holds: u32 = 0;
++    var rounds: u32 = 0;
++    while (!s.finished and rounds < 400) : (rounds += 1) {
++        if (s.awaiting) {
++            holds += 1;
++            // the first hold resumes with the result; a hold inside it resumes with nothing (the model draws on)
++            try std.testing.expect(try hold.resumeAwaiting(&s, gpa, if (holds == 1) &result else &.{}));
++        }
++        try engine.step();
++    }
++    try std.testing.expect(s.finished);
++    return .{ .tokens = try gpa.dupe(u32, s.emitted()), .holds = holds };
++}
++
++test "forced rows: a trigger on one before the result's last never holds, and every row lands in order" {
++    for (1..result.len) |row| {
++        const r = try run(fire + row);
++        defer gpa.free(r.tokens);
++        try std.testing.expectEqualSlices(u32, &result, r.tokens[fire + 1 ..][0..result.len]);
++        try std.testing.expectEqual(@as(u32, 1), r.holds);
++    }
++}
++
++test "forced rows: a trigger on the result's last still holds, as before (nothing waits behind it)" {
++    const r = try run(fire + result.len);
++    defer gpa.free(r.tokens);
++    try std.testing.expectEqualSlices(u32, &result, r.tokens[fire + 1 ..][0..result.len]);
++    try std.testing.expectEqual(@as(u32, 2), r.holds);
++}
+diff --git a/zig/src/core/lanes/hold.zig b/zig/src/core/lanes/hold.zig
+index cbd6d3252..a28df4a77 100644
+--- a/zig/src/core/lanes/hold.zig
++++ b/zig/src/core/lanes/hold.zig
+@@ -51,6 +51,13 @@ pub fn resultRow(s: *Stream) bool {
+     return s.resumed_rows > 0;
+ }
+ 
++/// The next forced token off the queue, a forced row of the next commit (no hold before its last), or null.
++pub fn popForce(s: *Stream) ?u32 {
++    if (s.force.items.len == 0) return null;
++    s.forced_out += 1;
++    return s.force.orderedRemove(0);
++}
++
+ /// Continues a stream held at a runner trigger: `tokens` (cut to the room left) are forced next, then the model draws.
+ pub fn resumeAwaiting(s: *Stream, gpa: Allocator, tokens: []const u32) Allocator.Error!bool {
+     if (!s.awaiting or !s.held or s.finished) return false;
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 926e9358a..59c575548 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -70,6 +70,7 @@ test {
+     _ = @import("hold_test.zig");
+     _ = @import("fire_replay_test.zig");
+     _ = @import("settle_fire_test.zig");
++    _ = @import("forced_rows_hold_test.zig");
+     _ = @import("round_trace_test.zig");
+     _ = @import("open_first_test.zig");
+     _ = @import("open_trace_test.zig");
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index c5860d222..b09f23da6 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -217,6 +217,7 @@ pub const Stream = struct {
+     hold_eos: bool = false,
+     held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
+     resumed_rows: usize = 0, // a held reply's result rows still to land: their EOS neither holds nor ends it
++    forced_out: usize = 0, // forced rows taken off `force` for the next commit: a hold before the last drops them
+     runner: ?RunnerHook = null,
+     awaiting: bool = false, // held at a runner trigger: hold.resumeAwaiting continues it
+     settle: enum { none, matching, cut } = .none, // this commit: a result settled at a trigger (hold.settle), its end
+@@ -454,6 +455,7 @@ pub const Stream = struct {
+         }
+         var landed: usize = 0;
+         s.settle = .none;
++        defer s.forced_out = 0; // the commit's forced rows lead it: those it did not land are gone
+         for (tokens, 0..) |t, i| {
+             if (s.finished) break;
+             if (s.settle == .matching and !@import("hold.zig").settledNext(s, t)) break;
+@@ -468,6 +470,7 @@ pub const Stream = struct {
+             s.context.appendAssumeCapacity(t);
+             if (rows.len > 0) s.rows.appendAssumeCapacity(rows[i]);
+             landed += 1;
++            s.forced_out -|= 1;
+             const ended_think = s.think_open and @as(i64, t) == s.think_end;
+             if (@as(i64, t) == s.think_end) {
+                 s.think_open = false;
+@@ -484,7 +487,7 @@ pub const Stream = struct {
+             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
+             const result_row = @import("hold.zig").resultRow(s); // its EOS (ChatML's <|im_end|>) closes the tool turn
+             if (!result_row and @import("runner_eos.zig").hold(s, t, stopped)) break;
+-            const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.budgetLeft() > 1;
++            const can_hold = !s.isEos(t) and s.force.items.len == 0 and s.forced_out == 0 and s.budgetLeft() > 1;
+             if (s.runner) |r| if (r.token(r.ptr, t, s.think_open, can_hold, ended_think) and can_hold) {
+                 if (try @import("hold.zig").settle(s, gpa, r)) continue;
+                 s.held = true;
+@@ -527,10 +530,7 @@ pub const Stream = struct {
+         return c.check(c.ptr, s.emitted());
+     }
+ 
+-    pub fn popForce(s: *Stream) ?u32 {
+-        if (s.force.items.len == 0) return null;
+-        return s.force.orderedRemove(0);
+-    }
++    pub const popForce = @import("hold.zig").popForce;
+ };
+ 
+ test {
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index a4452b3f3..bdde5c966 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -70,6 +70,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
+         const take = @min(width - 1, s.force.items.len);
+         const forced = try a.dupe(u32, s.force.items[0..take]);
+         s.force.replaceRangeAssumeCapacity(0, take, &.{});
++        s.forced_out += take;
+         p.kind = .forced;
+         p.forced = forced;
+         p.tokens = forced;

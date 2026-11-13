@@ -8,6 +8,28 @@ Every change to this recipe, newest first. Each release names the image it serve
 Patches `0010`-`0012` change the engine, so the image hash changes: setup builds the image locally until one is
 published for these patches (the v1.1 digest in `scripts/config.sh` does not apply).
 
+### Added
+- **Compute lanes, opt-in (`ENGINE=lanes`, README "Compute lanes").**
+  - What it does: the model can run a Python cell or an inline `<expr> =` while it thinks, and gets the exact result
+    back in its reasoning. The keys default to the thinking-only setting (`TF_RUNNER_SPANS=reasoning`).
+  - `scripts/lanes.sh` builds a lane image on top of the default image: `tensorfold-native` from the lane engine
+    (upstream TensorFold, `LANES_REPO` @ `LANES_REF`, plus the patches in `lanes/`: this recipe's patches ported into
+    TensorFold's Zig engine), plus the runner's frontend
+    and its pinned assets.
+  - `start.sh` passes `TF_RUNNER*` / `TF_COMPUTE_LANE*` to both ranks, and uses `--kv-cache` with this engine.
+  - Text only (`VISION=0`).
+  - Startup: the lane engine keeps its timed lane costs between starts (`start.sh` mounts a folder beside the lane
+    image's CUDA cache), so a start after the first one is not slower than `ENGINE=patches` (77.2 s against 92.6 s to
+    the first 200, README "Compute lanes"). The lane engine is built for the Spark's own CPU, as this recipe's is.
+  - `tool_choice` `"required"`, a named function and Anthropic `any` force a tool call with `ENGINE=lanes` too: patch
+    0007's call gate is ported into the lane engine (`capabilities.call_gates: true` in `/v1/models`).
+  - The lane engine is upstream TensorFold `f212eeabd` plus `lanes/` (76 patches; the same tree as `9c6c3d04c`):
+    that call gate, a thinking-budget fix, and a digit stop. On this model the stop keeps a big inline value from being extended by
+    thousands of invented digits. `TF_RUNNER_INLINE_MARK=1` (` @engine` after each owned value, now
+    the default) also stopped the model overriding a right value (README "Compute lanes", "Long inline values").
+  - The default (`ENGINE=patches`), its image and its hash are unchanged.
+  - By Jay Leaton ([jayleaton](https://github.com/jayleaton)), on MiaAI-Lab's engine and patches.
+
 ### Fixed
 - **A segfault in `endPass` under a full prompt cache, and a state rank 1 kept that rank 0 had freed**
   ([#9](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/9), `0010`): the store could evict a

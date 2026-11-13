@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:31:34 +0700
+Subject: [PATCH 49/79] lanes, flashnext_mia tools: stream loop tests and the
+ AOT cover stage in their own files
+
+Pure code motion under 600 lines: declarations moved whole, moved methods aliased in their struct, pub where another file now calls them.
+---
+ tools/zig/flashnext_mia/flashnext_aot.py      | 132 +----------------
+ .../zig/flashnext_mia/flashnext_aot_cover.py  | 137 ++++++++++++++++++
+ zig/src/core/lanes/stream.zig                 |  28 +---
+ zig/src/core/lanes/stream_loop_test.zig       |  32 ++++
+ 4 files changed, 172 insertions(+), 157 deletions(-)
+ create mode 100644 tools/zig/flashnext_mia/flashnext_aot_cover.py
+ create mode 100644 zig/src/core/lanes/stream_loop_test.zig
+
+diff --git a/tools/zig/flashnext_mia/flashnext_aot.py b/tools/zig/flashnext_mia/flashnext_aot.py
+index b87caf9c7..cb0f7e9d2 100644
+--- a/tools/zig/flashnext_mia/flashnext_aot.py
++++ b/tools/zig/flashnext_mia/flashnext_aot.py
+@@ -7,10 +7,11 @@ import argparse
+ import hashlib
+ import importlib
+ import json
+-import struct
+ import sys
+ from pathlib import Path
+ 
++from flashnext_aot_cover import _reorder, cover, zig_const
++
+ TARGET = ("cuda", 121, 32)
+ OPTION_KEYS = ("num_warps", "num_ctas", "num_stages", "warp_size", "maxnreg", "ptx_version", "ptx_options",
+                "ir_override", "enable_fp_fusion", "enable_reflect_ftz", "launch_cooperative_grid", "launch_pdl",
+@@ -131,16 +132,6 @@ def _int_form(k: dict, name: str, form: str) -> dict:
+     return _reorder(out)
+ 
+ 
+-def _reorder(k: dict) -> dict:
+-    """Signature, attrs and constexprs in parameter order, as the JIT builds them (the attrs' order is hashed)."""
+-
+-    p = k["params"]
+-    k["signature"] = {n: k["signature"][n] for n in p}
+-    k["attrs"] = {n: k["attrs"].get(n, []) for n in p}
+-    k["constexprs"] = {n: k["constexprs"][n] for n in sorted(k["constexprs"], key=lambda x: p.index(x.split(".")[0]))}
+-    return k
+-
+-
+ def _derived(k: dict, why: str) -> dict:
+     out = json.loads(json.dumps(k))
+     src = out.pop("hash", None) or out.get("tp1_hash") or out.get("expanded_from")
+@@ -322,113 +313,6 @@ def derive(spec: Path, out: Path) -> int:
+ 
+ 
+ 
+-# ------------------------------------------------------------------------------------------------------------ cover
+-
+-def _fixture_matches(k: dict, launch: dict) -> bool:
+-    """zig/src/cuda/aot.zig's ``matches`` on a W5 fixture launch (pointers taken as 16-byte aligned)."""
+-
+-    if k["name"] != launch["fn"]:
+-        return False
+-    zc = {n: zig_const(v) for n, v in k["constexprs"].items()}
+-    for n, v in launch["consts"].items():
+-        if not isinstance(v, dict) or not ({"int", "f32"} & set(v)):
+-            continue                                       # a None (or named) constexpr: Zig does not compare it
+-        got = zc.get(n)
+-        if got is None or any(got.get(t) != v.get(t) for t in ("int", "f32") if t in v):
+-            return False
+-    runtime = 0
+-    params = {n for n in k["params"] if k["signature"].get(n) != "constexpr"}
+-    for a in launch["args"]:
+-        n, ty = a["name"], a["type"]
+-        div = bool(k["attrs"].get(n))
+-        if ty.startswith("*"):
+-            if n not in params or k["signature"][n] != ty or not div:
+-                return False
+-        elif "int" in a:
+-            x = a["int"]
+-            if n not in params:
+-                if x != 1 or zc.get(n, {}).get("int") != 1:
+-                    return False
+-                continue
+-            if k["signature"][n] != ty or x == 1 or div != (x % 16 == 0):
+-                return False
+-        elif n not in params or k["signature"][n] != ty:
+-            return False
+-        runtime += 1
+-    return runtime == len(params)
+-
+-
+-def _from_fixture(t: dict, launch: dict, case: str) -> dict:
+-    """A spec entry for a fixture launch, on a template of the same kernel: its types, int forms, constexprs, warps."""
+-
+-    out = json.loads(json.dumps(t))
+-    for drop in ("hash", "cubin_sha256", "tp1_hash"):
+-        out.pop(drop, None)
+-    for a in launch["args"]:
+-        n = a["name"]
+-        if "int" in a and a["int"] == 1:
+-            out["signature"][n], out["constexprs"][n], out["attrs"][n] = "constexpr", {"int": 1}, []
+-            continue
+-        out["signature"][n] = a["type"]
+-        out["constexprs"].pop(n, None)
+-        if a["type"].startswith("*"):
+-            out["attrs"][n] = [["tt.divisibility", 16]]
+-        elif "int" in a:
+-            out["attrs"][n] = [["tt.divisibility", 16]] if a["int"] % 16 == 0 else []
+-    for n, v in launch["consts"].items():
+-        old = t["constexprs"].get(n, {})
+-        if not isinstance(v, dict) or not ({"int", "f32"} & set(v)):
+-            continue
+-        if "f32" in v:
+-            if old and zig_const(old).get("f32") == v["f32"]:
+-                continue                                  # the template's own value (its fp64 bits)
+-            x = struct.unpack("<f", struct.pack("<I", v["f32"]))[0]     # an fp32 value, as a Python float
+-            out["constexprs"][n] = {"float": x, "fp64_bits": "0x%016x" % struct.unpack("<Q", struct.pack("<d", x))[0]}
+-            continue
+-        out["constexprs"][n] = {"bool": bool(v["int"])} if "bool" in old else {"int": v["int"]}
+-    out["options"]["num_warps"] = launch["num_warps"]
+-    if launch.get("num_stages") is not None:
+-        out["options"]["num_stages"] = launch["num_stages"]
+-    out["tp"] = [2] if "/tp2" in case else [1] if "/tp1" in case else [1, 2]
+-    out["expanded_from"] = t.get("hash") or t.get("expanded_from")
+-    out["rule"] = f"W5 fixture {case}"
+-    return _reorder(out)
+-
+-
+-def cover(spec: Path, fixtures: Path, out: Path) -> int:
+-    """Every launch of W5's fixtures (zig/src/families/flashnext_mia/fixtures_cuda_triton.json) must find a variant."""
+-
+-    data = json.loads(spec.read_text())
+-    kernels = data["kernels"]
+-    cases = json.loads(fixtures.read_text())["cases"]
+-    cases = list(cases.items()) if isinstance(cases, dict) else cases
+-    added, missing = [], 0
+-    for case, launches in cases:
+-        for launch in launches:
+-            if any(_fixture_matches(k, launch) for k in kernels + added):
+-                continue
+-            missing += 1
+-            same = [k for k in kernels if k["name"] == launch["fn"]
+-                    and {a["name"] for a in launch["args"]} <= set(k["params"])]
+-            if not same:
+-                print(f"NO TEMPLATE {case} {launch['fn']}")
+-                continue
+-            # the template closest in constexprs
+-            best = max(same, key=lambda k: (sum(zig_const(k["constexprs"].get(n, {"none": True})) == v
+-                                                for n, v in launch["consts"].items() if isinstance(v, dict)),
+-                                            sum(k["signature"].get(a["name"]) == a["type"] for a in launch["args"])))
+-            new = _from_fixture(best, launch, case)
+-            if not _fixture_matches(new, launch):
+-                raise SystemExit(f"{case}: the synthesized entry does not match its launch")
+-            added.append(new)
+-            print(f"added {case} {launch['fn']}: " + ", ".join(f"{a['name']} {a['type']}" for a in launch["args"]
+-                                                              if a["type"] != best["signature"].get(a["name"])))
+-    data["kernels"] = kernels + added
+-    out.write_text(json.dumps(data, indent=1) + "\n")
+-    print(f"{sum(len(l) for _, l in cases)} fixture launches, {missing} without a variant, {len(added)} entries added "
+-          f"-> {out}")
+-    return 0
+-
+ # ------------------------------------------------------------------------------------------------------------ build
+ 
+ def value(v, tl, registry):
+@@ -500,18 +384,6 @@ def _compile_job(k: dict):
+         return f"{type(exc).__name__}: {str(exc)[:300]}"
+ 
+ 
+-def zig_const(v):
+-    if "bool" in v:
+-        return {"int": int(v["bool"])}
+-    if "int" in v:
+-        return {"int": v["int"]}
+-    if "fp64_bits" in v:
+-        return {"f32": struct.unpack("<I", struct.pack("<f", struct.unpack("<d", struct.pack("<Q", int(v["fp64_bits"], 16)))[0]))[0]}
+-    if "none" in v:
+-        return {"none": True}
+-    return {"str": json.dumps(v)}
+-
+-
+ def build(spec: Path, out: Path, tps: set[int], check: list[Path], jit: Path | None, only: str, jobs: int = 8) -> int:
+     data = json.loads(spec.read_text())
+     kernels = data["kernels"]
+diff --git a/tools/zig/flashnext_mia/flashnext_aot_cover.py b/tools/zig/flashnext_mia/flashnext_aot_cover.py
+new file mode 100644
+index 000000000..dcf07ed20
+--- /dev/null
++++ b/tools/zig/flashnext_mia/flashnext_aot_cover.py
+@@ -0,0 +1,137 @@
++"""flashnext_aot.py's cover stage: W5 fixture launches each get a spec variant; the spec helpers it shares."""
++
++from __future__ import annotations
++
++import json
++import struct
++from pathlib import Path
++
++
++def _reorder(k: dict) -> dict:
++    """Signature, attrs and constexprs in parameter order, as the JIT builds them (the attrs' order is hashed)."""
++
++    p = k["params"]
++    k["signature"] = {n: k["signature"][n] for n in p}
++    k["attrs"] = {n: k["attrs"].get(n, []) for n in p}
++    k["constexprs"] = {n: k["constexprs"][n] for n in sorted(k["constexprs"], key=lambda x: p.index(x.split(".")[0]))}
++    return k
++
++
++def zig_const(v):
++    if "bool" in v:
++        return {"int": int(v["bool"])}
++    if "int" in v:
++        return {"int": v["int"]}
++    if "fp64_bits" in v:
++        return {"f32": struct.unpack("<I", struct.pack("<f", struct.unpack("<d", struct.pack("<Q", int(v["fp64_bits"], 16)))[0]))[0]}
++    if "none" in v:
++        return {"none": True}
++    return {"str": json.dumps(v)}
++
++
++# ------------------------------------------------------------------------------------------------------------ cover
++
++def _fixture_matches(k: dict, launch: dict) -> bool:
++    """zig/src/cuda/aot.zig's ``matches`` on a W5 fixture launch (pointers taken as 16-byte aligned)."""
++
++    if k["name"] != launch["fn"]:
++        return False
++    zc = {n: zig_const(v) for n, v in k["constexprs"].items()}
++    for n, v in launch["consts"].items():
++        if not isinstance(v, dict) or not ({"int", "f32"} & set(v)):
++            continue                                       # a None (or named) constexpr: Zig does not compare it
++        got = zc.get(n)
++        if got is None or any(got.get(t) != v.get(t) for t in ("int", "f32") if t in v):
++            return False
++    runtime = 0
++    params = {n for n in k["params"] if k["signature"].get(n) != "constexpr"}
++    for a in launch["args"]:
++        n, ty = a["name"], a["type"]
++        div = bool(k["attrs"].get(n))
++        if ty.startswith("*"):
++            if n not in params or k["signature"][n] != ty or not div:
++                return False
++        elif "int" in a:
++            x = a["int"]
++            if n not in params:
++                if x != 1 or zc.get(n, {}).get("int") != 1:
++                    return False
++                continue
++            if k["signature"][n] != ty or x == 1 or div != (x % 16 == 0):
++                return False
++        elif n not in params or k["signature"][n] != ty:
++            return False
++        runtime += 1
++    return runtime == len(params)
++
++
++def _from_fixture(t: dict, launch: dict, case: str) -> dict:
++    """A spec entry for a fixture launch, on a template of the same kernel: its types, int forms, constexprs, warps."""
++
++    out = json.loads(json.dumps(t))
++    for drop in ("hash", "cubin_sha256", "tp1_hash"):
++        out.pop(drop, None)
++    for a in launch["args"]:
++        n = a["name"]
++        if "int" in a and a["int"] == 1:
++            out["signature"][n], out["constexprs"][n], out["attrs"][n] = "constexpr", {"int": 1}, []
++            continue
++        out["signature"][n] = a["type"]
++        out["constexprs"].pop(n, None)
++        if a["type"].startswith("*"):
++            out["attrs"][n] = [["tt.divisibility", 16]]
++        elif "int" in a:
++            out["attrs"][n] = [["tt.divisibility", 16]] if a["int"] % 16 == 0 else []
++    for n, v in launch["consts"].items():
++        old = t["constexprs"].get(n, {})
++        if not isinstance(v, dict) or not ({"int", "f32"} & set(v)):
++            continue
++        if "f32" in v:
++            if old and zig_const(old).get("f32") == v["f32"]:
++                continue                                  # the template's own value (its fp64 bits)
++            x = struct.unpack("<f", struct.pack("<I", v["f32"]))[0]     # an fp32 value, as a Python float
++            out["constexprs"][n] = {"float": x, "fp64_bits": "0x%016x" % struct.unpack("<Q", struct.pack("<d", x))[0]}
++            continue
++        out["constexprs"][n] = {"bool": bool(v["int"])} if "bool" in old else {"int": v["int"]}
++    out["options"]["num_warps"] = launch["num_warps"]
++    if launch.get("num_stages") is not None:
++        out["options"]["num_stages"] = launch["num_stages"]
++    out["tp"] = [2] if "/tp2" in case else [1] if "/tp1" in case else [1, 2]
++    out["expanded_from"] = t.get("hash") or t.get("expanded_from")
++    out["rule"] = f"W5 fixture {case}"
++    return _reorder(out)
++
++
++def cover(spec: Path, fixtures: Path, out: Path) -> int:
++    """Every launch of W5's fixtures (zig/src/families/flashnext_mia/fixtures_cuda_triton.json) must find a variant."""
++
++    data = json.loads(spec.read_text())
++    kernels = data["kernels"]
++    cases = json.loads(fixtures.read_text())["cases"]
++    cases = list(cases.items()) if isinstance(cases, dict) else cases
++    added, missing = [], 0
++    for case, launches in cases:
++        for launch in launches:
++            if any(_fixture_matches(k, launch) for k in kernels + added):
++                continue
++            missing += 1
++            same = [k for k in kernels if k["name"] == launch["fn"]
++                    and {a["name"] for a in launch["args"]} <= set(k["params"])]
++            if not same:
++                print(f"NO TEMPLATE {case} {launch['fn']}")
++                continue
++            # the template closest in constexprs
++            best = max(same, key=lambda k: (sum(zig_const(k["constexprs"].get(n, {"none": True})) == v
++                                                for n, v in launch["consts"].items() if isinstance(v, dict)),
++                                            sum(k["signature"].get(a["name"]) == a["type"] for a in launch["args"])))
++            new = _from_fixture(best, launch, case)
++            if not _fixture_matches(new, launch):
++                raise SystemExit(f"{case}: the synthesized entry does not match its launch")
++            added.append(new)
++            print(f"added {case} {launch['fn']}: " + ", ".join(f"{a['name']} {a['type']}" for a in launch["args"]
++                                                              if a["type"] != best["signature"].get(a["name"])))
++    data["kernels"] = kernels + added
++    out.write_text(json.dumps(data, indent=1) + "\n")
++    print(f"{sum(len(l) for _, l in cases)} fixture launches, {missing} without a variant, {len(added)} entries added "
++          f"-> {out}")
++    return 0
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index e3cb0f6ab..c5860d222 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -535,6 +535,7 @@ pub const Stream = struct {
+ 
+ test {
+     _ = @import("commit_storage_test.zig");
++    _ = @import("stream_loop_test.zig");
+ }
+ 
+ test "commit stops at eos and length" {
+@@ -557,33 +558,6 @@ test "a logprob stream lands a row with each token it lands, and refuses tokens
+     try std.testing.expectEqual(@as(u32, 9), s.rows.items[1].token);
+ }
+ 
+-test "loop guard stops at the cap even when no cycle fires" {
+-    const gpa = std.testing.allocator;
+-    var tokens: [20]u32 = undefined;
+-    for (&tokens, 0..) |*token, i| token.* = @intCast(100 + i);
+-    var guarded = try Stream.init(gpa, .{ .id = "guarded", .prompt = &.{1}, .max_new = 10, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
+-    defer guarded.deinit(gpa);
+-    try std.testing.expectEqual(@as(usize, 10), try guarded.commit(gpa, &tokens, &.{}));
+-    try std.testing.expect(guarded.finished and guarded.reason == .length);
+-}
+-
+-test "loop guard fires, closes thinking, and latches once" {
+-    const gpa = std.testing.allocator;
+-    var tokens: std.ArrayList(u32) = .empty;
+-    defer tokens.deinit(gpa);
+-    for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(1000 + i));
+-    for (0..257) |_| try tokens.append(gpa, 7);
+-    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 400, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
+-    defer s.deinit(gpa);
+-    try std.testing.expectEqual(@as(usize, 321), try s.commit(gpa, tokens.items, &.{}));
+-    try std.testing.expectEqual(@as(u32, 1), s.loop_period.?);
+-    try std.testing.expect(!s.finished and !s.think_open and s.force.items.len == 3);
+-    while (s.popForce()) |token| _ = try s.commit(gpa, &.{token}, &.{});
+-    try std.testing.expect(!s.finished and s.force.items.len == 0);
+-    _ = try s.commit(gpa, &.{8}, &.{});
+-    try std.testing.expect(!s.finished and s.loop_period.? == 1);
+-}
+-
+ test "answer_max limits the reply after the think block, not the reasoning" {
+     const gpa = std.testing.allocator;
+     var s = try Stream.init(gpa, .{ .id = "answer", .prompt = &.{1}, .max_new = 12, .think_end = 91, .answer_max = 2 });
+diff --git a/zig/src/core/lanes/stream_loop_test.zig b/zig/src/core/lanes/stream_loop_test.zig
+new file mode 100644
+index 000000000..5a2aa67b1
+--- /dev/null
++++ b/zig/src/core/lanes/stream_loop_test.zig
+@@ -0,0 +1,32 @@
++//! The stream's loop guard: its cap, its firing, the thinking close it forces and its latch.
++const std = @import("std");
++const stream = @import("stream.zig");
++const Stream = stream.Stream;
++const loop_warm_in = stream.loop_warm_in;
++
++test "loop guard stops at the cap even when no cycle fires" {
++    const gpa = std.testing.allocator;
++    var tokens: [20]u32 = undefined;
++    for (&tokens, 0..) |*token, i| token.* = @intCast(100 + i);
++    var guarded = try Stream.init(gpa, .{ .id = "guarded", .prompt = &.{1}, .max_new = 10, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
++    defer guarded.deinit(gpa);
++    try std.testing.expectEqual(@as(usize, 10), try guarded.commit(gpa, &tokens, &.{}));
++    try std.testing.expect(guarded.finished and guarded.reason == .length);
++}
++
++test "loop guard fires, closes thinking, and latches once" {
++    const gpa = std.testing.allocator;
++    var tokens: std.ArrayList(u32) = .empty;
++    defer tokens.deinit(gpa);
++    for (0..loop_warm_in) |i| try tokens.append(gpa, @intCast(1000 + i));
++    for (0..257) |_| try tokens.append(gpa, 7);
++    var s = try Stream.init(gpa, .{ .id = "loop", .prompt = &.{1}, .max_new = 400, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .loop_guard = true });
++    defer s.deinit(gpa);
++    try std.testing.expectEqual(@as(usize, 321), try s.commit(gpa, tokens.items, &.{}));
++    try std.testing.expectEqual(@as(u32, 1), s.loop_period.?);
++    try std.testing.expect(!s.finished and !s.think_open and s.force.items.len == 3);
++    while (s.popForce()) |token| _ = try s.commit(gpa, &.{token}, &.{});
++    try std.testing.expect(!s.finished and s.force.items.len == 0);
++    _ = try s.commit(gpa, &.{8}, &.{});
++    try std.testing.expect(!s.finished and s.loop_period.? == 1);
++}

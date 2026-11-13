@@ -1,0 +1,878 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 21:01:48 +0700
+Subject: [PATCH 76/79] runner: no drawn digit right after an owned inline
+ integer in reasoning, and a reasoning digit-run cap
+
+On Qwen3.8-Flash-Next TP2 the model kept extending owned inline values (7^64, 7^216, 7^220, 7^222) by
+1,600-29,700 invented digits: the runner splices ` <digits>` with nothing after it (TF_RUNNER_INLINE_MARK=0), so
+the next draw can continue the number. Every runaway seen (agent-client replies to a 7^222 mod 1000003 task, on
+the engine before this commit, with and without a thinking budget) began with the exact engine value; a reply then
+hit its 8192 budget cut or max_tokens (finish=length at 32768) before it answered.
+
+The TP2 backend has no masked draws, so the stop works as the call gate and the budget cut do: the runner's new
+RunnerHook.stop names a drawn token to replace where a round's tokens land (round_cut.apply, the MTP/windowed
+path) and a pipelined step reads a watched draw before feeding it. In reasoning only: the model's first token
+after an owned inline value ending in a digit may not start with a digit, and a digit run stops past
+TF_RUNNER_DIGIT_RUN_MAX (default 1024; 0 off); the stopped token becomes a newline. TF_RUNNER_DIGIT_STOP=0 turns
+the first off. Forced rows are never replaced; fence, REPL and trace results (newline tails) never arm it;
+thinking-off replies are unchanged. The newline token is looked up at the first arm or near the cap.
+
+runner.zig stays under 600 lines: its knob helpers moved to runner_knob.zig, its test list to runner_tests.zig.
+Tests (test-digit-stop-host): the rules on token text, the fake target's MTP and pipelined rounds and sessions,
+each beside a negative control; mutating either lanes call site fails the fake-target tests.
+---
+ CHANGELOG.md                            |   2 +
+ zig/build/lane_halt_host.zig            |   3 +
+ zig/src/core/lanes/engine.zig           |   2 +
+ zig/src/core/lanes/lanes.zig            |   2 +
+ zig/src/core/lanes/round_cut.zig        |   9 +-
+ zig/src/core/lanes/runner_hook.zig      |   5 +
+ zig/src/core/lanes/runner_stop.zig      | 125 +++++++++++
+ zig/src/core/lanes/runner_stop_test.zig | 271 ++++++++++++++++++++++++
+ zig/src/core/runner.zig                 |  59 +++---
+ zig/src/core/runner_digit_stop_test.zig | 143 +++++++++++++
+ zig/src/core/runner_knob.zig            |  16 ++
+ zig/src/core/runner_tests.zig           |  23 ++
+ 12 files changed, 626 insertions(+), 34 deletions(-)
+ create mode 100644 zig/src/core/lanes/runner_stop.zig
+ create mode 100644 zig/src/core/lanes/runner_stop_test.zig
+ create mode 100644 zig/src/core/runner_digit_stop_test.zig
+ create mode 100644 zig/src/core/runner_knob.zig
+ create mode 100644 zig/src/core/runner_tests.zig
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 629b975e5..a96f6ed74 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
+ 
+ ## Unreleased
+ 
++- In-model runner: in reasoning, the model's next token right after an owned inline integer may no longer start with a digit, and a reasoning digit run stops at 1,024 digits (`TF_RUNNER_DIGIT_STOP`, `TF_RUNNER_DIGIT_RUN_MAX`; on by default, 0 turns each off). The stopped token becomes a newline where it lands. On Qwen3.8-Flash-Next TP2 the model kept extending owned values such as 7^222 by 1,600-29,700 invented digits, so a reply ran into its thinking budget or `max_tokens` before it answered. Thinking-off replies, fence and REPL results are unchanged.
++
+ - Server: Responses grows each output item in one buffer, and Kimi chat advances its native stream parser through new tokens, so a long reply retains memory in proportion to its length while every reply and streamed event stays the same (#2642).
+ - Tests: `zig build bench-stream-scan` streams a 32k-token thinking reply (30,000 reasoning tokens, prose, then a Qwen XML, GLM, DSML or Kimi call) through the chat, Messages and Responses routes one or two tokens a chunk, and prints each chunk's request-thread time at 1k to 30k reply tokens, each whole-text step's time and the request arena; under `test-server-cpu` a 300-token reply checks that each route's streamed reasoning, prose and call arguments equal the reply's (#2642).
+ 
+diff --git a/zig/build/lane_halt_host.zig b/zig/build/lane_halt_host.zig
+index 1fe74e47c..521a1fe6f 100644
+--- a/zig/build/lane_halt_host.zig
++++ b/zig/build/lane_halt_host.zig
+@@ -21,6 +21,9 @@ pub fn steps(b: *std.Build) void {
+     b.step("test-settle-fire-host", "PREFIX_SYNC_GRAPH on the fake target: fires settled at their trigger never hold").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"settled fires:"} })).step);
+     b.step("test-forced-rows-host", "A held fire's forced result lands whole on the fake target: no hold inside it").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"forced rows:"} })).step);
+     b.step("test-budget-hold-host", "The thinking budget beside a held tool result on the fake target: the result lands whole, then the close").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"budget hold:"} })).step);
++    const digit_stop = b.step("test-digit-stop-host", "The runner's digit stop after owned inline values: its rules, the fake target's rounds, sessions");
++    digit_stop.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"runner digit stop"} })).step);
++    digit_stop.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner digit stop"} })).step);
+     b.step("test-runner-host", "The in-model runner: scanner, held results and delivery with a fake circuit backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner"} })).step);
+     // proof 2 on the real circuit (TF_RUNNER_CIRCUIT): optimized, since a debug evaluator takes minutes a run
+     const lanes_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index b850457f3..51fbae6a7 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -509,6 +509,7 @@ pub const Engine = struct {
+         var current: Feed = .{ .handle = s.inflight.? };
+         s.inflight = null;
+         if (try e.forcedNext(s)) |t| current = .{ .value = t };
++        try @import("runner_stop.zig").pipelined(e, s, &current); // the runner's digit stop reads a watched draw
+         var token: u32 = undefined;
+         if (mode == .drain) {
+             token = try e.readFeed(current); // the last queued step: no new one
+@@ -535,6 +536,7 @@ pub const Engine = struct {
+         var current: Feed = .{ .handle = s.inflight.? };
+         s.inflight = null;
+         if (try e.forcedNext(s)) |t| current = .{ .value = t };
++        try @import("runner_stop.zig").pipelined(e, s, &current); // the runner's digit stop reads a watched draw
+         const token = try e.readFeed(current);
+         s.rounds += 1;
+         const landed = try s.commit(e.gpa, &.{token}, &.{});
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index ef0708136..84c46c151 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -47,6 +47,7 @@ pub const recorder = @import("recorder.zig");
+ pub const logprob = @import("logprob.zig");
+ pub const grammar = @import("grammar.zig");
+ pub const call_gate = @import("call_gate.zig"); // tool_choice required or named without a grammar (patch 0007)
++pub const runner_stop = @import("runner_stop.zig"); // the runner's digit stop after owned values (reasoning only)
+ pub const grammar_time = @import("grammar_time.zig");
+ pub const grammar_fake = @import("grammar_fake.zig"); // a stand-in libtfgrammar for tests
+ 
+@@ -71,6 +72,7 @@ test {
+     _ = @import("hold_test.zig");
+     _ = @import("fire_replay_test.zig");
+     _ = @import("settle_fire_test.zig");
++    _ = @import("runner_stop.zig");
+     _ = @import("forced_rows_hold_test.zig");
+     _ = @import("budget_hold_test.zig");
+     _ = @import("round_trace_test.zig");
+diff --git a/zig/src/core/lanes/round_cut.zig b/zig/src/core/lanes/round_cut.zig
+index 270b97b79..5cab055ef 100644
+--- a/zig/src/core/lanes/round_cut.zig
++++ b/zig/src/core/lanes/round_cut.zig
+@@ -1,4 +1,4 @@
+-//! A round's committed tokens cut where the loop guard, the thinking budget or a tool_choice call gate takes over.
++//! A round's tokens cut where the loop guard, the thinking budget, the runner's digit stop or a call gate takes over.
+ const std = @import("std");
+ const sm = @import("stream.zig");
+ const call_gate = @import("call_gate.zig");
+@@ -10,6 +10,13 @@ pub fn apply(e: anytype, s: *Stream, committed: *std.ArrayList(u32), path: *[]u3
+     const budget_cut = s.thinkCut(committed.items);
+     const loop_cut = sm.loopCut(s, committed.items);
+     const never = std.math.maxInt(usize);
++    // the digit stop (reasoning rows only, never the gate's) wins ties with the loop guard and yields to the budget
++    if (@import("runner_stop.zig").cut(s, committed.items)) |hit| if (hit.at <= (loop_cut orelse never) and hit.at < (budget_cut orelse never)) {
++        path.* = path.*[0 .. hit.at + 1];
++        committed.shrinkRetainingCapacity(hit.at);
++        try committed.append(a, hit.token);
++        return hit.at;
++    };
+     // the gate wins ties with the loop guard and yields to the budget (patch 0007's order)
+     if (s.gate) |*g| if (try g.cut(a, committed.items)) |hit| if (hit.at <= (loop_cut orelse never) and hit.at < (budget_cut orelse never)) {
+         path.* = path.*[0 .. hit.at + 1];
+diff --git a/zig/src/core/lanes/runner_hook.zig b/zig/src/core/lanes/runner_hook.zig
+index 1ce40ec6e..0b166e1ae 100644
+--- a/zig/src/core/lanes/runner_hook.zig
++++ b/zig/src/core/lanes/runner_hook.zig
+@@ -1,7 +1,12 @@
+ //! The in-model runner's view of each committed token (core/runner.zig): true holds the stream for a result here.
++pub const Stop = @import("runner_stop.zig").Stop;
++
+ pub const RunnerHook = struct {
+     ptr: *anyopaque,
+     token: *const fn (ptr: *anyopaque, token: u32, think_open: bool, can_hold: bool, think_end: bool) bool,
+     settled: ?*const fn (ptr: *anyopaque) ?[]const u32 = null, // at a hold: a result forced next instead, or null
+     eos: ?*const fn (ptr: *anyopaque, think_open: bool, can_hold: bool) bool = null,
++    /// Reasoning tokens about to land (the first `forced` forced): the first the runner replaces (runner_stop.zig).
++    stop: ?*const fn (ptr: *anyopaque, tokens: []const u32, forced: usize) ?Stop = null,
++    watching: ?*const fn (ptr: *anyopaque) bool = null, // a pipelined draw is read first: `stop` may replace it
+ };
+diff --git a/zig/src/core/lanes/runner_stop.zig b/zig/src/core/lanes/runner_stop.zig
+new file mode 100644
+index 000000000..a9108e9cb
+--- /dev/null
++++ b/zig/src/core/lanes/runner_stop.zig
+@@ -0,0 +1,125 @@
++//! The runner's digit stop in reasoning: no drawn digit right after an owned inline integer, no digit run past a cap.
++const std = @import("std");
++const be = @import("backend.zig");
++const Stream = @import("stream.zig").Stream;
++const Allocator = std.mem.Allocator;
++
++/// A drawn token the runner replaces (an owned value is whole: a digit after it is a runaway): where, and its newline.
++pub const Stop = struct { at: usize, token: u32, why: Why };
++
++pub const Why = enum { after_value, run_cap };
++
++/// PREFIX_DIGIT_STOP and PREFIX_DIGIT_RUN_MAX (core/runner.zig parses them); run_max 0: no cap.
++pub const Limits = struct { after_value: bool = true, run_max: u32 = 1024 };
++
++/// One token's bytes, as the runner's tokenizer gives them.
++pub const Bytes = struct {
++    ctx: ?*anyopaque = null,
++    of: *const fn (ctx: ?*anyopaque, token: u32) []const u8,
++};
++
++fn digit(c: u8) bool {
++    return c >= '0' and c <= '9';
++}
++
++fn leading(b: []const u8) u32 {
++    var n: u32 = 0;
++    while (n < b.len and digit(b[n])) n += 1;
++    return n;
++}
++
++/// The digit run ending the text after `bytes` lands on a run of `run`.
++fn extend(run: u32, b: []const u8) u32 {
++    if (b.len == 0) return run;
++    var n: u32 = 0;
++    while (n < b.len and digit(b[b.len - 1 - n])) n += 1;
++    return if (n == b.len) run +| n else n;
++}
++
++/// A reply's stop state, moved on by each committed token (`landed`) and asked about a round's tokens (`stop`).
++pub const State = struct {
++    limits: Limits = .{},
++    newline: ?u32 = null, // the token put in a stopped token's place (null: the stop is off)
++    looked: bool = false, // `look` asked the tokenizer for it (once: one token or none)
++    lead: ?usize = null, // armed: owned tokens still to land; at 0 the next token is the model's first after the value
++    run: u32 = 0, // digits ending the reasoning's committed text
++
++    /// The newline token from `text` (its `encode`, as the runner's Text), asked once.
++    pub fn look(st: *State, gpa: Allocator, text: anytype) Allocator.Error!void {
++        if (st.looked) return;
++        st.looked = true;
++        const ids = try text.encode(text.ctx, gpa, "\n");
++        defer gpa.free(ids);
++        if (ids.len == 1) st.newline = ids[0];
++    }
++
++    /// Whether the run nears its cap with the newline not yet asked for (the runner then calls `look`).
++    pub fn wants(st: *const State) bool {
++        return !st.looked and st.limits.run_max > 0 and st.run +| 64 > st.limits.run_max;
++    }
++
++    /// An owned inline value is forced next: `count` tokens whose text is `value` (armed when it ends in a digit).
++    pub fn arm(st: *State, gpa: Allocator, text: anytype, count: usize, value: []const u8) Allocator.Error!void {
++        if (!st.limits.after_value or count == 0 or value.len == 0 or !digit(value[value.len - 1])) return;
++        try st.look(gpa, text);
++        if (st.newline != null) st.lead = count;
++    }
++
++    /// A committed token's bytes; outside reasoning there is no run and nothing stays armed.
++    pub fn landed(st: *State, bytes: []const u8, think_open: bool) void {
++        if (st.lead) |n| st.lead = if (n > 0 and think_open) n - 1 else null;
++        st.run = if (think_open) extend(st.run, bytes) else 0;
++    }
++
++    /// The first of `tokens` (reasoning only; the first `forced` are forced rows) the stop replaces, or null.
++    pub fn stop(st: *const State, bytes: Bytes, tokens: []const u32, forced: usize) ?Stop {
++        const nl = st.newline orelse return null;
++        var lead = st.lead;
++        var run = st.run;
++        for (tokens, 0..) |t, i| {
++            const b = bytes.of(bytes.ctx, t);
++            const owned = if (lead) |n| n > 0 else false;
++            if (!owned and i >= forced and b.len > 0 and digit(b[0])) {
++                if (lead != null) return .{ .at = i, .token = nl, .why = .after_value };
++                if (st.limits.run_max > 0 and run +| leading(b) > st.limits.run_max) return .{ .at = i, .token = nl, .why = .run_cap };
++            }
++            if (lead) |n| lead = if (n > 0) n - 1 else null;
++            run = extend(run, b);
++        }
++        return null;
++    }
++
++    /// Whether the next draw could be stopped: a pipelined stream reads it before feeding it.
++    pub fn watching(st: *const State) bool {
++        if (st.newline == null) return false;
++        return st.lead != null or (st.limits.run_max > 0 and st.run +| 16 > st.limits.run_max);
++    }
++};
++
++/// The stop's cut in a round's committed tokens: reasoning rows before its end, never while forced rows wait.
++pub fn cut(s: *Stream, tokens: []const u32) ?Stop {
++    const r = s.runner orelse return null;
++    const f = r.stop orelse return null;
++    if (!s.think_open or s.force.items.len > 0) return null;
++    var end = tokens.len;
++    for (tokens, 0..) |t, i| if (@as(i64, t) == s.think_end) {
++        end = i;
++        break;
++    };
++    return f(r.ptr, tokens[0..end], @min(s.forced_out, end));
++}
++
++/// A pipelined step's drawn token, read before it is fed while the runner watches; replaced when the stop says so.
++pub fn pipelined(e: anytype, s: *Stream, feed: *be.Feed) !void {
++    if (feed.* != .handle) return;
++    const r = s.runner orelse return;
++    const w = r.watching orelse return;
++    if (r.stop == null or !s.think_open or !w(r.ptr)) return;
++    const drawn = try e.readFeed(feed.*);
++    const hit = r.stop.?(r.ptr, &.{drawn}, 0);
++    feed.* = .{ .value = if (hit) |h| h.token else drawn };
++}
++
++test {
++    _ = @import("runner_stop_test.zig");
++}
+diff --git a/zig/src/core/lanes/runner_stop_test.zig b/zig/src/core/lanes/runner_stop_test.zig
+new file mode 100644
+index 000000000..9af37fca7
+--- /dev/null
++++ b/zig/src/core/lanes/runner_stop_test.zig
+@@ -0,0 +1,271 @@
++//! The runner's digit stop (runner_stop.zig) on token text and the fake target's rounds, beside negative controls.
++const std = @import("std");
++const stop = @import("runner_stop.zig");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const fake = @import("fake.zig");
++const hold = @import("hold.zig");
++const shared = @import("engine_test.zig");
++
++const gpa = std.testing.allocator;
++const nl: u32 = 96;
++
++/// Ids 0-9 are their digit, 10 " x", 11 "12" (a two-digit token), 12 "ab", 13 "7)"; `nl` is the newline.
++fn table(_: ?*anyopaque, t: u32) []const u8 {
++    const digits = "0123456789";
++    if (t < 10) return digits[t .. t + 1];
++    return switch (t) {
++        10 => " x",
++        11 => "12",
++        12 => "ab",
++        13 => "7)",
++        nl => "\n",
++        else => "?",
++    };
++}
++const text: stop.Bytes = .{ .of = table };
++
++fn state(limits: stop.Limits) stop.State {
++    return .{ .limits = limits, .newline = nl };
++}
++
++/// The runner's Text as `look` asks it: "\n" is `nl` (else one token per byte); `two` encodes "\n" as two tokens.
++fn encNl(_: ?*anyopaque, a: std.mem.Allocator, t: []const u8) std.mem.Allocator.Error![]u32 {
++    if (std.mem.eql(u8, t, "\n")) return try a.dupe(u32, &.{nl});
++    const out = try a.alloc(u32, t.len);
++    for (t, out) |c, *o| o.* = c;
++    return out;
++}
++fn encTwo(_: ?*anyopaque, a: std.mem.Allocator, _: []const u8) std.mem.Allocator.Error![]u32 {
++    return try a.dupe(u32, &.{ 1, 2 });
++}
++const Enc = struct { ctx: ?*anyopaque = null, encode: *const fn (?*anyopaque, std.mem.Allocator, []const u8) std.mem.Allocator.Error![]u32 };
++const enc: Enc = .{ .encode = encNl };
++const two: Enc = .{ .encode = encTwo };
++
++fn landAll(st: *stop.State, tokens: []const u32) void {
++    for (tokens) |t| st.landed(table(null, t), true);
++}
++
++test "runner digit stop: the model's digit right after an owned value is replaced, and not with the stop off" {
++    var st = state(.{});
++    try st.arm(gpa, enc, 3, "123");
++    const hit = st.stop(text, &.{ 1, 2, 3, 4, 5 }, 3).?;
++    try std.testing.expectEqual(@as(usize, 3), hit.at);
++    try std.testing.expectEqual(nl, hit.token);
++    try std.testing.expectEqual(stop.Why.after_value, hit.why);
++    // a multi-digit token after the value is a digit too
++    try std.testing.expectEqual(@as(usize, 3), st.stop(text, &.{ 1, 2, 3, 11 }, 3).?.at);
++    // negative control: the same rows with the stop off land as drawn
++    var off = state(.{ .after_value = false, .run_max = 0 });
++    try off.arm(gpa, enc, 3, "123");
++    try std.testing.expect(off.stop(text, &.{ 1, 2, 3, 4, 5 }, 3) == null);
++    try std.testing.expect(!off.watching());
++}
++
++test "runner digit stop: nothing is replaced without an owned value, after a non-digit, or in the value's own rows" {
++    var idle = state(.{});
++    try std.testing.expect(idle.stop(text, &.{ 1, 2, 3, 4 }, 0) == null);
++    try std.testing.expect(!idle.watching());
++    // the model's first token after the value is not a digit: disarmed, a later digit lands
++    var st = state(.{});
++    try st.arm(gpa, enc, 2, "45");
++    try std.testing.expect(st.watching());
++    try std.testing.expect(st.stop(text, &.{ 4, 5, 10, 7, 8 }, 2) == null);
++    landAll(&st, &.{ 4, 5, 10 });
++    try std.testing.expect(!st.watching());
++    try std.testing.expect(st.stop(text, &.{ 7, 8 }, 0) == null);
++    // the value's own (forced) rows are digits and never replaced, even past the forced count the stream gives
++    var own = state(.{});
++    try own.arm(gpa, enc, 3, "999");
++    try std.testing.expect(own.stop(text, &.{ 9, 9, 9 }, 0) == null);
++    // no newline token: the stop is off
++    var none: stop.State = .{};
++    try none.arm(gpa, two, 1, "1");
++    try std.testing.expect(none.looked and none.newline == null);
++    try std.testing.expect(none.stop(text, &.{ 1, 2 }, 1) == null);
++    try std.testing.expect(!none.watching());
++}
++
++test "runner digit stop: a value over several rounds is armed until its last row lands" {
++    var st = state(.{});
++    try st.arm(gpa, enc, 4, "1234");
++    try std.testing.expect(st.stop(text, &.{ 1, 2 }, 2) == null);
++    landAll(&st, &.{ 1, 2 });
++    const hit = st.stop(text, &.{ 3, 4, 5 }, 2).?;
++    try std.testing.expectEqual(@as(usize, 2), hit.at);
++    landAll(&st, &.{ 3, 4, nl });
++    try std.testing.expect(st.lead == null and st.run == 0);
++}
++
++test "runner digit stop: a value ending in a non-digit, or carrying the inline mark, does not arm" {
++    var st = state(.{});
++    try st.arm(gpa, enc, 2, "7)");
++    try std.testing.expect(st.lead == null);
++    try std.testing.expect(st.stop(text, &.{ 13, 4 }, 1) == null);
++    try st.arm(gpa, enc, 3, " @engine");
++    try std.testing.expect(st.lead == null);
++    // outside reasoning nothing stays armed
++    var closed = state(.{});
++    try closed.arm(gpa, enc, 1, "5");
++    closed.landed("5", false);
++    try std.testing.expect(closed.lead == null and closed.run == 0);
++}
++
++test "runner digit stop: a reasoning digit run stops at the cap, and runs on with no cap" {
++    var st = state(.{ .run_max = 8 });
++    landAll(&st, &.{ 1, 2, 3, 4, 5, 6 });
++    try std.testing.expectEqual(@as(u32, 6), st.run);
++    const hit = st.stop(text, &.{ 7, 8, 9 }, 0).?;
++    try std.testing.expectEqual(@as(usize, 2), hit.at);
++    try std.testing.expectEqual(stop.Why.run_cap, hit.why);
++    // a two-digit token past the cap
++    try std.testing.expectEqual(@as(usize, 1), st.stop(text, &.{ 7, 11 }, 0).?.at);
++    // forced rows are never cut, even over the cap
++    try std.testing.expect(st.stop(text, &.{ 7, 8, 9 }, 3) == null);
++    // a non-digit ends the run
++    landAll(&st, &.{12});
++    try std.testing.expectEqual(@as(u32, 0), st.run);
++    landAll(&st, &.{ 13, 1 });
++    try std.testing.expectEqual(@as(u32, 1), st.run);
++    // negative control: no cap, the same digits land
++    var off = state(.{ .run_max = 0 });
++    landAll(&off, &.{ 1, 2, 3, 4, 5, 6 });
++    try std.testing.expect(off.stop(text, &.{ 7, 8, 9 }, 0) == null);
++}
++
++test "runner digit stop: the newline is asked for only near the cap or at an arm, once" {
++    var st: stop.State = .{ .limits = .{ .run_max = 1024 } };
++    landAll(&st, &.{ 1, 2, 3 });
++    try std.testing.expect(!st.wants());
++    try std.testing.expect(st.stop(text, &.{4}, 0) == null); // no newline yet: the stop is off
++    var near: stop.State = .{ .limits = .{ .run_max = 100 } };
++    for (0..40) |_| near.landed("7", true);
++    try std.testing.expect(near.wants());
++    try near.look(gpa, enc);
++    try std.testing.expect(!near.wants() and near.newline.? == nl);
++    for (0..60) |_| near.landed("7", true);
++    try std.testing.expectEqual(stop.Why.run_cap, near.stop(text, &.{7}, 0).?.why);
++}
++
++// --- the fake target's rounds: every draw reads as the digit 7, so a fired value is followed by a runaway
++
++fn sevens(_: ?*anyopaque, t: u32) []const u8 {
++    return if (t == nl) "\n" else "7";
++}
++
++const fire_at: usize = 20;
++const value = [_]u32{ 7, 8, 9 }; // the owned value's rows ("777" here)
++
++/// A runner that fires once at `fire_at` (held, then resumed with `value`) and keeps the digit stop's state.
++const Hook = struct {
++    st: stop.State,
++    seen: usize = 0,
++    fired: bool = false,
++    fires: bool = true,
++
++    fn token(ptr: *anyopaque, t: u32, think_open: bool, can_hold: bool, _: bool) bool {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        h.st.landed(sevens(null, t), think_open);
++        defer h.seen += 1;
++        if (!h.fires or h.fired or h.seen != fire_at or !can_hold) return false;
++        h.fired = true;
++        return true;
++    }
++
++    fn onStop(ptr: *anyopaque, tokens: []const u32, forced: usize) ?stop.Stop {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        return h.st.stop(.{ .of = sevens }, tokens, forced);
++    }
++
++    fn onWatching(ptr: *anyopaque) bool {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        return h.st.watching();
++    }
++};
++
++const Run = struct { mtp: bool = true, drafts: bool = true, limits: stop.Limits = .{}, think_open: bool = true, stop_fn: bool = true, fires: bool = true };
++
++/// The emitted tokens and the index of the value's first row (null: it never fired).
++fn run(spec: Run) !struct { tokens: []u32, value_at: ?usize } {
++    var cfg = try shared.modelWith(spec.mtp);
++    defer cfg.deinit(gpa);
++    cfg.forced_drafts = true;
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    var hook: Hook = .{ .st = .{ .limits = spec.limits, .newline = nl }, .fires = spec.fires };
++    const r: sm.RunnerHook = .{ .ptr = &hook, .token = Hook.token, .stop = if (spec.stop_fn) Hook.onStop else null, .watching = if (spec.stop_fn) Hook.onWatching else null };
++    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &shared.p1, .max_new = 90, .drafts = spec.drafts, .think_end = 1000, .think_open = spec.think_open, .runner = r });
++    defer s.deinit(gpa);
++    try engine.addStream(&s);
++    var value_at: ?usize = null;
++    var rounds: usize = 0;
++    while (!s.finished and rounds < 600) : (rounds += 1) {
++        if (s.awaiting) {
++            value_at = s.emitted().len;
++            try hook.st.arm(gpa, enc, value.len, "777");
++            try std.testing.expect(try hold.resumeAwaiting(&s, gpa, &value));
++        }
++        try engine.step();
++    }
++    try std.testing.expect(s.finished);
++    return .{ .tokens = try gpa.dupe(u32, s.emitted()), .value_at = value_at };
++}
++
++fn longestRun(tokens: []const u32) usize {
++    var best: usize = 0;
++    var cur: usize = 0;
++    for (tokens) |t| {
++        cur = if (t == nl) 0 else cur + 1;
++        best = @max(best, cur);
++    }
++    return best;
++}
++
++test "runner digit stop on the fake target: the draw after an owned value is a newline, MTP and pipelined rounds" {
++    for ([_]bool{ true, false }) |mtp| for ([_]bool{ true, false }) |drafts| {
++        const on = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .run_max = 0 } });
++        defer gpa.free(on.tokens);
++        const off = try run(.{ .mtp = mtp, .drafts = drafts, .limits = .{ .after_value = false, .run_max = 0 } });
++        defer gpa.free(off.tokens);
++        const at = on.value_at.?;
++        try std.testing.expectEqual(at, off.value_at.?);
++        try std.testing.expectEqualSlices(u32, &value, on.tokens[at .. at + value.len]);
++        try std.testing.expectEqualSlices(u32, &value, off.tokens[at .. at + value.len]);
++        // negative control: with the stop off the model's own (digit) draw follows the value
++        try std.testing.expect(off.tokens[at + value.len] != nl);
++        try std.testing.expectEqual(nl, on.tokens[at + value.len]);
++        // everything before the value is untouched
++        try std.testing.expectEqualSlices(u32, off.tokens[0 .. at + value.len], on.tokens[0 .. at + value.len]);
++        // and only that one draw is replaced: no other newline the stop put in
++        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, on.tokens, &.{nl}) - std.mem.count(u32, off.tokens, &.{nl}));
++    };
++}
++
++test "runner digit stop on the fake target: the run cap cuts every long reasoning digit run, none with no cap" {
++    for ([_]bool{ true, false }) |mtp| {
++        const on = try run(.{ .mtp = mtp, .fires = false, .limits = .{ .after_value = false, .run_max = 12 } });
++        defer gpa.free(on.tokens);
++        const off = try run(.{ .mtp = mtp, .fires = false, .limits = .{ .after_value = false, .run_max = 0 } });
++        defer gpa.free(off.tokens);
++        try std.testing.expect(longestRun(on.tokens) <= 12);
++        try std.testing.expect(longestRun(off.tokens) > 12); // negative control
++    }
++}
++
++test "runner digit stop on the fake target: outside reasoning the reply is the same tokens as with no stop at all" {
++    for ([_]bool{ true, false }) |mtp| {
++        const closed = try run(.{ .mtp = mtp, .think_open = false, .limits = .{ .run_max = 4 } });
++        defer gpa.free(closed.tokens);
++        const bare = try run(.{ .mtp = mtp, .think_open = false, .stop_fn = false });
++        defer gpa.free(bare.tokens);
++        try std.testing.expectEqualSlices(u32, bare.tokens, closed.tokens);
++        // negative control: the same limits in reasoning do cut
++        const open = try run(.{ .mtp = mtp, .think_open = true, .limits = .{ .run_max = 4 } });
++        defer gpa.free(open.tokens);
++        try std.testing.expect(!std.mem.eql(u32, bare.tokens, open.tokens));
++    }
++}
+diff --git a/zig/src/core/runner.zig b/zig/src/core/runner.zig
+index 6c8d63aaa..2abcd4b08 100644
+--- a/zig/src/core/runner.zig
++++ b/zig/src/core/runner.zig
+@@ -29,6 +29,7 @@ pub const Config = struct {
+     guide_max_bytes: usize = 512, // PREFIX_GUIDE_MAX_BYTES: request guide cap, opt-in up to 2048 bytes
+     compile: bool = true, // false: the frontend never builds an ELF (no clang); calc and graph programs only (S3)
+     inline_mark: bool = false, // PREFIX_INLINE_MARK: tag owned inline values; off preserves their bytes
++    digit_stop: lanes.runner_stop.Limits = .{}, // PREFIX_DIGIT_STOP / _DIGIT_RUN_MAX: no runaway after a value
+     sync_graph: bool = false, // PREFIX_SYNC_GRAPH: a graph result settles at its trigger token, in that round (no hold)
+     cells: bool = true, // PREFIX_CELLS: the receipt records each owned cell's span, route and landed value (runner_receipt.zig)
+     abstains: bool = false, // PREFIX_ABSTAINS: with cells, each abstained cell's source, reason and stage (runner_abstain.zig)
+@@ -59,6 +60,8 @@ pub const Config = struct {
+         c.exact = try knob(u1, get, prefix ++ "_EXACT", 0, 0, 1) == 1;
+         c.settle_us = try knob(u32, get, prefix ++ "_SETTLE_US", c.settle_us, 0, 100_000);
+         c.inline_mark = try knob(u1, get, prefix ++ "_INLINE_MARK", 0, 0, 1) == 1;
++        c.digit_stop.after_value = try knob(u1, get, prefix ++ "_DIGIT_STOP", 1, 0, 1) == 1;
++        c.digit_stop.run_max = try knob(u32, get, prefix ++ "_DIGIT_RUN_MAX", c.digit_stop.run_max, 0, 1 << 20);
+         c.sync_graph = try knob(u1, get, prefix ++ "_SYNC_GRAPH", 0, 0, 1) == 1;
+         if (c.sync_graph and c.backend != .graph) return bad(prefix ++ "_SYNC_GRAPH", "1 (backend is not graph)");
+         c.cells = try knob(u1, get, prefix ++ "_CELLS", 1, 0, 1) == 1;
+@@ -93,18 +96,8 @@ pub const Config = struct {
+         return c;
+     }
+ 
+-    fn knob(comptime T: type, get: *const fn ([]const u8) ?[]const u8, comptime name: []const u8, default: T, min: T, max: T) error{BadKnob}!T {
+-        const text = get(name) orelse return default;
+-        if (text.len == 0) return default;
+-        const v = std.fmt.parseInt(T, text, 10) catch return bad(name, text);
+-        if (v < min or v > max) return bad(name, text);
+-        return v;
+-    }
+-
+-    fn bad(name: []const u8, value: []const u8) error{BadKnob} {
+-        log.warn("{s}={s} is not a valid value", .{ name, value });
+-        return error.BadKnob;
+-    }
++    const knob = @import("runner_knob.zig").knob;
++    const bad = @import("runner_knob.zig").bad;
+ };
+ 
+ /// The engine's tokenizer as the runner needs it: one token's bytes, and text to token ids.
+@@ -133,7 +126,7 @@ pub const Runner = struct {
+         var cfg = r.cfg.scan;
+         if (ask.off) cfg.trace = false;
+         cfg.trace_repeat = ask.repeat;
+-        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .check = ask.check, .rec = .{ .on = r.cfg.cells, .abstains_on = r.cfg.abstains } };
++        s.* = .{ .r = r, .id = r.next_id, .scan = .{ .cfg = cfg }, .format = format, .check = ask.check, .rec = .{ .on = r.cfg.cells, .abstains_on = r.cfg.abstains }, .digits = .{ .limits = r.cfg.digit_stop } };
+         r.next_id += 1;
+         return s;
+     }
+@@ -177,9 +170,24 @@ pub const Session = struct {
+     check: bool = false, // TraceAsk.check
+     rec: records.Log = .{}, // the receipt's per-cell records
+     commit: answer.State = .{}, // PREFIX_COMMIT: the request's ask (lane_stream), the think state, whether it fired
++    digits: lanes.runner_stop.State = .{}, // the digit stop after owned inline values, in reasoning (lanes/runner_stop.zig)
+ 
+     pub fn hook(s: *Session) lanes.stream.RunnerHook {
+-        return .{ .ptr = s, .token = onToken, .settled = if (s.r.cfg.sync_graph) settled else null, .eos = onEos };
++        return .{ .ptr = s, .token = onToken, .settled = if (s.r.cfg.sync_graph) settled else null, .eos = onEos, .stop = onStop, .watching = onWatching };
++    }
++
++    fn onStop(ptr: *anyopaque, tokens: []const u32, forced: usize) ?lanes.runner_stop.Stop {
++        const s: *Session = @ptrCast(@alignCast(ptr));
++        if (s.broken) return null;
++        const tx = s.r.text.?;
++        const hit = s.digits.stop(.{ .ctx = tx.ctx, .of = tx.bytes }, tokens, forced) orelse return null;
++        log.info("reply {d}: digit stop ({t}): a drawn token replaced by a newline", .{ s.id, hit.why });
++        return hit;
++    }
++
++    fn onWatching(ptr: *anyopaque) bool {
++        const s: *Session = @ptrCast(@alignCast(ptr));
++        return !s.broken and s.digits.watching();
+     }
+ 
+     /// The tokens a trigger's run settled with at the token itself (once; null: hold for them as before).
+@@ -234,6 +242,8 @@ pub const Session = struct {
+             s.sync_ids = &.{};
+         }
+         const bytes = if (think_end) "" else tx.bytes(tx.ctx, token);
++        s.digits.landed(bytes, think_open);
++        if (s.digits.wants()) try s.digits.look(s.r.gpa, tx);
+         try s.rec.token(s.r.gpa, token, bytes, think_open);
+         if (answer.skip(&s.commit, think_open)) return false;
+         const scanning = if (s.forcing) |*r| output.scanning(&r.inline_bytes_left, bytes) else bytes;
+@@ -377,6 +387,7 @@ pub const Session = struct {
+             return ids;
+         }
+         s.owned_n += 1;
++        if (w.inline_space != null) try s.digits.arm(s.r.gpa, s.r.text.?, ids.len, if (s.r.cfg.inline_mark) output.suffix else output.value(res.out));
+         c.told = .owned;
+         c.owned_tokens = @intCast(ids.len);
+         s.rec.owned(s.r.gpa, w.index, ids) catch {
+@@ -577,23 +588,5 @@ const Translate = struct {
+ };
+ 
+ test {
+-    _ = @import("runner_scan.zig");
+-    _ = @import("runner_api.zig");
+-    _ = @import("runner_trace_test.zig");
+-    _ = @import("runner_settle_test.zig");
+-    _ = @import("runner_sync_test.zig");
+-    _ = @import("runner_probe.zig");
+-    _ = @import("runner_graph_table_test.zig");
+-    _ = @import("runner_inline_mod_test.zig");
+-    _ = @import("runner_inline_arith_test.zig");
+-    _ = @import("runner_inline_chain_test.zig");
+-    _ = @import("runner_receipt_test.zig");
+-    _ = @import("runner_inline_context_test.zig");
+-    _ = @import("runner_inline_hex_test.zig");
+-    _ = @import("runner_trace_stated_test.zig");
+-    _ = @import("runner_trace_divmod_test.zig");
+-    _ = @import("runner_trace_named_test.zig");
+-    _ = @import("runner_trace_check_test.zig");
+-    _ = @import("runner_graph_edit.zig");
+-    _ = @import("runner_commit.zig");
++    _ = @import("runner_tests.zig");
+ }
+diff --git a/zig/src/core/runner_digit_stop_test.zig b/zig/src/core/runner_digit_stop_test.zig
+new file mode 100644
+index 000000000..14804b31b
+--- /dev/null
++++ b/zig/src/core/runner_digit_stop_test.zig
+@@ -0,0 +1,143 @@
++//! The digit stop on reply sessions: owned inline values arm it in reasoning; REPL, fences, off or no reasoning do not.
++const std = @import("std");
++const rapi = @import("runner_api.zig");
++const runner = @import("runner.zig");
++
++const gpa = std.testing.allocator;
++
++fn bytes(_: ?*anyopaque, token: u32) []const u8 {
++    const all = comptime blk: {
++        var t: [128]u8 = undefined;
++        for (&t, 0..) |*c, i| c.* = i;
++        break :blk t;
++    };
++    return if (token < 128) all[token..][0..1] else "";
++}
++
++fn encode(_: ?*anyopaque, a: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u32 {
++    const out = try a.alloc(u32, text.len);
++    for (text, out) |c, *t| t.* = c;
++    return out;
++}
++
++fn translate(_: ?*anyopaque, a: std.mem.Allocator, cell: rapi.Cell) std.mem.Allocator.Error!rapi.Translation {
++    return .{ .program = .{ .kind = .graph, .bytes = try a.dupe(u8, std.mem.trim(u8, cell.code, " \n")) } };
++}
++
++/// Every run ends at once: 47*83, 7*6 (REPL) and print(7*6) (a fence) by their values, anything else a fault.
++const Back = struct {
++    jobs: std.ArrayList([]u8) = .empty,
++
++    fn answer(prog: []const u8) rapi.Result {
++        const answers = [_][2][]const u8{ .{ "47*83", "3901\n" }, .{ "7*6", "42\n" }, .{ "print(7*6)", "42\n" } };
++        for (answers) |x| if (std.mem.eql(u8, x[0], prog)) return .{ .status = .ok, .out = x[1], .steps = 10 };
++        return .{ .status = .fault };
++    }
++    fn backend(b: *Back) rapi.Backend {
++        return .{ .ctx = b, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release } };
++    }
++    fn start(ctx: *anyopaque, _: u64, p: rapi.Program, _: u64) error{ OutOfMemory, Busy }!rapi.JobId {
++        const b: *Back = @ptrCast(@alignCast(ctx));
++        try b.jobs.append(gpa, try gpa.dupe(u8, p.bytes));
++        return b.jobs.items.len - 1;
++    }
++    fn poll(ctx: *anyopaque, job: rapi.JobId) rapi.Poll {
++        const b: *Back = @ptrCast(@alignCast(ctx));
++        return .{ .done = answer(b.jobs.items[job]) };
++    }
++    fn cancel(_: *anyopaque, _: rapi.JobId) void {}
++    fn release(_: *anyopaque, _: u64) void {}
++    fn deinit(b: *Back) void {
++        for (b.jobs.items) |j| gpa.free(j);
++        b.jobs.deinit(gpa);
++    }
++};
++
++const Case = struct { lead: []const u8, think_open: bool = true, after_value: bool = true };
++
++/// After the lead's hold and its owned tokens: whether the stop replaces a drawn "5", a drawn " ", and the owned text.
++const Seen = struct { digit: bool, space: bool, armed: bool, owned: []u8 };
++
++fn run(case: Case) !Seen {
++    var back: Back = .{};
++    defer back.deinit();
++    var r: runner.Runner = .{ .gpa = gpa, .cfg = .{}, .frontend = .{ .translate = translate }, .backend = back.backend(), .text = .{ .bytes = bytes, .encode = encode } };
++    r.cfg.scan.inline_math = true;
++    r.cfg.digit_stop.after_value = case.after_value;
++    const s = (try r.session(.{})).?;
++    defer s.destroy();
++    const hook = s.hook();
++    var held = false;
++    for (case.lead) |ch| if (hook.token(hook.ptr, ch, case.think_open, true, false)) {
++        held = true;
++        break;
++    };
++    try std.testing.expect(held);
++    const cell = s.cells.items[s.waiting.?.index];
++    while (!cell.translated.load(.acquire)) std.Thread.yield() catch {};
++    const ids = for (0..64) |_| {
++        if (try s.tick()) |x| break x;
++    } else return error.NeverSettled;
++    defer gpa.free(ids);
++    const armed = s.digits.lead != null;
++    // the owned tokens land as forced rows; the stop is asked about the model's next draw
++    for (ids) |t| _ = hook.token(hook.ptr, t, case.think_open, false, false);
++    var owned: std.ArrayList(u8) = .empty;
++    for (ids) |t| try owned.appendSlice(gpa, bytes(null, t));
++    return .{
++        .digit = hook.stop.?(hook.ptr, &.{'5'}, 0) != null,
++        .space = hook.stop.?(hook.ptr, &.{' '}, 0) != null,
++        .armed = armed,
++        .owned = try owned.toOwnedSlice(gpa),
++    };
++}
++
++test "runner digit stop: an owned inline integer in reasoning stops the next digit, and not with the stop off" {
++    const on = try run(.{ .lead = "So 47*83 =" });
++    defer gpa.free(on.owned);
++    try std.testing.expectEqualStrings(" 3901", on.owned);
++    try std.testing.expect(on.armed and on.digit and !on.space);
++    const off = try run(.{ .lead = "So 47*83 =", .after_value = false });
++    defer gpa.free(off.owned);
++    try std.testing.expectEqualStrings(on.owned, off.owned); // the owned value itself is unchanged
++    try std.testing.expect(!off.armed and !off.digit); // negative control
++}
++
++test "runner digit stop: REPL and fence results end in their newline tail and do not arm" {
++    for ([_][]const u8{ ">>> 7*6\n", "```python\nprint(7*6)\n```\nResult:\n" }) |lead| {
++        const seen = try run(.{ .lead = lead });
++        defer gpa.free(seen.owned);
++        try std.testing.expect(std.mem.indexOf(u8, seen.owned, "42") != null);
++        try std.testing.expect(std.mem.endsWith(u8, seen.owned, "\n"));
++        try std.testing.expect(!seen.armed and !seen.digit);
++    }
++}
++
++test "runner digit stop: outside reasoning an owned value leaves nothing armed" {
++    const seen = try run(.{ .lead = "So 47*83 =", .think_open = false });
++    defer gpa.free(seen.owned);
++    try std.testing.expectEqualStrings(" 3901", seen.owned);
++    try std.testing.expect(!seen.digit and !seen.space);
++}
++
++test "runner digit stop: TF_R_DIGIT_STOP and TF_R_DIGIT_RUN_MAX parse, on with a 1024-digit cap unless set" {
++    const K = struct {
++        var set: []const [2][]const u8 = &.{};
++        fn get(name: []const u8) ?[]const u8 {
++            for (set) |k| if (std.mem.eql(u8, k[0], name)) return k[1];
++            return null;
++        }
++    };
++    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" } };
++    const d = (try runner.Config.parse(&K.get, "TF_R")).?;
++    try std.testing.expect(d.digit_stop.after_value and d.digit_stop.run_max == 1024);
++    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_DIGIT_STOP", "0" }, .{ "TF_R_DIGIT_RUN_MAX", "0" } };
++    const off = (try runner.Config.parse(&K.get, "TF_R")).?;
++    try std.testing.expect(!off.digit_stop.after_value and off.digit_stop.run_max == 0);
++    for ([_][]const u8{ "2", "x" }) |v| {
++        K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_DIGIT_STOP", v } };
++        try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
++    }
++    K.set = &.{ .{ "TF_R", "1" }, .{ "TF_R_CIRCUIT", "/c.bin" }, .{ "TF_R_DIGIT_RUN_MAX", "-1" } };
++    try std.testing.expectError(error.BadKnob, runner.Config.parse(&K.get, "TF_R"));
++}
+diff --git a/zig/src/core/runner_knob.zig b/zig/src/core/runner_knob.zig
+new file mode 100644
+index 000000000..2a4700722
+--- /dev/null
++++ b/zig/src/core/runner_knob.zig
+@@ -0,0 +1,16 @@
++//! The in-model runner's knob parsing (core/runner.zig's Config): a number in range, or a warning and error.BadKnob.
++const std = @import("std");
++const log = std.log.scoped(.runner);
++
++pub fn knob(comptime T: type, get: *const fn ([]const u8) ?[]const u8, comptime name: []const u8, default: T, min: T, max: T) error{BadKnob}!T {
++    const text = get(name) orelse return default;
++    if (text.len == 0) return default;
++    const v = std.fmt.parseInt(T, text, 10) catch return bad(name, text);
++    if (v < min or v > max) return bad(name, text);
++    return v;
++}
++
++pub fn bad(name: []const u8, value: []const u8) error{BadKnob} {
++    log.warn("{s}={s} is not a valid value", .{ name, value });
++    return error.BadKnob;
++}
+diff --git a/zig/src/core/runner_tests.zig b/zig/src/core/runner_tests.zig
+new file mode 100644
+index 000000000..4444ffa1a
+--- /dev/null
++++ b/zig/src/core/runner_tests.zig
+@@ -0,0 +1,23 @@
++//! The in-model runner's test files (core/runner.zig refers to this one).
++test {
++    _ = @import("runner_scan.zig");
++    _ = @import("runner_api.zig");
++    _ = @import("runner_trace_test.zig");
++    _ = @import("runner_settle_test.zig");
++    _ = @import("runner_sync_test.zig");
++    _ = @import("runner_probe.zig");
++    _ = @import("runner_graph_table_test.zig");
++    _ = @import("runner_inline_mod_test.zig");
++    _ = @import("runner_inline_arith_test.zig");
++    _ = @import("runner_inline_chain_test.zig");
++    _ = @import("runner_receipt_test.zig");
++    _ = @import("runner_inline_context_test.zig");
++    _ = @import("runner_inline_hex_test.zig");
++    _ = @import("runner_trace_stated_test.zig");
++    _ = @import("runner_trace_divmod_test.zig");
++    _ = @import("runner_trace_named_test.zig");
++    _ = @import("runner_trace_check_test.zig");
++    _ = @import("runner_graph_edit.zig");
++    _ = @import("runner_commit.zig");
++    _ = @import("runner_digit_stop_test.zig");
++}

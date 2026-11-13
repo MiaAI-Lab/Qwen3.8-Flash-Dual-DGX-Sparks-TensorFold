@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 19:38:11 +0700
+Subject: [PATCH 54/79] core lanes: opt-in pooled shared budgets, as db281878's
+ Rule.budgets allocated them
+
+Model.pooled_budgets (off by default): a shared round's head budgets come from allocate over
+the stream chains with the measured overhead (head steps inside it) and max(streams,
+batch_rows) rows, and no rotating probe row: db281878's depth.zig Rule.budgets. Off, f212's
+rule prices the head's steps by the deepest chain (allocateDrafts with HeadCost, fixedMs) and
+adds probeShared's row, which asks fewer drafts a stream as streams grow.
+
+pooled_budgets_test: 4 and 16 fresh streams get db281878's numbers (3 and 2 each) pooled, and
+f212's (2 and 1) unpooled, at a 6 ms head step.
+---
+ zig/src/core/lanes/config.zig              |  3 ++
+ zig/src/core/lanes/depth.zig               |  7 +++-
+ zig/src/core/lanes/engine.zig              |  1 +
+ zig/src/core/lanes/lanes.zig               |  1 +
+ zig/src/core/lanes/pooled_budgets_test.zig | 47 ++++++++++++++++++++++
+ 5 files changed, 57 insertions(+), 2 deletions(-)
+ create mode 100644 zig/src/core/lanes/pooled_budgets_test.zig
+
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 12b115fc3..7b0e6acaa 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -48,6 +48,7 @@ pub const Model = struct {
+     join_batch: bool = false, // opt-in: joiners' first drafts wait for the next round, in one batch (lanes/join_batch.zig)
+     burst_split: bool = false, // opt-in: a burst's resumed or marked prompts prefill alone, the rest still together
+     burst_short: u32 = 0, // with burst_split: a prompt shorter than this drops its resume and marks to join a burst
++    pooled_budgets: bool = false, // opt-in: shared budgets price head steps inside the measured overhead, no probe row
+     copy_first: bool = false, // a copy ahead takes the round: the head holds no drafts for it (a drafter's own pass)
+     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass, timed at load
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+@@ -93,6 +94,7 @@ pub const Config = struct {
+     join_batch: bool = false, // Model.join_batch
+     burst_split: bool = false, // Model.burst_split (the lane host's burst admission reads it)
+     burst_short: u32 = 0, // Model.burst_short
++    pooled_budgets: bool = false, // Model.pooled_budgets
+     /// a prompt in pieces leaves its last token as the pending row of its first shared round's window
+     join_tail: bool = false,
+     /// a round's pieces of several streams in one backend call (Backend.pieces), which may run them as one forward
+@@ -182,6 +184,7 @@ pub const Config = struct {
+             .join_batch = m.join_batch,
+             .burst_split = m.burst_split,
+             .burst_short = m.burst_short,
++            .pooled_budgets = m.pooled_budgets,
+             .join_tail = m.join_tail,
+             .piece_runs = m.piece_runs,
+             .join_drafts = m.join_drafts,
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 7c3ebaef6..3382280c5 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -74,6 +74,7 @@ pub const Rule = struct {
+     head_stops: bool = false, // opt-in: the head stops each chain itself, so every ask is the room's most drafts
+     head_stops_most: u32 = std.math.maxInt(u32), // ... while at most this many streams are live (`live`)
+     live: usize = 0, // the engine's live streams, set at each step when head_stops is on (lanes/join_batch.zig)
++    pooled_budgets: bool = false, // opt-in: budgets as db281878 made them (head steps in the overhead, no probe row)
+     batch_rows: u32,
+     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
+     row_cost: @import("row_cost.zig").RowCost = .{}, // what a row costs past shared_costs here, under k.learn_rows
+@@ -346,12 +347,14 @@ pub const Rule = struct {
+         defer r.gpa.free(ones);
+         @memset(ones, 1);
+         const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled) };
+-        const counts = if (r.draft_step_ms != 0)
++        const counts = if (r.pooled_budgets)
++            try alloc.allocate(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), @max(whos.len, r.batch_rows))
++        else if (r.draft_step_ms != 0)
+             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled) })
+         else
+             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), head);
+         defer r.gpa.free(counts);
+-        r.probeShared(whos, most, counts);
++        if (!r.pooled_budgets) r.probeShared(whos, most, counts);
+         if (r.plain_guard) {
+             // no draft where none pays; a probe after a growing run of plain rounds
+             for (whos, counts) |w, *c| {
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 3fa73406e..4c2a1c427 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -76,6 +76,7 @@ pub const Engine = struct {
+                 .confidence_floor = cfg.draft_confidence,
+                 .batch_rows = cfg.batch_rows,
+                 .batched_heads = cfg.draft_streams,
++                .pooled_budgets = cfg.pooled_budgets,
+             },
+         };
+     }
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 2ba4d5a86..af04bc87b 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -86,6 +86,7 @@ test {
+     _ = @import("depth_probe_test.zig");
+     _ = @import("head_stops_test.zig");
+     _ = @import("join_batch_test.zig");
++    _ = @import("pooled_budgets_test.zig");
+     _ = @import("proposal_external_test.zig");
+     _ = @import("lone_costs_test.zig");
+     _ = @import("lone_backoff_test.zig");
+diff --git a/zig/src/core/lanes/pooled_budgets_test.zig b/zig/src/core/lanes/pooled_budgets_test.zig
+new file mode 100644
+index 000000000..5fcc7bc45
+--- /dev/null
++++ b/zig/src/core/lanes/pooled_budgets_test.zig
+@@ -0,0 +1,47 @@
++//! Model.pooled_budgets: a shared round's drafts as db281878's Rule.budgets allocated them, head steps unpriced.
++const std = @import("std");
++const depth = @import("depth.zig");
++const Table = @import("table.zig").Table;
++const Rule = depth.Rule;
++const State = depth.State;
++const Who = depth.Who;
++
++const No = struct {
++    fn copy(_: *anyopaque, _: *const Who) bool {
++        return false;
++    }
++};
++
++/// Each of `n` fresh streams' budget (all equal here) under the pooled or the priced rule.
++fn budget(n: usize, pooled: bool) !i64 {
++    const gpa = std.testing.allocator;
++    var shared: Table = .{};
++    defer shared.deinit(gpa);
++    for (1..257) |w| try shared.put(gpa, @intCast(w), 10.0 + @as(f64, @floatFromInt(w))); // a row costs 1 ms past 10
++    const empty: Table = .{};
++    var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.8, 0.7, 0.6, 0.5 }, .most_drafts = 15, .family_costs = &empty, .shared_costs = &shared, .mtp_step_ms = 6.0, .plain_guard = false, .node_probabilities = false, .batch_rows = 256, .batched_heads = true, .pooled_budgets = pooled };
++    defer rule.deinit();
++    var states: [16]?State = @splat(null);
++    defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
++    var whos: [16]Who = undefined;
++    for (&whos, &states) |*w, *s| w.* = .{ .state = s, .draft_room = 100, .finished = false, .forced = false };
++    var unused: u8 = 0;
++    var out: [16]i64 = undefined;
++    try rule.budgets(whos[0..n], .{ .ptr = &unused, .copy = No.copy }, false, out[0..n]);
++    for (out[1..n]) |d| try std.testing.expectEqual(out[0], d);
++    return out[0];
++}
++
++test "pooled budgets: N streams draft what db281878's allocation over the measured overhead gives them" {
++    // chains 0.9, 0.72, 0.504, 0.3024, 8 ms overhead: three each at (4 + 4 * 2.124) / (10 + 16 + 8) = 0.3675
++    try std.testing.expectEqual(@as(i64, 3), try budget(4, true));
++    // 16 streams: two each, (16 + 16 * 1.62) / (10 + 48 + 8) = 0.6352, a third draft (0.504) is below that rate
++    try std.testing.expectEqual(@as(i64, 2), try budget(16, true));
++}
++
++test "pooled budgets: off, the head's 6 ms steps priced by the deepest chain draft each stream less" {
++    // 4 streams: two each, 10.48 / (10 + 12 + 8 + 2 * 6) = 0.2495 beats three each at 12.496 / (10 + 16 + 8 + 18)
++    try std.testing.expectEqual(@as(i64, 2), try budget(4, false));
++    // 16 streams: one each, 30.4 / (10 + 32 + 8 + 6) = 0.5429 beats two each at 41.92 / (10 + 48 + 8 + 12)
++    try std.testing.expectEqual(@as(i64, 1), try budget(16, false));
++}

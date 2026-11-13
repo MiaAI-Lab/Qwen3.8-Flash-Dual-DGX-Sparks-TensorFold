@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:41:08 +0700
+Subject: [PATCH 74/79] lanes: the budget-hold test's result ends with its EOS
+ and a newline, the rows that land with the cut
+
+---
+ zig/src/core/lanes/budget_hold_test.zig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/core/lanes/budget_hold_test.zig b/zig/src/core/lanes/budget_hold_test.zig
+index 2ee9d8a2b..bdac2939a 100644
+--- a/zig/src/core/lanes/budget_hold_test.zig
++++ b/zig/src/core/lanes/budget_hold_test.zig
+@@ -10,7 +10,7 @@ const gpa = std.testing.allocator;
+ const close = [_]u32{ 90, 91, 92 };
+ const think_end: i64 = 91;
+ const base_result = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89, 13, 24 };
+-const eos_row = base_result.len - 3; // ChatML's <|im_end|>: in the last rows, which land with the cut
++const eos_row = base_result.len - 2; // ChatML's <|im_end|> then a newline: rows that land with the cut
+ 
+ /// The tool result a hold resumes with: its row `eos_row` is the reply's EOS, as a ChatML tool turn's rows hold one.
+ fn resultWith(eos: ?u32) [base_result.len]u32 {
+@@ -91,7 +91,7 @@ fn run(spec: Spec) !Out {
+ test "budget hold: a cut that would land inside a held result waits: every result row lands, then the close" {
+     const eos = try eosInThink(&shared.p1);
+     const result = resultWith(eos.token);
+-    for ([_]bool{ true, false }) |mtp| for ([_]bool{ true, false }) |drafts| for ([_]usize{ 1, eos_row + 1, 4, result.len - 1 }) |into| {
++    for ([_]bool{ true, false }) |mtp| for ([_]bool{ true, false }) |drafts| for ([_]usize{ 1, 4, eos_row, result.len - 1 }) |into| {
+         const budget: u32 = @intCast(eos.at + 1 + into); // the budget's cut falls on the result's row `into`
+         const r = try run(.{ .mtp = mtp, .drafts = drafts, .budget = budget, .eos = eos.token });
+         defer gpa.free(r.tokens);

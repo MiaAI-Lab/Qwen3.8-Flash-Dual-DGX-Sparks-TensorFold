@@ -1,0 +1,1017 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 19:33:46 +0700
+Subject: [PATCH 30/79] lanes: runner rounds: drafts past a forced tail,
+ settled fires, the round trace
+
+The rounds side of the in-model runner (slice 6 of C4).
+
+- forced_drafts.zig: a lone window holding a forced tail (a runner's or a
+  tool's result) takes the last fed row's drafts past it. Config.forced_drafts
+  is off for every family by default; DeepSeek-V4.1's lane model turns it on as
+  before (TF_DSV41_NO_FORCED_DRAFTS=1 turns it off). forced_drafts.headDepth
+  sizes the head's drafts past the tail (the unforced depth plus the tail, at
+  most the stream's room); backend.Window.forced names the forced rows for a
+  backend.
+- A settled trigger's last kept token reruns as a held EOS does (settle .cut),
+  so a fire settled at its trigger never holds: settle_fire_test and
+  test-settle-fire-host.
+- round_trace.zig: rounds around each held stream, one JSON line each,
+  read-only (off on Windows at compile time). runner_binding.openRoundTrace
+  opens it from PREFIX_TRACE (1: stderr, else a path) and PREFIX_TRACE_ROUNDS;
+  DeepSeek-V4.1's serve engine calls it beside the runner. The fork's DSV41
+  backend counters (row graphs, DSpark spec, Engram) are not in this trace.
+- fire_replay_test and round_trace_test.
+
+Ported from the dsv41 release line (s86 7b79ef92d).
+---
+ zig/build/lane_halt_host.zig                  |   1 +
+ zig/src/core/lanes/backend.zig                |   1 +
+ zig/src/core/lanes/config.zig                 |   3 +
+ zig/src/core/lanes/engine.zig                 |  12 +-
+ zig/src/core/lanes/fire_replay_test.zig       | 189 +++++++++++++++
+ zig/src/core/lanes/forced_drafts.zig          |  76 ++++++
+ zig/src/core/lanes/lanes.zig                  |   4 +
+ zig/src/core/lanes/round_trace.zig            | 226 ++++++++++++++++++
+ zig/src/core/lanes/round_trace_test.zig       |  93 +++++++
+ zig/src/core/lanes/settle_fire_test.zig       | 130 ++++++++++
+ zig/src/core/lanes/windows.zig                |   3 +-
+ zig/src/core/runner_binding.zig               |  37 +++
+ zig/src/families/deepseek_v41/draft/lanes.zig |   2 +-
+ .../families/deepseek_v41/serve_engine.zig    |   1 +
+ 14 files changed, 770 insertions(+), 8 deletions(-)
+ create mode 100644 zig/src/core/lanes/fire_replay_test.zig
+ create mode 100644 zig/src/core/lanes/forced_drafts.zig
+ create mode 100644 zig/src/core/lanes/round_trace.zig
+ create mode 100644 zig/src/core/lanes/round_trace_test.zig
+ create mode 100644 zig/src/core/lanes/settle_fire_test.zig
+
+diff --git a/zig/build/lane_halt_host.zig b/zig/build/lane_halt_host.zig
+index 6b2f4de9c..32b30caa5 100644
+--- a/zig/build/lane_halt_host.zig
++++ b/zig/build/lane_halt_host.zig
+@@ -18,6 +18,7 @@ pub fn steps(b: *std.Build) void {
+     hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"compute hold:"} })).step);
+     hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"compute hold:"} })).step);
+     b.step("test-runner-abstain-host", "Abstain records: each abstained cell's source, reason and decision point").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner abstain records:"} })).step);
++    b.step("test-settle-fire-host", "PREFIX_SYNC_GRAPH on the fake target: fires settled at their trigger never hold").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"settled fires:"} })).step);
+     b.step("test-runner-host", "The in-model runner: scanner, held results and delivery with a fake circuit backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"runner"} })).step);
+     // proof 2 on the real circuit (TF_RUNNER_CIRCUIT): optimized, since a debug evaluator takes minutes a run
+     const lanes_fast = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index 48e2c8ffa..bda839563 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -17,6 +17,7 @@ pub const Window = struct {
+     parents: ?[]const i32, // each row's parent row (row 0: -1) for a tree; null for a chain
+     positions: []const u64, // the absolute position each row's draw is keyed at
+     early: bool = false, // also draft each row's first head draft behind the verify (speculate_early)
++    forced: u32 = 0, // rows after the pending one that are forced (a result's tokens): always kept, never drafts
+     masks: []const u32 = &.{}, // structured output: each row's allowed-token bits (rows x words, lanes/grammar.zig); empty: none
+ 
+     pub fn rows(w: Window) usize {
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 030ea73e7..d09b00858 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -25,6 +25,7 @@ pub const Model = struct {
+     mtp: bool = false, // a draft head is loaded
+     speculate: bool = false, // the head can draft from a verify's rows
+     speculate_early: bool = true, // draft every row's first draft behind the verify
++    forced_drafts: bool = false, // a lone window holding a forced tail takes the last fed row's drafts past it
+     draft_prior: []const f64 = &.{}, // the head's acceptance by depth until a stream has its own
+     depth_rate: f64 = 0, // the newest round's weight in a depth's acceptance estimate (0: the core's)
+     plain_guard: bool = false, // plain rounds compete with drafted depths
+@@ -70,6 +71,7 @@ pub const Config = struct {
+     base_width: u32,
+     family_mtp: bool,
+     speculate_early: bool,
++    forced_drafts: bool = false, // Model.forced_drafts
+     pipelined: bool,
+     plain_guard: bool,
+     most_drafts: u32,
+@@ -159,6 +161,7 @@ pub const Config = struct {
+             .base_width = @min(width, first_copy + 1),
+             .family_mtp = m.mtp and width >= 2 and m.speculate,
+             .speculate_early = m.speculate_early and !(m.root_copies and m.copy_drafts),
++            .forced_drafts = m.forced_drafts,
+             .pipelined = m.gpu_tokens,
+             .plain_guard = m.plain_guard,
+             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 4672256d5..3fa73406e 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -113,6 +113,7 @@ pub const Engine = struct {
+     pub fn step(e: *Engine) !void {
+         try @import("join_batch.zig").step(e); // opt-in: joiners' first drafts in one batch; head stops' live count
+         _ = e.arena.reset(.retain_capacity);
++        if (@import("round_trace.zig").on()) @import("round_trace.zig").before(e);
+         const a = e.arena.allocator();
+         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
+         e.steps += 1;
+@@ -151,6 +152,7 @@ pub const Engine = struct {
+             }
+         }
+         try trail.resolve(e);
++        if (@import("round_trace.zig").on()) @import("round_trace.zig").after(e);
+         try e.sweep();
+         try trail.state(e);
+     }
+@@ -327,10 +329,7 @@ pub const Engine = struct {
+         var path: []u32 = undefined;
+         var committed: std.ArrayList(u32) = .empty;
+         if (p.kind == .forced) {
+-            path = try a.alloc(u32, rows);
+-            for (path, 0..) |*r, i| r.* = @intCast(i);
+-            try committed.appendSlice(a, p.forced);
+-            try committed.append(a, s.popForce() orelse sampled[rows - 1]);
++            path = try @import("forced_drafts.zig").conclude(e, s, p, tokens, sampled, &committed);
+         } else {
+             path = try accept.acceptPath(a, tokens, parents, sampled);
+             for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
+@@ -419,7 +418,8 @@ pub const Engine = struct {
+         }
+         const landed = try s.commit(e.gpa, committed.items, committed_rows);
+         const got = committed.items[0..landed];
+-        if ((s.finished or s.held) and got.len < path.len) path = path[0 .. got.len + @intFromBool(s.finished)]; // held: EOS row reruns
++        // held: the EOS row reruns; settled at a trigger (cut): its last kept token reruns, forced next
++        if ((s.finished or s.held or s.settle == .cut) and got.len < path.len) path = path[0 .. got.len + @intFromBool(s.finished and !s.held and s.settle != .cut)];
+         const keep = path.len;
+         s.cache_len += keep;
+         s.pending = committed.items[keep - 1];
+@@ -438,7 +438,7 @@ pub const Engine = struct {
+     /// Read the kept rows with their following tokens and ask the head for the next round's drafts.
+     fn draftLate(e: *Engine, s: *Stream, start: u64, follow: []const u32, path: []const u32, budget: ?i64) !void {
+         var w = win.who(s);
+-        const d: u32 = @intCast(try e.rule.headDepth(&w, budget, win.probe(e)));
++        const d: u32 = @intCast(try @import("forced_drafts.zig").headDepth(e, s, &w, budget, win.probe(e)));
+         const request: be.DraftRequest = .{ .stream = s, .follow = follow, .rows = path, .start = start, .position = s.cache_len + 1, .depth = d };
+         if (!e.late.put(e.backend.defer_lone_draft and e.alone, request)) try e.askDrafts(&.{request});
+     }
+diff --git a/zig/src/core/lanes/fire_replay_test.zig b/zig/src/core/lanes/fire_replay_test.zig
+new file mode 100644
+index 000000000..aaf8f4a96
+--- /dev/null
++++ b/zig/src/core/lanes/fire_replay_test.zig
+@@ -0,0 +1,189 @@
++//! Runner fires replayed on the fake target: drafts past each forced result change the rounds, never the tokens.
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const fake = @import("fake.zig");
++const hold = @import("hold.zig");
++const shared = @import("engine_test.zig");
++const round_trace = @import("round_trace.zig");
++
++const gpa = std.testing.allocator;
++const fires = [_]usize{ 20, 47, 75 };
++const foreign = [_]u32{ 7, 8, 9 };
++
++/// A runner hook holding the stream at the given emitted indices.
++const Hook = struct {
++    seen: usize = 0,
++    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool, _: bool) bool {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        defer h.seen += 1;
++        return can_hold and std.mem.indexOfScalar(usize, &fires, h.seen) != null;
++    }
++};
++
++/// What a fire's result is: the target's own next `echo` draws (a result the drafts guess) or `foreign`'s tokens.
++const Owned = union(enum) { echo: usize, foreign };
++
++/// Counts over one reply: its rounds, the rounds that fed a result, and the drafts those carried and kept.
++const Replay = struct {
++    tokens: []u32,
++    rounds: u64 = 0,
++    feeds: u64 = 0,
++    fed_drafts: u64 = 0,
++    fed_kept: u64 = 0,
++    kept_before: bool = true, // at each hold every token before the trigger is in the target's cache
++    trigger_drafts: u64 = 0, // drafts the trigger rounds kept before their trigger
++};
++
++fn replay(on: bool, width: ?u32, owned: Owned) !Replay {
++    return replayTraced(on, width, owned, null);
++}
++
++/// The fake target's verify count as a trace's backend counter.
++fn verifies(ctx: *anyopaque, out: []u64) void {
++    out[0] = @as(*fake.Fake, @ptrCast(@alignCast(ctx))).rounds;
++}
++
++fn replayTraced(on: bool, width: ?u32, owned: Owned, trace: ?c_int) !Replay {
++    var cfg = try shared.modelWith(true);
++    defer cfg.deinit(gpa);
++    cfg.forced_drafts = on;
++    if (width) |w| cfg.base_width = w;
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    if (trace) |fd| round_trace.open(fd, 4, .{ .ctx = &target, .names = &.{"verifies"}, .read = verifies });
++    defer if (trace != null) round_trace.close();
++    var hook: Hook = .{};
++    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &shared.p1, .max_new = 100, .drafts = true, .runner = .{ .ptr = &hook, .token = Hook.token } });
++    defer s.deinit(gpa);
++    try engine.addStream(&s);
++    var r: Replay = .{ .tokens = &.{} };
++    var history: std.ArrayList(u32) = .empty;
++    defer history.deinit(gpa);
++    while (!s.finished and r.rounds < 400) {
++        if (s.awaiting) {
++            var result: std.ArrayList(u32) = .empty;
++            defer result.deinit(gpa);
++            switch (owned) {
++                .foreign => try result.appendSlice(gpa, &foreign),
++                .echo => |n| {
++                    history.clearRetainingCapacity();
++                    try history.appendSlice(gpa, &shared.p1);
++                    try history.appendSlice(gpa, s.emitted());
++                    for (0..n) |_| try history.append(gpa, fake.next(history.items, null, history.items.len));
++                    try result.appendSlice(gpa, history.items[history.items.len - n ..]);
++                },
++            }
++            try std.testing.expect(try hold.resumeAwaiting(&s, gpa, result.items));
++        }
++        const feeding = s.force.items.len > 0;
++        const drafted = s.drafted;
++        const accepted = s.accepted;
++        const before = s.emitted().len;
++        try engine.step();
++        r.rounds += 1;
++        if (feeding) {
++            r.feeds += 1;
++            r.fed_drafts += s.drafted - drafted;
++            r.fed_kept += s.accepted - accepted;
++        }
++        if (s.awaiting) {
++            const cached = target.lanes.getPtr(&s).?.history.items.len;
++            r.kept_before = r.kept_before and cached == shared.p1.len + s.emitted().len - 1;
++            r.trigger_drafts += s.emitted().len - before - 1;
++        }
++    }
++    try std.testing.expect(s.finished);
++    r.tokens = try gpa.dupe(u32, s.emitted());
++    return r;
++}
++
++/// Each token is the target's draw over everything before it, but a fire's result, which is `owned`'s.
++fn expectReplayed(out: []const u32, owned: Owned) !void {
++    var h: std.ArrayList(u32) = .empty;
++    defer h.deinit(gpa);
++    try h.appendSlice(gpa, &shared.p1);
++    var forced_until: usize = 0;
++    for (out, 0..) |t, i| {
++        if (i < forced_until) {
++            if (owned == .foreign) try std.testing.expectEqual(foreign[i - (forced_until - foreign.len)], t);
++        } else try std.testing.expectEqual(fake.next(h.items, null, h.items.len), t);
++        try h.append(gpa, t);
++        if (std.mem.indexOfScalar(usize, &fires, i) != null) forced_until = i + 1 + switch (owned) {
++            .echo => |n| n,
++            .foreign => foreign.len,
++        };
++    }
++}
++
++test "fire replay: drafts past forced results keep every token; a guessed result saves rounds, off is the old count" {
++    // old: each reply's rounds with the engine before drafts past forced results (a9301c957)
++    const cases = [_]struct { width: ?u32, owned: Owned, old: u64 }{
++        .{ .width = null, .owned = .{ .echo = 2 }, .old = 34 },
++        .{ .width = null, .owned = .foreign, .old = 38 },
++        .{ .width = 5, .owned = .{ .echo = 6 }, .old = 37 },
++        .{ .width = 5, .owned = .foreign, .old = 38 },
++    };
++    for (cases) |c| {
++        const off = try replay(false, c.width, c.owned);
++        defer gpa.free(off.tokens);
++        const on = try replay(true, c.width, c.owned);
++        defer gpa.free(on.tokens);
++        try std.testing.expectEqualSlices(u32, off.tokens, on.tokens);
++        try expectReplayed(on.tokens, c.owned);
++        // off (the negative control): a round feeding a result carries no drafts, as before
++        try std.testing.expectEqual(@as(u64, 0), off.fed_drafts);
++        try std.testing.expectEqual(c.old, off.rounds);
++        try std.testing.expect(on.fed_drafts > 0);
++        try std.testing.expect(on.rounds <= off.rounds);
++        if (c.owned == .echo) {
++            try std.testing.expect(on.fed_kept > 0);
++            try std.testing.expect(on.rounds < off.rounds);
++        }
++        // the trigger round keeps the drafts it accepted before the trigger: only the trigger's row runs again
++        try std.testing.expect(on.kept_before and off.kept_before);
++        try std.testing.expect(on.trigger_drafts > 0);
++    }
++}
++
++test "fire replay traced: each fire's rounds before, its trigger, hold, resume and rounds after; the same tokens" {
++    var fds: [2]c_int = undefined;
++    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
++    defer _ = std.c.close(fds[0]);
++    const plain = try replay(true, null, .{ .echo = 2 });
++    defer gpa.free(plain.tokens);
++    const traced = try replayTraced(true, null, .{ .echo = 2 }, fds[1]);
++    defer gpa.free(traced.tokens);
++    _ = std.c.close(fds[1]);
++    try std.testing.expectEqualSlices(u32, plain.tokens, traced.tokens);
++    var text: std.ArrayList(u8) = .empty;
++    defer text.deinit(gpa);
++    var chunk: [4096]u8 = undefined;
++    while (true) {
++        const n = std.c.read(fds[0], &chunk, chunk.len);
++        if (n <= 0) break;
++        try text.appendSlice(gpa, chunk[0..@intCast(n)]);
++    }
++    const names = [_][]const u8{ "open", "hold", "resume", "trigger", "pre", "post" };
++    var counts: [names.len]usize = @splat(0);
++    var lines = std.mem.splitScalar(u8, text.items, '\n');
++    var after_resume = false;
++    while (lines.next()) |line| {
++        if (line.len == 0) continue;
++        const p = try std.json.parseFromSlice(struct { rt: []const u8, phase: []const u8 = "", since: i64 = 0, kind: []const u8 = "", verifies: u64 = 1 }, gpa, line, .{ .ignore_unknown_fields = true });
++        defer p.deinit();
++        const v = p.value;
++        const key = if (std.mem.eql(u8, v.rt, "round")) v.phase else v.rt;
++        for (names, &counts) |n, *c| c.* += @intFromBool(std.mem.eql(u8, n, key));
++        try std.testing.expectEqual(@as(u64, 1), v.verifies); // a lone stream's step: one verify
++        // the first round after a resume feeds the result: since 1, forced
++        if (after_resume) try std.testing.expect(v.since == 1 and std.mem.eql(u8, v.kind, "forced"));
++        after_resume = std.mem.eql(u8, v.rt, "resume");
++    }
++    try std.testing.expectEqualSlices(usize, &.{ 1, fires.len, fires.len, fires.len }, counts[0..4]);
++    try std.testing.expect(counts[4] >= fires.len and counts[4] <= fires.len * 4); // before: up to 4 a fire
++    try std.testing.expect(counts[5] > 0 and counts[5] <= fires.len * 4); // after: up to 4 a fire, while the reply lasts
++}
+diff --git a/zig/src/core/lanes/forced_drafts.zig b/zig/src/core/lanes/forced_drafts.zig
+new file mode 100644
+index 000000000..da6362d3c
+--- /dev/null
++++ b/zig/src/core/lanes/forced_drafts.zig
+@@ -0,0 +1,76 @@
++//! Drafts past a lone stream's forced tail (a runner's or tool's result): the last fed row's drafts fill its window.
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const Plan = @import("windows.zig").Plan;
++const accept = @import("accept.zig");
++const depth = @import("depth.zig");
++
++fn on(e: *const Engine, s: *const sm.Stream) bool {
++    return e.cfg.forced_drafts and e.alone and s.drafts and s.grammar == null;
++}
++
++fn width(e: *const Engine) usize {
++    return @min(e.cfg.base_width, e.cfg.batch_rows);
++}
++
++/// Forced tokens still queued that the next window takes whole, with room for drafts after them (0: none, or off).
++pub fn tail(e: *const Engine, s: *const sm.Stream) u32 {
++    const n = s.force.items.len;
++    if (!on(e, s) or n == 0 or n + 1 >= width(e)) return 0;
++    return @intCast(n);
++}
++
++/// The head's next drafts for `s`: past a forced tail the next window takes whole, the tail's own positions too.
++pub fn headDepth(e: *Engine, s: *const sm.Stream, w: *depth.Who, budget: ?i64, probe: depth.Probe) !i64 {
++    const n = tail(e, s);
++    if (n == 0) return e.rule.headDepth(w, budget, probe);
++    var free = w.*;
++    free.forced = false; // the depth it would draft unforced; no copy is ahead past a forced tail
++    const d = try e.rule.headDepth(&free, budget, .{ .ptr = e, .copy = noCopy });
++    const most = @min(@as(i64, e.rule.most_drafts), @max(1, w.draft_room - 1));
++    if (d == 0 or n >= most) return 0;
++    return @min(d + n, most);
++}
++
++fn noCopy(_: *anyopaque, _: *const depth.Who) bool {
++    return false;
++}
++
++/// A window holding the whole forced tail: the held drafts past it as host tokens (drafted from the same pending row).
++pub fn extend(e: *Engine, s: *sm.Stream, p: *Plan, queued: ?sm.Held) !void {
++    const q = queued orelse return;
++    if (!on(e, s) or s.force.items.len > 0) return;
++    if (q.parents) |parents| if (!accept.isChain(parents)) return;
++    const count: usize = if (q.tokens) |t| t.len else q.count;
++    const n = @min(count, width(e) - 1);
++    if (n <= p.forced.len) return;
++    const a = e.arena.allocator();
++    const drafts = if (q.tokens) |t| t else read: {
++        const read = e.backend.vtable.held orelse return;
++        const out = try a.alloc(u32, count);
++        try read(e.backend.ptr, s, out);
++        break :read out;
++    };
++    p.tokens = try std.mem.concat(a, u32, &.{ p.forced, drafts[p.forced.len..n] });
++}
++
++/// A forced window's path: forced rows land whole, drafts past them up to the first the target did not pick.
++pub fn conclude(e: *Engine, s: *sm.Stream, p: Plan, tokens: []const u32, sampled: []const u32, committed: *std.ArrayList(u32)) ![]u32 {
++    const a = e.arena.allocator();
++    const fed = p.forced.len + 1;
++    var n = fed;
++    while (n < tokens.len and tokens[n] == sampled[n - 1]) n += 1;
++    const path = try a.alloc(u32, n);
++    for (path, 0..) |*r, i| r.* = @intCast(i);
++    try committed.appendSlice(a, p.forced);
++    try committed.appendSlice(a, tokens[fed..n]);
++    try committed.append(a, s.popForce() orelse sampled[n - 1]);
++    if (tokens.len > fed) {
++        e.drafted += tokens.len - fed;
++        e.accepted += n - fed;
++        s.drafted += tokens.len - fed;
++        s.accepted += n - fed;
++    }
++    return path;
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 8a25ca9fb..2ba4d5a86 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -36,6 +36,7 @@ pub const row_cost = @import("row_cost.zig");
+ pub const trail = @import("trail.zig");
+ pub const engine = @import("engine.zig");
+ pub const hold = @import("hold.zig");
++pub const round_trace = @import("round_trace.zig");
+ pub const fake = @import("fake.zig");
+ pub const shared_head_cost_check = @import("shared_head_cost_check.zig");
+ pub const shared_draft_check = @import("shared_draft_check.zig");
+@@ -66,6 +67,9 @@ test {
+     _ = @import("loop_stop_test.zig");
+     _ = @import("handover_test.zig");
+     _ = @import("hold_test.zig");
++    _ = @import("fire_replay_test.zig");
++    _ = @import("settle_fire_test.zig");
++    _ = @import("round_trace_test.zig");
+     _ = @import("open_first_test.zig");
+     _ = @import("open_trace_test.zig");
+     _ = @import("recorder_test.zig");
+diff --git a/zig/src/core/lanes/round_trace.zig b/zig/src/core/lanes/round_trace.zig
+new file mode 100644
+index 000000000..6859f0d3f
+--- /dev/null
++++ b/zig/src/core/lanes/round_trace.zig
+@@ -0,0 +1,226 @@
++//! Rounds around held streams (runner fires), one JSON line each: N before a hold, N after its resume; read-only.
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const Stream = @import("stream.zig").Stream;
++
++/// A backend's counters, read before and after each step; a record carries each one's change over its step.
++pub const Extras = struct { ctx: *anyopaque, names: []const []const u8, read: *const fn (ctx: *anyopaque, out: []u64) void };
++
++const max_extras = 16;
++const max_streams = 64;
++const max_ring = 64;
++
++const Kind = enum { forced, drafted, plain };
++
++/// What the trace last saw of a stream: its counters before the step, and where it stands around its fires.
++const Seen = struct {
++    s: ?*const Stream = null, // compared, never read: the engine frees a stream once it leaves `live`
++    rounds: u64 = 0,
++    drafted: u64 = 0,
++    accepted: u64 = 0,
++    emitted: usize = 0,
++    forced: bool = false,
++    awaiting: bool = false,
++    hold_ns: u64 = 0,
++    since: i64 = -1, // rounds since its last resume (-1: none yet)
++    post: u32 = 0, // rounds after the resume still to write
++};
++
++const Rec = struct {
++    step: u64,
++    t_ns: u64,
++    stream: u32,
++    since: i64,
++    kind: Kind,
++    drafted: u64,
++    kept: u64,
++    got: usize,
++    held_next: u32,
++    wall_ns: u64,
++    gap_ns: u64,
++    streams: usize,
++    x: [max_extras]u64,
++};
++
++var fd: c_int = -1;
++var around: u32 = 0;
++var extras: ?Extras = null;
++var seen: [max_streams]Seen = @splat(.{});
++var ring: [max_ring]Rec = undefined;
++var ring_len: usize = 0;
++var ring_at: usize = 0;
++var t_open: u64 = 0;
++var step_start: u64 = 0;
++var last_end: u64 = 0;
++var x_before: [max_extras]u64 = @splat(0);
++var buf: [4096]u8 = undefined;
++
++/// Writes to `out` (an open file descriptor): `rounds` rounds before each hold and after each resume (most 64).
++pub fn open(out: c_int, rounds: u32, x: ?Extras) void {
++    fd = out;
++    around = @min(rounds, max_ring);
++    extras = if (x) |v| if (v.names.len <= max_extras) v else null else null;
++    t_open = now();
++    last_end = t_open;
++    var w = std.Io.Writer.fixed(&buf);
++    w.print("{{\"rt\":\"open\",\"rounds\":{d},\"extras\":[", .{around}) catch return;
++    if (extras) |v| for (v.names, 0..) |n, i| w.print("{s}\"{s}\"", .{ if (i > 0) "," else "", n }) catch return;
++    w.writeAll("]}\n") catch return;
++    put(w.buffered());
++}
++
++/// Off on Windows at compile time: the trace writes through libc there is none of.
++pub inline fn on() bool {
++    return @import("builtin").os.tag != .windows and fd >= 0;
++}
++
++fn now() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
++}
++
++fn put(s: []const u8) void {
++    var at: usize = 0;
++    while (at < s.len) {
++        const n = std.c.write(fd, s[at..].ptr, s.len - at);
++        if (n <= 0) return;
++        at += @intCast(n);
++    }
++}
++
++fn readExtras(out: []u64) void {
++    if (extras) |v| v.read(v.ctx, out[0..v.names.len]);
++}
++
++fn live(e: *const Engine, p: *const Stream) bool {
++    for (e.live.items) |s| if (s == p) return true;
++    return false;
++}
++
++/// Frees entries of streams no longer live (pointers compared only): a new stream at a freed address starts fresh.
++fn forget(e: *const Engine) void {
++    for (&seen) |*x| if (x.s) |p| if (!live(e, p)) {
++        x.* = .{};
++    };
++}
++
++/// The live stream's entry (a new one takes an entry no live stream holds; null when all are taken).
++fn entry(e: *const Engine, s: *const Stream) ?*Seen {
++    var free: ?*Seen = null;
++    for (&seen) |*x| {
++        if (x.s == s) return x;
++        if (free == null and (x.s == null or !live(e, x.s.?))) free = x;
++    }
++    const x = free orelse return null;
++    x.* = .{ .s = s, .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .emitted = s.emitted().len };
++    return x;
++}
++
++/// Before a step: the clock, the backend's counters, each live stream's; a stream resumed since its hold is noted.
++pub fn before(e: *const Engine) void {
++    step_start = now();
++    readExtras(&x_before);
++    forget(e);
++    for (e.live.items) |s| {
++        const x = entry(e, s) orelse continue;
++        if (x.awaiting and !s.awaiting) {
++            var w = std.Io.Writer.fixed(&buf);
++            w.print("{{\"rt\":\"resume\",\"stream\":{d},\"t_us\":{d},\"held_us\":{d},\"forced\":{d}}}\n", .{ index(x), us(step_start - t_open), us(step_start - x.hold_ns), s.force.items.len }) catch {};
++            put(w.buffered());
++            x.since = 0;
++            x.post = around;
++        }
++        x.awaiting = s.awaiting;
++        x.rounds = s.rounds;
++        x.drafted = s.drafted;
++        x.accepted = s.accepted;
++        x.emitted = s.emitted().len;
++        x.forced = s.force.items.len > 0;
++    }
++}
++
++/// After a step: each stream that ran a round, written when it is near a fire, else kept as the next fire's before.
++pub fn after(e: *const Engine) void {
++    const t = now();
++    var x_after: [max_extras]u64 = @splat(0);
++    readExtras(&x_after);
++    defer for (e.live.items) |s| {
++        // a finished stream leaves `live` in this step's sweep, then is freed: its entry goes now, while it is live
++        if (s.finished) if (find(s)) |x| {
++            x.* = .{};
++        };
++    };
++    for (e.live.items) |s| {
++        const x = entry(e, s) orelse continue;
++        if (s.rounds == x.rounds) continue;
++        if (x.since >= 0) x.since += 1;
++        var r: Rec = .{ .step = e.steps, .t_ns = t - t_open, .stream = index(x), .since = x.since, .kind = if (x.forced) .forced else if (s.drafted > x.drafted) .drafted else .plain, .drafted = s.drafted - x.drafted, .kept = s.accepted - x.accepted, .got = s.emitted().len - x.emitted, .held_next = if (s.next) |n| n.count else 0, .wall_ns = t - step_start, .gap_ns = step_start - last_end, .streams = e.live.items.len, .x = undefined };
++        for (&r.x, x_after, x_before) |*d, b, a| d.* = b -% a;
++        x.rounds = s.rounds;
++        if (s.awaiting and !x.awaiting) {
++            flush();
++            write(r, "trigger");
++            var w = std.Io.Writer.fixed(&buf);
++            w.print("{{\"rt\":\"hold\",\"stream\":{d},\"t_us\":{d}}}\n", .{ index(x), us(t - t_open) }) catch {};
++            put(w.buffered());
++            x.awaiting = true;
++            x.hold_ns = t;
++            x.post = 0;
++        } else if (x.post > 0) {
++            write(r, "post");
++            x.post -= 1;
++        } else push(r);
++    }
++    last_end = now();
++}
++
++fn find(s: *const Stream) ?*Seen {
++    for (&seen) |*x| if (x.s == s) return x;
++    return null;
++}
++
++/// Entries held (tests).
++pub fn held() usize {
++    var n: usize = 0;
++    for (seen) |x| n += @intFromBool(x.s != null);
++    return n;
++}
++
++fn index(x: *const Seen) u32 {
++    return @intCast((@intFromPtr(x) - @intFromPtr(&seen)) / @sizeOf(Seen));
++}
++
++fn us(ns: u64) u64 {
++    return ns / std.time.ns_per_us;
++}
++
++fn push(r: Rec) void {
++    if (around == 0) return;
++    ring[(ring_at + ring_len) % max_ring] = r;
++    if (ring_len < around) ring_len += 1 else ring_at = (ring_at + 1) % max_ring;
++}
++
++/// The rounds kept since the last write, as a hold's before.
++fn flush() void {
++    for (0..ring_len) |i| write(ring[(ring_at + i) % max_ring], "pre");
++    ring_len = 0;
++    ring_at = 0;
++}
++
++fn write(r: Rec, phase: []const u8) void {
++    var w = std.Io.Writer.fixed(&buf);
++    w.print("{{\"rt\":\"round\",\"phase\":\"{s}\",\"step\":{d},\"t_us\":{d},\"stream\":{d},\"since\":{d},\"kind\":\"{s}\",\"drafted\":{d},\"kept\":{d},\"got\":{d},\"held_next\":{d},\"wall_us\":{d},\"gap_us\":{d},\"streams\":{d}", .{ phase, r.step, us(r.t_ns), r.stream, r.since, @tagName(r.kind), r.drafted, r.kept, r.got, r.held_next, us(r.wall_ns), us(r.gap_ns), r.streams }) catch return;
++    if (extras) |v| for (v.names, r.x[0..v.names.len]) |n, d| w.print(",\"{s}\":{d}", .{ n, d }) catch return;
++    w.writeAll("}\n") catch return;
++    put(w.buffered());
++}
++
++/// Closes the trace (tests): the descriptor is the caller's.
++pub fn close() void {
++    fd = -1;
++    extras = null;
++    seen = @splat(.{});
++    ring_len = 0;
++    ring_at = 0;
++}
+diff --git a/zig/src/core/lanes/round_trace_test.zig b/zig/src/core/lanes/round_trace_test.zig
+new file mode 100644
+index 000000000..74d69f69d
+--- /dev/null
++++ b/zig/src/core/lanes/round_trace_test.zig
+@@ -0,0 +1,93 @@
++//! The round trace beside streams that finish and are freed: it reads only live streams (a rank-0 fault seen in a smoke run).
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const fake = @import("fake.zig");
++const shared = @import("engine_test.zig");
++const round_trace = @import("round_trace.zig");
++
++const gpa = std.testing.allocator;
++
++fn stepUntil(engine: *Engine, s: *const sm.Stream) !void {
++    var n: u32 = 0;
++    while (!s.finished and n < 200) : (n += 1) try engine.step();
++    try std.testing.expect(s.finished);
++}
++
++test "round trace: a traced stream finishes and is freed, then a new stream takes an entry; no freed stream is read" {
++    var fds: [2]c_int = undefined;
++    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
++    defer _ = std.c.close(fds[0]);
++    defer _ = std.c.close(fds[1]);
++    var cfg = try shared.modelWith(true);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    round_trace.open(fds[1], 4, null);
++    defer round_trace.close();
++    // a stream that outlives the others, so the trace keeps stepping beside the freed one
++    var long = try sm.Stream.init(gpa, .{ .id = "long", .prompt = &shared.p1, .max_new = 60 });
++    defer long.deinit(gpa);
++    try engine.addStream(&long);
++    // the first stream in a mapping of its own, unmapped once the engine is done with it: any read of it faults
++    const first = try std.heap.page_allocator.create(sm.Stream);
++    first.* = try sm.Stream.init(gpa, .{ .id = "first", .prompt = &shared.p1, .max_new = 6 });
++    try engine.addStream(first);
++    try engine.step();
++    try std.testing.expectEqual(@as(usize, 2), round_trace.held());
++    try stepUntil(&engine, first);
++    // the step that finished it swept it from live; its entry went in that step, while it was still live
++    try std.testing.expectEqual(@as(usize, 1), engine.live.items.len);
++    try std.testing.expectEqual(@as(usize, 1), round_trace.held());
++    first.deinit(gpa);
++    std.heap.page_allocator.destroy(first);
++    // a new stream looks for a free entry beside the long one: the first's memory is gone
++    var second = try sm.Stream.init(gpa, .{ .id = "second", .prompt = &shared.p1, .max_new = 6 });
++    defer second.deinit(gpa);
++    try engine.addStream(&second);
++    try engine.step();
++    try std.testing.expectEqual(@as(usize, 2), round_trace.held());
++    try stepUntil(&engine, &second);
++    try stepUntil(&engine, &long);
++    try std.testing.expectEqual(@as(usize, 0), engine.live.items.len);
++    try std.testing.expectEqual(@as(usize, 0), round_trace.held());
++}
++
++test "round trace: a stream released without finishing loses its entry at the next step (pointers compared only)" {
++    var fds: [2]c_int = undefined;
++    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
++    defer _ = std.c.close(fds[0]);
++    defer _ = std.c.close(fds[1]);
++    var cfg = try shared.modelWith(true);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    round_trace.open(fds[1], 4, null);
++    defer round_trace.close();
++    var long = try sm.Stream.init(gpa, .{ .id = "long", .prompt = &shared.p1, .max_new = 30 });
++    defer long.deinit(gpa);
++    try engine.addStream(&long);
++    const gone = try std.heap.page_allocator.create(sm.Stream);
++    gone.* = try sm.Stream.init(gpa, .{ .id = "gone", .prompt = &shared.p1, .max_new = 30 });
++    try engine.addStream(gone);
++    try engine.step();
++    try std.testing.expectEqual(@as(usize, 2), round_trace.held());
++    // taken out of live by its owner (a cancel's path) and freed while still unfinished
++    for (engine.live.items, 0..) |s, i| if (s == gone) {
++        _ = engine.live.orderedRemove(i);
++        break;
++    };
++    engine.release(gone);
++    gone.deinit(gpa);
++    std.heap.page_allocator.destroy(gone);
++    try engine.step();
++    try std.testing.expectEqual(@as(usize, 1), round_trace.held());
++    try stepUntil(&engine, &long);
++    try std.testing.expectEqual(@as(usize, 0), round_trace.held());
++}
+diff --git a/zig/src/core/lanes/settle_fire_test.zig b/zig/src/core/lanes/settle_fire_test.zig
+new file mode 100644
+index 000000000..fe95c0f35
+--- /dev/null
++++ b/zig/src/core/lanes/settle_fire_test.zig
+@@ -0,0 +1,130 @@
++//! Runner fires settled at their trigger (RunnerHook.settled) on the fake target: a hold's tokens with no hold
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const fake = @import("fake.zig");
++const hold = @import("hold.zig");
++const shared = @import("engine_test.zig");
++
++const gpa = std.testing.allocator;
++const fires = [_]usize{ 20, 47, 75 };
++const foreign = [_]u32{ 7, 8, 9 };
++
++/// A fire's result: the target's own next `echo` draws (one the drafts guess) or `foreign`'s tokens.
++const Owned = union(enum) { echo: usize, foreign };
++
++/// How a fire's result reaches the stream: settled at its trigger, or held and resumed after `ticks` host ticks.
++const Way = union(enum) { settled, held: u32 };
++
++/// Fires at the given emitted indices; `settled` answers at the trigger itself when the way is settled.
++const Hook = struct {
++    seen: usize = 0,
++    stream: *sm.Stream = undefined,
++    owned: Owned,
++    result: std.ArrayList(u32) = .empty,
++    at: ?usize = null, // a settled fire's emitted count at its trigger, until the round's end is seen
++
++    fn token(ptr: *anyopaque, _: u32, _: bool, can_hold: bool, _: bool) bool {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        defer h.seen += 1;
++        return can_hold and std.mem.indexOfScalar(usize, &fires, h.seen) != null;
++    }
++
++    fn settled(ptr: *anyopaque) ?[]const u32 {
++        const h: *Hook = @ptrCast(@alignCast(ptr));
++        compute(h) catch return null;
++        h.at = h.stream.emitted().len;
++        return h.result.items;
++    }
++
++    /// The fire's result after everything the stream has (its trigger is in the context already).
++    fn compute(h: *Hook) !void {
++        h.result.clearRetainingCapacity();
++        switch (h.owned) {
++            .foreign => try h.result.appendSlice(gpa, &foreign),
++            .echo => |n| {
++                var history: std.ArrayList(u32) = .empty;
++                defer history.deinit(gpa);
++                try history.appendSlice(gpa, &shared.p1);
++                try history.appendSlice(gpa, h.stream.emitted());
++                for (0..n) |_| try history.append(gpa, fake.next(history.items, null, history.items.len));
++                try h.result.appendSlice(gpa, history.items[history.items.len - n ..]);
++            },
++        }
++    }
++};
++
++const Replay = struct { tokens: []u32, rounds: u64 = 0, holds: u64 = 0, paused: u64 = 0, cache_ok: bool = true, kept: u64 = 0 };
++
++fn replay(way: Way, owned: Owned) !Replay {
++    var cfg = try shared.modelWith(true);
++    defer cfg.deinit(gpa);
++    cfg.forced_drafts = true;
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    var hook: Hook = .{ .owned = owned };
++    defer hook.result.deinit(gpa);
++    const settles = way == .settled;
++    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &shared.p1, .max_new = 100, .drafts = true, .runner = .{ .ptr = &hook, .token = Hook.token, .settled = if (settles) Hook.settled else null } });
++    defer s.deinit(gpa);
++    hook.stream = &s;
++    try engine.addStream(&s);
++    var r: Replay = .{ .tokens = &.{} };
++    var waited: u32 = 0;
++    const ticks: u32 = switch (way) {
++        .held => |n| n,
++        .settled => 1,
++    };
++    while (!s.finished and r.rounds < 400) {
++        if (s.awaiting) {
++            // a host tick: the last one of `ticks` resumes it, before the next round is planned
++            waited += 1;
++            if (waited >= ticks) {
++                try hook.compute();
++                try std.testing.expect(try hold.resumeAwaiting(&s, gpa, hook.result.items));
++                waited = 0;
++            } else r.paused += 1;
++        }
++        try engine.step();
++        r.rounds += 1;
++        // the result tokens a settled fire's own round kept (accepted past the trigger and the result's own)
++        if (hook.at) |at| r.kept += @min(s.emitted().len - at, hook.result.items.len);
++        hook.at = null;
++        if (s.awaiting) r.holds += 1;
++        // a hold or a settled cut: every kept token is in the target's cache but the pending one, none past it
++        if (s.awaiting or s.settle == .cut) {
++            const cached = target.lanes.getPtr(&s).?.history.items.len;
++            r.cache_ok = r.cache_ok and cached == shared.p1.len + s.emitted().len - 1;
++        }
++    }
++    try std.testing.expect(s.finished);
++    r.tokens = try gpa.dupe(u32, s.emitted());
++    return r;
++}
++
++test "settled fires: the same tokens as a hold, no hold, and the trigger round keeps the drafted result" {
++    for ([_]Owned{ .{ .echo = 2 }, .{ .echo = 4 }, .foreign }) |owned| {
++        const two = try replay(.{ .held = 2 }, owned);
++        defer gpa.free(two.tokens);
++        const one = try replay(.{ .held = 1 }, owned);
++        defer gpa.free(one.tokens);
++        const now = try replay(.settled, owned);
++        defer gpa.free(now.tokens);
++        std.debug.print("settled fires ({any}): rounds held 2 ticks {d}, 1 tick {d}, settled {d} (kept {d})\n", .{ owned, two.rounds, one.rounds, now.rounds, now.kept });
++        try std.testing.expectEqualSlices(u32, two.tokens, one.tokens);
++        try std.testing.expectEqualSlices(u32, one.tokens, now.tokens);
++        // a hold (the negative control) waits at every fire; a settled fire never holds
++        try std.testing.expectEqual(@as(u64, fires.len), one.holds);
++        try std.testing.expectEqual(@as(u64, 0), now.holds);
++        // two ticks pause the stream one round a fire; one tick none
++        try std.testing.expectEqual(@as(u64, fires.len), two.paused);
++        try std.testing.expectEqual(@as(u64, 0), one.paused);
++        try std.testing.expect(now.cache_ok and one.cache_ok and two.cache_ok);
++        try std.testing.expect(one.rounds < two.rounds);
++        // the fake's misses hash the draft position, so other rounds move with the cuts: only kept tokens are exact
++        if (owned == .echo) try std.testing.expect(now.kept > 0) else try std.testing.expectEqual(@as(u64, 0), now.kept);
++    }
++}
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index 47c9c82f5..a4452b3f3 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -73,6 +73,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
+         p.kind = .forced;
+         p.forced = forced;
+         p.tokens = forced;
++        try @import("forced_drafts.zig").extend(e, s, &p, queued);
+     } else {
+         var copy: Copy = .{};
+         if (copied) |c| copy = c else if (s.drafts) copy = try copyProposal(e, s);
+@@ -514,7 +515,7 @@ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+     const ds = try accept.depths(a, parents);
+     const positions = try a.alloc(u64, rows);
+     for (positions, ds) |*x, d| x.* = p.position + 1 + d;
+-    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .masks = p.masks };
++    return .{ .stream = p.stream, .pending = p.stream.pending.?, .held = p.held, .tokens = p.tokens, .parents = if (p.parents != null) parents else null, .positions = positions, .early = early, .forced = @intCast(p.forced.len), .masks = p.masks };
+ }
+ 
+ pub fn rowParents(e: *Engine, w: be.Window) ![]const i32 {
+diff --git a/zig/src/core/runner_binding.zig b/zig/src/core/runner_binding.zig
+index 4aff00824..00ee987d9 100644
+--- a/zig/src/core/runner_binding.zig
++++ b/zig/src/core/runner_binding.zig
+@@ -24,8 +24,32 @@ pub const Binding = struct {
+         const old = b.alias orelse return b.prefix;
+         return if (set(get(old))) old else b.prefix;
+     }
++
++    /// PREFIX_TRACE=1 (stderr) or a path: rounds around each runner fire (lanes round_trace); PREFIX_TRACE_ROUNDS: 12.
++    pub fn openRoundTrace(comptime b: Binding, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!void {
++        if (b.alias) |old| if (set(get(old))) return roundTrace(old, get);
++        return roundTrace(b.prefix, get);
++    }
+ };
+ 
++fn roundTrace(comptime p: []const u8, get: *const fn ([]const u8) ?[]const u8) error{BadKnob}!void {
++    const path = get(p ++ "_TRACE") orelse return;
++    if (path.len == 0 or std.mem.eql(u8, path, "0")) return;
++    const rounds = if (get(p ++ "_TRACE_ROUNDS")) |r| std.fmt.parseInt(u32, r, 10) catch {
++        log.warn("{s}_TRACE_ROUNDS={s}: not a count of rounds", .{ p, r });
++        return error.BadKnob;
++    } else 12;
++    var z: [std.fs.max_path_bytes:0]u8 = undefined;
++    const fd: c_int = if (std.mem.eql(u8, path, "1")) 2 else if (path.len < z.len) blk: {
++        @memcpy(z[0..path.len], path);
++        z[path.len] = 0;
++        break :blk std.c.open(z[0..path.len :0], .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
++    } else -1;
++    if (fd < 0) return log.warn("{s}_TRACE: cannot open {s}", .{ p, path });
++    @import("lanes").round_trace.open(fd, rounds, null);
++    log.info("in-model runner: round trace, {d} rounds around each fire to {s}", .{ rounds, if (fd == 2) "stderr" else path });
++}
++
+ fn set(v: ?[]const u8) bool {
+     return if (v) |s| s.len > 0 else false;
+ }
+@@ -62,3 +86,16 @@ test "runner binding: the generic names or the family's alias, never both switch
+     try t.expect((try dsv41.parse(&Env.get)) == null);
+     try t.expect((try flashnext.parse(&Env.get)) == null);
+ }
++
++test "runner binding: the round trace stays off unless asked, and a bad round count is refused" {
++    Env.pairs = &.{.{ "TF_DSV41_RUNNER", "1" }};
++    try dsv41.openRoundTrace(&Env.get);
++    Env.pairs = &.{ .{ "TF_DSV41_RUNNER", "1" }, .{ "TF_DSV41_RUNNER_TRACE", "0" } };
++    try dsv41.openRoundTrace(&Env.get);
++    try t.expect(!@import("lanes").round_trace.on());
++    Env.pairs = &.{ .{ "TF_DSV41_RUNNER", "1" }, .{ "TF_DSV41_RUNNER_TRACE", "1" }, .{ "TF_DSV41_RUNNER_TRACE_ROUNDS", "x" } };
++    try t.expectError(error.BadKnob, dsv41.openRoundTrace(&Env.get));
++    Env.pairs = &.{ .{ "TF_RUNNER", "1" }, .{ "TF_DSV41_RUNNER_TRACE_ROUNDS", "x" } };
++    try dsv41.openRoundTrace(&Env.get);
++    try t.expect(!@import("lanes").round_trace.on());
++}
+diff --git a/zig/src/families/deepseek_v41/draft/lanes.zig b/zig/src/families/deepseek_v41/draft/lanes.zig
+index 2f875c971..4e944c179 100644
+--- a/zig/src/families/deepseek_v41/draft/lanes.zig
++++ b/zig/src/families/deepseek_v41/draft/lanes.zig
+@@ -119,7 +119,7 @@ pub const Lanes = struct {
+         for (window, 0..) |*w, i| w.* = .{ .width = @intCast(i + 1), .ms = v[i] };
+         const shared = try arena.alloc(lanes.config.Cost, @min(v.len, batch_rows));
+         for (shared, 0..) |*w, i| w.* = .{ .width = @intCast(i + 1), .ms = v[i] };
+-        return .{ .exact_width = costs_mod.slot_rows, .mtp = true, .speculate = true, .speculate_early = false, .drafts = x.opts.shape.block, .window_costs = window, .mtp_step_ms = 0.0, .hidden_rows = true, .batch_rows = batch_rows, .max_streams = x.opts.slots, .shared_costs = shared, .draft_probabilities = true, .draft_streams = true, .join_tail = x.target.vtable.tail != null and try joinTail(), .piece_runs = try envOn("TF_DSV41_PIECE_RUNS"), .join_drafts = try envOn("TF_DSV41_JOIN_DRAFTS"), .replay_runs = try envOn("TF_DSV41_REPLAY_RUNS") };
++        return .{ .exact_width = costs_mod.slot_rows, .mtp = true, .speculate = true, .speculate_early = false, .drafts = x.opts.shape.block, .window_costs = window, .mtp_step_ms = 0.0, .hidden_rows = true, .batch_rows = batch_rows, .max_streams = x.opts.slots, .shared_costs = shared, .draft_probabilities = true, .draft_streams = true, .join_tail = x.target.vtable.tail != null and try joinTail(), .piece_runs = try envOn("TF_DSV41_PIECE_RUNS"), .join_drafts = try envOn("TF_DSV41_JOIN_DRAFTS"), .replay_runs = try envOn("TF_DSV41_REPLAY_RUNS"), .forced_drafts = !try envOn("TF_DSV41_NO_FORCED_DRAFTS") };
+     }
+ 
+     /// TF_DSV41_TAIL_JOIN=1: a prompt in pieces leaves its last token to its first round's shared window (default off).
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index 72921c99d..0af4dde9f 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -141,6 +141,7 @@ pub const Served = struct {
+             rc.place.engine = engineCpus; // PREFIX_CPUS=auto keeps the runner's threads off these
+             s.host.runner = try api.runner.open(gpa, rc);
+             s.host.info_.runner = s.host.runner;
++            try api.runner.bindings.dsv41.openRoundTrace(&@import("serve_knobs.zig").env); // PREFIX_TRACE
+         }
+         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
+         s.host.on_thread = .{ .ctx = m, .run = bindContext };

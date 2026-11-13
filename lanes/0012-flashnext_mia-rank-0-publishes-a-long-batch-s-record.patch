@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:34:06 +0200
+Subject: [PATCH 12/79] flashnext_mia: rank 0 publishes a long batch's record
+ before writing the batch
+
+Rank 0 publishes a long batch's record before it writes the batch on the control link (MiaAI-Lab issue #3:
+a batch larger than the socket buffers, a prompt of several hundred thousand tokens, blocked rank 0 in the
+write while rank 1, waiting for the record, never read the link). Regression test: a 1 MiB batch through
+4 KiB socket buffers.
+
+Source: patches/0012-records-notify-before-batch.patch @ MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold dc05c912342e
+Port: applied as is to zig/src/families/flashnext_mia/cuda_mirror.zig (her zig/src/families/flashnext/cuda_mirror.zig).
+---
+ .../families/flashnext_mia/cuda_mirror.zig    | 82 ++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/flashnext_mia/cuda_mirror.zig b/zig/src/families/flashnext_mia/cuda_mirror.zig
+index 82c257a3b..8e62ebeb3 100644
+--- a/zig/src/families/flashnext_mia/cuda_mirror.zig
++++ b/zig/src/families/flashnext_mia/cuda_mirror.zig
+@@ -660,9 +660,10 @@ pub const Records = struct {
+         if (r.idle) try r.link.send(.request, &.{}); // rank 1 back on the wire
+         r.idle = false;
+         const k = packRecord(&r.rec, kind, bytes);
+-        // the long batch is on the link before its record: rank 1 reads it after the record
+-        if (k == .on_link) try r.link.send(.round, bytes);
++        // the record first, then the long batch: rank 1 reads the batch only after the record wakes it, so a batch
++        // larger than the link's buffers needs rank 1 draining the link while this write is still going
+         try r.wire.put(r.wire.ptr, &r.rec);
++        if (k == .on_link) try r.link.send(.round, bytes);
+     }
+ 
+     fn sendFn(p: *anyopaque, bytes: []const u8) anyerror!void {
+@@ -1685,6 +1686,83 @@ test "the mirror over records: batched rounds, idle waits on the link, long prom
+     try std.testing.expectEqual(@as(u32, 0), rank1.target.lanes.count());
+ }
+ 
++/// Both ends of a socket pair kept small, with a deadline: a write larger than they hold blocks until the reader drains
++/// it, and a stuck one ends in an error instead of a hung test.
++fn smallBuffers(links: []const Link) !void {
++    const room: c_int = 4096;
++    const deadline: std.posix.timeval = .{ .sec = 3, .usec = 0 };
++    for (links) |l| {
++        try std.posix.setsockopt(l.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&room));
++        try std.posix.setsockopt(l.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&room));
++        try std.posix.setsockopt(l.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&deadline));
++        try std.posix.setsockopt(l.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&deadline));
++    }
++}
++
++const BatchReader = struct {
++    got: ?[]u8 = null,
++    err: ?anyerror = null,
++
++    fn run(r: *BatchReader, io: std.Io, port: u16, wire_port: u16) void {
++        const gpa = std.testing.allocator;
++        const l = Link.join(io, net.IpAddress.parse("127.0.0.1", port) catch unreachable, 5000) catch |e| {
++            r.err = e;
++            return;
++        };
++        defer l.close();
++        const wl = Link.join(io, net.IpAddress.parse("127.0.0.1", wire_port) catch unreachable, 5000) catch |e| {
++            r.err = e;
++            return;
++        };
++        defer wl.close();
++        smallBuffers(&.{ l, wl }) catch |e| {
++            r.err = e;
++            return;
++        };
++        var lw: LinkWire = .{ .link = wl };
++        var records: Records = .{ .gpa = gpa, .wire = lw.wire(), .link = l, .idle = false };
++        defer records.deinit();
++        const batch = records.channel().recv() catch |e| {
++            r.err = e;
++            return;
++        };
++        r.got = gpa.dupe(u8, batch orelse &.{}) catch |e| {
++            r.err = e;
++            return;
++        };
++    }
++};
++
++test "a batch larger than the link's buffers reaches rank 1: its record goes out before the batch is written" {
++    const gpa = std.testing.allocator;
++    var threaded: std.Io.Threaded = .init(gpa, .{});
++    defer threaded.deinit();
++    const io = threaded.io();
++    const server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
++    defer server.close();
++    const wire_server = try link_mod.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
++    defer wire_server.close();
++    var reader: BatchReader = .{};
++    defer if (reader.got) |b| gpa.free(b);
++    const t = try std.Thread.spawn(.{}, BatchReader.run, .{ &reader, io, server.port(), wire_server.port() });
++    const l = try server.accept(5000);
++    defer l.close();
++    const wl = try wire_server.accept(5000);
++    defer wl.close();
++    try smallBuffers(&.{ l, wl });
++    var lw: LinkWire = .{ .link = wl };
++    var records: Records = .{ .gpa = gpa, .wire = lw.wire(), .link = l, .idle = false };
++    defer records.deinit();
++    const batch = try gpa.alloc(u8, 1 << 20);
++    defer gpa.free(batch);
++    for (batch, 0..) |*b, i| b.* = @intCast((i * 31 + i / 251) % 256);
++    const sent = records.channel().send(batch);
++    t.join();
++    try sent;
++    if (reader.err) |e| return e;
++    try std.testing.expectEqualSlices(u8, batch, reader.got.?);
++}
++
+ test "rank 0 closing the link while no stream is open stops rank 1 cleanly" {
+     const gpa = std.testing.allocator;
+     var threaded: std.Io.Threaded = .init(gpa, .{});

@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 01:25:36 +0700
+Subject: [PATCH 59/79] flashnext_mia lanes costs: shared rounds warmed at the
+ timed shape, a 9-rep median, the least of 2 passes
+
+The 8-stream shared-round point varied between boots (123.8 / 131.1 ms against
+189.6 / 191.9 ms), which flips the pooled allocation at 16 streams between 7
+and 3 drafts a stream.
+
+- Each width now runs 4 untimed rounds of the timed shape (full window and the
+  head's drafts) instead of one round(1), then 9 timed rounds, and takes their
+  median (was 5 reps, median of the last 4).
+- Two passes over every width, each width keeping its least median, so a pass
+  slowed by boot noise does not price the table. Both ranks run the same rounds
+  in the same order; nothing branches on a timing.
+- Rank 0 logs the table at boot:
+  "lanes costs: verify 1:x,...; level y ms; shared 32:a,64:b,128:c,256:d".
+
+Boot order: measure() runs inside the family's open, before native/cuda.zig
+opens the in-model runner (probe, graph bank) and before the server starts
+the compute lane sandbox, on the same thread, so neither overlaps it.
+
+Test: "shared round costs: a width's slow first rounds and one outlier rep
+leave its steady ms" (passMs over a fake clock).
+---
+ .../flashnext_mia/cuda_lanes_core.zig         |  1 +
+ .../flashnext_mia/cuda_lanes_costs.zig        | 82 ++++++++++++++++---
+ .../families/flashnext_mia/cuda_native.zig    |  2 +
+ 3 files changed, 75 insertions(+), 10 deletions(-)
+
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_core.zig b/zig/src/families/flashnext_mia/cuda_lanes_core.zig
+index 806a44630..de78a130f 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes_core.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes_core.zig
+@@ -157,6 +157,7 @@ pub fn Lanes(comptime E: type) type {
+         pub const heldFn = rounds_part.Rounds(E).heldFn;
+         pub const releaseFn = rounds_part.Rounds(E).releaseFn;
+         pub const measure = costs_part.Measure(E).measure;
++        pub const logCosts = costs_part.Measure(E).logCosts;
+ 
+         pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
+             const late = if (envs.get("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, v, "0") else true;
+diff --git a/zig/src/families/flashnext_mia/cuda_lanes_costs.zig b/zig/src/families/flashnext_mia/cuda_lanes_costs.zig
+index c7d43be49..b6c555fde 100644
+--- a/zig/src/families/flashnext_mia/cuda_lanes_costs.zig
++++ b/zig/src/families/flashnext_mia/cuda_lanes_costs.zig
+@@ -8,6 +8,36 @@ const max_drafts = cl.max_drafts;
+ const max_streams = cl.max_streams;
+ const shared_points = cl.shared_points;
+ 
++/// A shared width's timing: untimed rounds of the timed shape first, then the median of the timed ones.
++pub const shared_warm = 4;
++pub const shared_reps = 9;
++/// Passes over every width; each width keeps its least median (a pass slowed by boot noise does not price it).
++pub const shared_passes = 2;
++
++/// One pass at one width: `shared_warm` untimed rounds, then the median of `shared_reps` timed ones (`round.ms`).
++pub fn passMs(round: anytype) !f64 {
++    for (0..shared_warm) |_| _ = try round.ms(false);
++    var times: [shared_reps]f64 = undefined;
++    for (&times) |*x| x.* = try round.ms(true);
++    return median(&times);
++}
++
++/// A shared round of every stream's full window and the head's drafts, as `passMs` runs it.
++fn SharedRound(comptime E: type) type {
++    return struct {
++        c: *Costing(E),
++        top: usize,
++        text: []const u32,
++        io: std.Io,
++
++        fn ms(s: @This(), timed: bool) !f64 {
++            var out: f64 = 0;
++            try s.c.round(s.top, s.text, if (timed) .{ .io = s.io, .out = &out } else null, s.top - 1);
++            return out;
++        }
++    };
++}
++
+ pub fn Measure(comptime E: type) type {
+     return struct {
+         const Self = lanes_core.Lanes(E);
+@@ -49,19 +79,37 @@ pub fn Measure(comptime E: type) type {
+                 self.cost_count += 1;
+             }
+             self.mtp_ms = k.level;
+-            // shared rounds: n streams' full windows in one forward
++            // shared rounds: n streams' full windows in one forward; each pass times every width, the least median kept
+             self.shared_count = 0;
+-            var n: usize = 2;
+-            while (n <= self.streams and self.shared_count < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
+-                var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
+-                defer many.deinit();
+-                try many.round(1, cont, null, 0);
+-                // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
+-                for (&times) |*x| try many.round(top, cont, .{ .io = io, .out = x }, top - 1);
+-                self.shared[self.shared_count] = .{ .width = @intCast(n * top), .ms = median(times[1..]) };
+-                self.shared_count += 1;
++            for (0..shared_passes) |pass| {
++                var i: usize = 0;
++                var n: usize = 2;
++                while (n <= self.streams and i < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
++                    var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
++                    defer many.deinit();
++                    // a whole shared round: forward, draws and the batched head's drafts (the allocator weighs rows)
++                    const got = try passMs(SharedRound(E){ .c = &many, .top = top, .text = cont, .io = io });
++                    if (pass == 0) self.shared[i] = .{ .width = @intCast(n * top), .ms = got } else self.shared[i].ms = @min(self.shared[i].ms, got);
++                    i += 1;
++                }
++                self.shared_count = i;
+             }
+         }
++
++        /// The cost tables in one line (rank 0 logs it at boot): verify ms by rows, a head level, shared ms by rows.
++        pub fn logCosts(self: *const Self) void {
++            var buf: [1024]u8 = undefined;
++            var n: usize = 0;
++            n += (std.fmt.bufPrint(buf[n..], "lanes costs: verify ", .{}) catch return).len;
++            for (self.costs[0..self.cost_count], 0..) |c, i| {
++                n += (std.fmt.bufPrint(buf[n..], "{s}{d}:{d:.1}", .{ if (i == 0) "" else ",", c.width, c.ms }) catch return).len;
++            }
++            n += (std.fmt.bufPrint(buf[n..], "; level {d:.2} ms; shared ", .{self.mtp_ms}) catch return).len;
++            for (self.shared[0..self.shared_count], 0..) |c, i| {
++                n += (std.fmt.bufPrint(buf[n..], "{s}{d}:{d:.1}", .{ if (i == 0) "" else ",", c.width, c.ms }) catch return).len;
++            }
++            std.log.info("{s}", .{buf[0..n]});
++        }
+     };
+ }
+ 
+@@ -157,3 +205,17 @@ fn median(xs: []f64) f64 {
+     std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+     return if (xs.len % 2 == 1) xs[xs.len / 2] else (xs[xs.len / 2 - 1] + xs[xs.len / 2]) / 2;
+ }
++
++test "shared round costs: a width's slow first rounds and one outlier rep leave its steady ms" {
++    // a fake clock: a width's first 5 rounds run slow (190 ms), its 10th is an outlier (500 ms), the rest take 125 ms
++    const Spiky = struct {
++        calls: *usize,
++        fn ms(f: @This(), _: bool) !f64 {
++            defer f.calls.* += 1;
++            return if (f.calls.* < 5) 190 else if (f.calls.* == 9) 500 else 125;
++        }
++    };
++    var calls: usize = 0;
++    try std.testing.expectEqual(@as(f64, 125), try passMs(Spiky{ .calls = &calls }));
++    try std.testing.expectEqual(@as(usize, shared_warm + shared_reps), calls);
++}
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index 4825955c5..dcde9130c 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -175,6 +175,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+         const ids = try costText(gpa, io, dir);
+         defer gpa.free(ids);
+         try own.lanes.measure(io, ids);
++        if (o.rank == 0) own.lanes.logCosts();
+     }
+     own.lanes.cache_budget = if (o.rank == 0) cacheBudget(o, &own.lanes) else 0; // rank 1 follows rank 0's notes
+     var backend = own.lanes.backend();
+@@ -402,6 +403,7 @@ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kern
+ test {
+     _ = mirror;
+     _ = lane_backend;
++    _ = @import("cuda_lanes_costs.zig");
+ }
+ 
+ test "open compiles over the engine" {

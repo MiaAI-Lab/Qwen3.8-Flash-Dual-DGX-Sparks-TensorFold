@@ -1,0 +1,1323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 03:17:27 +0700
+Subject: [PATCH 20/79] core: sandboxed compute lane executor (Landlock +
+ seccomp)
+
+The executor the compute lane runs a model's Python call in. Nothing uses it
+yet; the lane itself follows separately.
+
+- compute_lane.zig: Config (workers, wall/memory/output limits, result and
+  call caps, interpreter path, CPU list) parsed from PREFIX and PREFIX_*
+  knobs, where only "1" enables; a pool of sandbox slots and the supervisor
+  of one job: posix_spawn of the trampoline, pidfd, wall limit, output cap,
+  cancel.
+- compute_sandbox.zig: the trampoline a fresh process runs before exec'ing
+  Python: drops root to nobody, sets rlimits and CPU affinity, keeps an
+  inherited niceness at or above 10 (a dropped uid may not lower it), then
+  applies Landlock and seccomp.
+- compute_landlock.zig: read and execute beneath the interpreter's roots
+  only; no writes, no network, no signals out.
+- compute_seccomp.zig: native arch only; no sockets, tracing, namespaces or
+  child processes.
+- compute_runner.zig: the Python prelude (stdin source, REPL-style repr of a
+  final bare expression, seeded random) and the canonical, deterministic
+  result text of one job.
+
+Linux only: elsewhere a job is "unavailable". test-compute-lane-host runs
+jobs through the real sandbox: confinement, limits, output cap, cancel,
+niceness and result text.
+---
+ zig/build/compute_lane_host.zig         |  14 +
+ zig/build/cuda.zig                      |   1 +
+ zig/src/core/compute_landlock.zig       |  95 +++++++
+ zig/src/core/compute_lane.zig           | 349 ++++++++++++++++++++++++
+ zig/src/core/compute_lane_test.zig      | 286 +++++++++++++++++++
+ zig/src/core/compute_lane_unit_test.zig | 173 ++++++++++++
+ zig/src/core/compute_runner.zig         |  59 ++++
+ zig/src/core/compute_sandbox.zig        | 119 ++++++++
+ zig/src/core/compute_sandbox_main.zig   |  15 +
+ zig/src/core/compute_seccomp.zig        |  96 +++++++
+ 10 files changed, 1207 insertions(+)
+ create mode 100644 zig/build/compute_lane_host.zig
+ create mode 100644 zig/src/core/compute_landlock.zig
+ create mode 100644 zig/src/core/compute_lane.zig
+ create mode 100644 zig/src/core/compute_lane_test.zig
+ create mode 100644 zig/src/core/compute_lane_unit_test.zig
+ create mode 100644 zig/src/core/compute_runner.zig
+ create mode 100644 zig/src/core/compute_sandbox.zig
+ create mode 100644 zig/src/core/compute_sandbox_main.zig
+ create mode 100644 zig/src/core/compute_seccomp.zig
+
+diff --git a/zig/build/compute_lane_host.zig b/zig/build/compute_lane_host.zig
+new file mode 100644
+index 000000000..e3fde6fb0
+--- /dev/null
++++ b/zig/build/compute_lane_host.zig
+@@ -0,0 +1,14 @@
++//! The compute lane's sandbox host tests: the sandbox executable, then jobs through Landlock, seccomp and limits.
++const std = @import("std");
++
++pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, step: *std.Build.Step) void {
++    if (host.result.os.tag != .linux) return;
++    const sandbox_exe = b.addExecutable(.{ .name = "compute-sandbox", .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/compute_sandbox_main.zig"), .target = host, .optimize = .Debug, .link_libc = true }) });
++    const options = b.addOptions();
++    options.addOptionPath("sandbox_exe", sandbox_exe.getEmittedBin());
++    const tests = b.createModule(.{ .root_source_file = b.path("zig/src/core/compute_lane_test.zig"), .target = host, .optimize = .Debug, .link_libc = true });
++    tests.addOptions("compute_lane_options", options);
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = tests }));
++    b.step("test-compute-lane-host", "Sandboxed compute lane jobs: Landlock, seccomp, limits and result text").dependOn(&run.step);
++    step.dependOn(&run.step);
++}
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index a33d4aa5e..95f0e6b2f 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -205,6 +205,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("runtime_libraries.zig").tests(b, step);
+     const host = b.graph.host;
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
++    @import("compute_lane_host.zig").steps(b, host, step);
+     // the SASS profile rule (cuda_kernels.zig) and the -Dgpu check of prebuilt images
+     for ([_][]const u8{ "zig/build/cuda_kernels.zig", "zig/build/check_product_fatbins.zig" }) |root|
+         step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(root), .target = host }) })).step);
+diff --git a/zig/src/core/compute_landlock.zig b/zig/src/core/compute_landlock.zig
+new file mode 100644
+index 000000000..55b222f1b
+--- /dev/null
++++ b/zig/src/core/compute_landlock.zig
+@@ -0,0 +1,95 @@
++//! The compute sandbox's Landlock ruleset: read and run beneath the interpreter's roots; no network, no signals out.
++const std = @import("std");
++const linux = std.os.linux;
++
++const RulesetAttr = extern struct { handled_access_fs: u64, handled_access_net: u64, scoped: u64 };
++const PathBeneath = extern struct { allowed_access: u64 align(1), parent_fd: i32 align(1) };
++
++pub const fs = struct {
++    pub const execute: u64 = 1 << 0;
++    pub const write_file: u64 = 1 << 1;
++    pub const read_file: u64 = 1 << 2;
++    pub const read_dir: u64 = 1 << 3;
++    /// Every filesystem right of ABI 6 (EXECUTE through IOCTL_DEV).
++    pub const all: u64 = (1 << 16) - 1;
++};
++const net_bind_tcp: u64 = 1 << 0;
++const net_connect_tcp: u64 = 1 << 1;
++const scope_abstract_unix: u64 = 1 << 0;
++const scope_signal: u64 = 1 << 1;
++const create_ruleset_version: u32 = 1 << 0;
++const rule_path_beneath: u32 = 1;
++pub const min_abi = 6;
++
++/// A failed step and its errno.
++pub const Fail = struct { step: []const u8, errno: u16 };
++
++extern "c" fn realpath(noalias path: [*:0]const u8, noalias resolved: [*]u8) ?[*:0]u8;
++
++fn fail(step: []const u8, rc: usize) ?Fail {
++    const e = linux.errno(rc);
++    return .{ .step = step, .errno = code(if (e == .SUCCESS) .INVAL else e) };
++}
++
++fn code(e: linux.E) u16 {
++    return @intCast(@backingInt(e));
++}
++
++/// The interpreter's install root when it lives outside /usr: dirname(dirname(realpath)); null under /usr.
++pub fn installRoot(real: []const u8) error{Root}!?[]const u8 {
++    if (std.mem.startsWith(u8, real, "/usr/")) return null;
++    const bin = std.fs.path.dirnamePosix(real) orelse return error.Root;
++    const root = std.fs.path.dirnamePosix(bin) orelse return error.Root;
++    if (std.mem.eql(u8, root, "/")) return error.Root; // a root of "/" would open everything
++    return root;
++}
++
++/// Restricts the calling process to the compute ruleset for `python`; null on success, else the failed step.
++pub fn apply(python: [*:0]const u8) ?Fail {
++    const abi = linux.syscall3(.landlock_create_ruleset, 0, 0, create_ruleset_version);
++    if (linux.errno(abi) != .SUCCESS) return fail("landlock abi", abi);
++    if (abi < min_abi) return .{ .step = "landlock abi 6", .errno = code(.NOSYS) };
++    const attr: RulesetAttr = .{
++        .handled_access_fs = fs.all,
++        .handled_access_net = net_bind_tcp | net_connect_tcp,
++        .scoped = scope_abstract_unix | scope_signal,
++    };
++    const made = linux.syscall3(.landlock_create_ruleset, @intFromPtr(&attr), @sizeOf(RulesetAttr), 0);
++    if (linux.errno(made) != .SUCCESS) return fail("landlock ruleset", made);
++    const ruleset: i32 = @intCast(made);
++    defer _ = linux.close(ruleset);
++    const run = fs.read_file | fs.read_dir | fs.execute;
++    if (rule(ruleset, "/usr", run, true)) |f| return f;
++    var buf: [4096]u8 = undefined;
++    var path: [4096]u8 = undefined;
++    const real = std.mem.span(realpath(python, &buf) orelse return .{ .step = "interpreter", .errno = code(.NOENT) });
++    const root = installRoot(real) catch return .{ .step = "interpreter root", .errno = code(.INVAL) };
++    if (root) |r| {
++        const z = std.mem.printSentinel(&path, "{s}", .{r}, 0) catch return .{ .step = "interpreter root", .errno = code(.NAMETOOLONG) };
++        if (rule(ruleset, z, run, true)) |f| return f;
++    }
++    // distributions link the stdlib's sitecustomize.py into /etc: that one file, not its directory
++    const site = std.mem.printSentinel(&path, "{s}/lib/{s}/sitecustomize.py", .{ root orelse "/usr", std.fs.path.basenamePosix(real) }, 0) catch "";
++    if (site.len > 0) if (realpath(site, &buf)) |target| {
++        if (rule(ruleset, std.mem.span(target), fs.read_file, false)) |f| return f;
++    };
++    if (rule(ruleset, "/etc/ld.so.cache", fs.read_file, false)) |f| return f;
++    if (rule(ruleset, "/dev/urandom", fs.read_file, false)) |f| return f;
++    if (rule(ruleset, "/dev/null", fs.read_file | fs.write_file, false)) |f| return f;
++    const done = linux.syscall2(.landlock_restrict_self, @intCast(ruleset), 0);
++    if (linux.errno(done) != .SUCCESS) return fail("landlock restrict", done);
++    return null;
++}
++
++/// Grants `access` beneath `path`; a missing optional path is skipped.
++fn rule(ruleset: i32, path: [:0]const u8, access: u64, required: bool) ?Fail {
++    const opened = linux.open(path.ptr, .{ .PATH = true, .CLOEXEC = true }, 0);
++    if (linux.errno(opened) == .NOENT and !required) return null;
++    if (linux.errno(opened) != .SUCCESS) return fail(path, opened);
++    const fd: i32 = @intCast(opened);
++    defer _ = linux.close(fd);
++    const beneath: PathBeneath = .{ .allowed_access = access, .parent_fd = fd };
++    const added = linux.syscall4(.landlock_add_rule, @intCast(ruleset), rule_path_beneath, @intFromPtr(&beneath), 0);
++    if (linux.errno(added) != .SUCCESS) return fail(path, added);
++    return null;
++}
+diff --git a/zig/src/core/compute_lane.zig b/zig/src/core/compute_lane.zig
+new file mode 100644
+index 000000000..84796dfc2
+--- /dev/null
++++ b/zig/src/core/compute_lane.zig
+@@ -0,0 +1,349 @@
++//! The compute lane's executor: its knobs, a pool of sandbox slots and the supervisor of one sandboxed job.
++const std = @import("std");
++const builtin = @import("builtin");
++const linux = std.os.linux;
++const Allocator = std.mem.Allocator;
++const sandbox = @import("compute_sandbox.zig");
++const log = std.log.scoped(.compute_lane);
++
++pub const Config = struct {
++    workers: u8 = 2, // concurrent sandboxes
++    max_ms: u32 = 10_000, // wall limit per job
++    max_output_bytes: u32 = 64 * 1024, // stdout+stderr cap; past it the job is killed
++    max_result_tokens: u32 = 512, // result body cap, applied by the server
++    max_calls: u32 = 8, // built-in calls per reply, applied by the server
++    mem_mb: u32 = 1024, // RLIMIT_AS
++    python: []const u8 = "/usr/bin/python3",
++    cpus: []const u8 = "", // optional affinity list like "16-19" or "1,3,5-7"
++
++    /// PREFIX "1" enables (unset, "" or "0": null); PREFIX_* knobs override defaults; a bad value is error.BadKnob.
++    pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!?Config {
++        const on = get(prefix) orelse return null;
++        if (on.len == 0 or std.mem.eql(u8, on, "0")) return null;
++        if (!std.mem.eql(u8, on, "1")) return bad(prefix, on);
++        var c: Config = .{};
++        c.workers = try knob(u8, get, prefix ++ "_WORKERS", c.workers, 1, 64);
++        c.max_ms = try knob(u32, get, prefix ++ "_MAX_MS", c.max_ms, 1, 3_600_000);
++        c.max_result_tokens = try knob(u32, get, prefix ++ "_MAX_RESULT_TOKENS", c.max_result_tokens, 1, 1 << 20);
++        c.max_calls = try knob(u32, get, prefix ++ "_MAX_CALLS", c.max_calls, 1, 1024);
++        c.mem_mb = try knob(u32, get, prefix ++ "_MEM_MB", c.mem_mb, 64, 1 << 20);
++        if (get(prefix ++ "_PYTHON")) |p| if (p.len > 0) {
++            if (p[0] != '/') return bad(prefix ++ "_PYTHON", p);
++            c.python = p;
++        };
++        if (get(prefix ++ "_CPUS")) |s| if (s.len > 0) {
++            var set: [16]u64 = undefined;
++            if (!sandbox.cpuList(s, &set)) return bad(prefix ++ "_CPUS", s);
++            c.cpus = s;
++        };
++        return c;
++    }
++
++    fn knob(comptime T: type, get: *const fn ([]const u8) ?[]const u8, comptime name: []const u8, default: T, min: T, max: T) error{BadKnob}!T {
++        const text = get(name) orelse return default;
++        if (text.len == 0) return default;
++        const v = std.fmt.parseInt(T, text, 10) catch return bad(name, text);
++        if (v < min or v > max) return bad(name, text);
++        return v;
++    }
++
++    fn bad(name: []const u8, value: []const u8) error{BadKnob} {
++        log.warn("{s}={s} is not a valid value", .{ name, value });
++        return error.BadKnob;
++    }
++};
++
++pub const Status = enum { ok, exit_error, timeout, output_limit, cancelled, unavailable };
++pub const Outcome = struct {
++    status: Status,
++    exit_code: ?u8 = null,
++    signal: ?u8 = null,
++    stdout: []const u8 = "",
++    stderr: []const u8 = "",
++    exec_ns: u64 = 0,
++};
++/// A caller's hook: `gone` turns true once the job's result is no longer wanted (client disconnected).
++pub const Cancel = struct { ctx: *anyopaque, gone: *const fn (ctx: *anyopaque) bool };
++
++pub const Pool = struct {
++    cfg: Config,
++    launcher: []const []const u8,
++    busy: std.atomic.Value(u32) = .init(0),
++
++    /// `launcher`: argv prefix that starts the trampoline, e.g. {"/proc/self/exe", "__compute_sandbox"}.
++    pub fn init(cfg: Config, launcher: []const []const u8) Pool {
++        return .{ .cfg = cfg, .launcher = launcher };
++    }
++
++    /// Waits for a free slot, runs `code` in the sandbox and frees the slot; failures to start are .unavailable.
++    pub fn run(p: *Pool, a: Allocator, code: []const u8, cancel: ?Cancel) Allocator.Error!Outcome {
++        if (builtin.os.tag != .linux) return .{ .status = .unavailable, .stderr = "compute lane: Linux only" } else {
++            if (!p.acquire(cancel)) return .{ .status = .cancelled };
++            defer _ = p.busy.fetchSub(1, .release);
++            return supervise(p.cfg, a, p.launcher, code, cancel);
++        }
++    }
++
++    /// Runs `print(1+1)`; anything but status ok with stdout "2\n" is error.SandboxUnavailable.
++    pub fn selfTest(p: *Pool, a: Allocator) !void {
++        const o = try p.run(a, "print(1+1)", null);
++        if (o.status == .ok and std.mem.eql(u8, o.stdout, "2\n")) return;
++        log.warn("compute lane self-test failed: {s}, stdout \"{s}\", stderr \"{s}\"", .{ @tagName(o.status), o.stdout, o.stderr });
++        return error.SandboxUnavailable;
++    }
++
++    fn acquire(p: *Pool, cancel: ?Cancel) bool {
++        while (true) {
++            const n = p.busy.load(.acquire);
++            if (n < p.cfg.workers) {
++                if (p.busy.cmpxchgWeak(n, n + 1, .acquire, .monotonic) == null) return true;
++                continue;
++            }
++            if (cancel) |c| if (c.gone(c.ctx)) return false;
++            sleepMs(10);
++        }
++    }
++};
++
++const libc = struct {
++    extern "c" fn posix_spawn(pid: *linux.pid_t, path: [*:0]const u8, actions: *const Opaque, attr: *const Opaque, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
++    extern "c" fn posix_spawn_file_actions_init(actions: *Opaque) c_int;
++    extern "c" fn posix_spawn_file_actions_destroy(actions: *Opaque) c_int;
++    extern "c" fn posix_spawn_file_actions_adddup2(actions: *Opaque, fd: c_int, to: c_int) c_int;
++    extern "c" fn posix_spawnattr_init(attr: *Opaque) c_int;
++    extern "c" fn posix_spawnattr_destroy(attr: *Opaque) c_int;
++    extern "c" fn posix_spawnattr_setflags(attr: *Opaque, flags: c_short) c_int;
++    extern "c" fn posix_spawnattr_setsigmask(attr: *Opaque, set: *const Opaque) c_int;
++    extern "c" fn posix_spawnattr_setsigdefault(attr: *Opaque, set: *const Opaque) c_int;
++    extern "c" fn sigemptyset(set: *Opaque) c_int;
++    extern "c" fn sigfillset(set: *Opaque) c_int;
++};
++/// Storage for libc's spawn attributes, file actions and sigset_t, larger than glibc's and musl's.
++const Opaque = extern struct { bytes: [512]u8 align(16) = undefined };
++const spawn_setsigdef: c_short = 0x04;
++const spawn_setsigmask: c_short = 0x08;
++const ns_per_ms = std.time.ns_per_ms;
++// pipe ends: stdin read/write, stdout read/write, stderr read/write
++const in_r = 0;
++const in_w = 1;
++const out_r = 2;
++const out_w = 3;
++const err_r = 4;
++const err_w = 5;
++
++fn supervise(cfg: Config, a: Allocator, launcher: []const []const u8, code: []const u8, cancel: ?Cancel) Allocator.Error!Outcome {
++    if (launcher.len == 0) return unavailable(a, "launcher", @intCast(@backingInt(linux.E.INVAL)));
++    const argv = try sandbox.encode(a, launcher, .{ .max_ms = cfg.max_ms, .mem_mb = cfg.mem_mb, .cpus = cfg.cpus, .python = cfg.python });
++    var fds: [6]linux.fd_t = @splat(-1);
++    defer for (fds) |fd| if (fd >= 0) close(fd);
++    for (0..3) |i| {
++        var pair: [2]linux.fd_t = undefined;
++        const rc = linux.pipe2(&pair, .{ .CLOEXEC = true });
++        if (linux.errno(rc) != .SUCCESS) return unavailable(a, "pipe", errno(rc));
++        fds[2 * i] = pair[0];
++        fds[2 * i + 1] = pair[1];
++    }
++    for ([_]usize{ in_w, out_r, err_r }) |i| {
++        const flags = linux.fcntl(fds[i], linux.F.GETFL, 0);
++        const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
++        const rc = linux.fcntl(fds[i], linux.F.SETFL, flags | nonblock);
++        if (linux.errno(rc) != .SUCCESS) return unavailable(a, "fcntl", errno(rc));
++    }
++    var pid: linux.pid_t = 0;
++    const failed = spawn(&pid, argv, fds[in_r], fds[out_w], fds[err_w]);
++    if (failed != 0) return unavailable(a, "posix_spawn", failed);
++    for ([_]usize{ in_r, out_w, err_w }) |i| {
++        close(fds[i]);
++        fds[i] = -1;
++    }
++    const start = now();
++    const opened = linux.pidfd_open(pid, 0);
++    if (linux.errno(opened) != .SUCCESS) {
++        _ = linux.kill(pid, .KILL);
++        _ = reap(pid);
++        return unavailable(a, "pidfd_open", errno(opened));
++    }
++    const pidfd: linux.fd_t = @intCast(opened);
++    defer close(pidfd);
++    var io: Pipes = .{ .fds = &fds, .cap = cfg.max_output_bytes };
++    if (code.len == 0) io.shut(in_w);
++    const ours = io.loop(a, pidfd, code, start + @as(u64, cfg.max_ms) * ns_per_ms, cancel) catch |e| {
++        _ = linux.kill(pid, .KILL);
++        _ = reap(pid);
++        return e;
++    };
++    if (ours != null) _ = linux.kill(pid, .KILL);
++    const st = reap(pid);
++    const o: Outcome = .{ .status = .ok, .stdout = try io.out.toOwnedSlice(a), .stderr = try io.err.toOwnedSlice(a), .exec_ns = now() - start };
++    return classify(o, ours, st);
++}
++
++fn classify(o: Outcome, ours: ?Status, st: ?u32) Outcome {
++    var r = o;
++    if (ours) |s| {
++        r.status = s;
++        return r;
++    }
++    const w = st orelse {
++        r.status = .unavailable;
++        return r;
++    };
++    if (linux.W.IFEXITED(w)) {
++        const code = linux.W.EXITSTATUS(w);
++        r.status = if (code == 0) .ok else .exit_error;
++        if (code == 125 and std.mem.startsWith(u8, r.stderr, "compute sandbox: ")) r.status = .unavailable;
++        if (code != 0) r.exit_code = code;
++    } else {
++        r.status = .exit_error;
++        r.signal = @intCast(@backingInt(linux.W.TERMSIG(w)));
++    }
++    return r;
++}
++
++/// The supervisor's side of one job's pipes: feeds stdin, collects capped stdout and stderr.
++const Pipes = struct {
++    fds: *[6]linux.fd_t,
++    cap: u32,
++    out: std.ArrayList(u8) = .empty,
++    err: std.ArrayList(u8) = .empty,
++    written: usize = 0,
++
++    fn shut(io: *Pipes, i: usize) void {
++        close(io.fds[i]);
++        io.fds[i] = -1;
++    }
++
++    /// Polls until the child exits with both pipes drained (null), or the status the supervisor kills it for.
++    fn loop(io: *Pipes, a: Allocator, pidfd: linux.fd_t, code: []const u8, deadline: u64, cancel: ?Cancel) Allocator.Error!?Status {
++        var exited = false;
++        while (io.fds[out_r] >= 0 or io.fds[err_r] >= 0 or !exited) {
++            if (cancel) |cn| if (cn.gone(cn.ctx)) return .cancelled;
++            const t = now();
++            if (t >= deadline) return .timeout;
++            const wait: i32 = @intCast(@min(50, (deadline - t + ns_per_ms - 1) / ns_per_ms));
++            var pf = [_]linux.pollfd{
++                .{ .fd = io.fds[out_r], .events = linux.POLL.IN },
++                .{ .fd = io.fds[err_r], .events = linux.POLL.IN },
++                .{ .fd = if (exited) -1 else pidfd, .events = linux.POLL.IN },
++                .{ .fd = io.fds[in_w], .events = linux.POLL.OUT },
++            };
++            const rc = linux.poll(&pf, pf.len, wait);
++            if (linux.errno(rc) == .INTR) continue;
++            if (linux.errno(rc) != .SUCCESS) return .unavailable;
++            if (pf[3].revents != 0) io.feed(code);
++            if (pf[0].revents != 0 and try io.drain(a, out_r, &io.out)) return .output_limit;
++            if (pf[1].revents != 0 and try io.drain(a, err_r, &io.err)) return .output_limit;
++            if (pf[2].revents != 0) exited = true;
++        }
++        return null;
++    }
++
++    fn feed(io: *Pipes, code: []const u8) void {
++        const rc = writeNoSigpipe(io.fds[in_w], code[io.written..]);
++        switch (linux.errno(rc)) {
++            .SUCCESS => io.written += rc,
++            .AGAIN, .INTR => {},
++            else => io.written = code.len, // the child closed stdin: nothing more to give it
++        }
++        if (io.written >= code.len) io.shut(in_w);
++    }
++
++    /// Reads what is ready from pipe `i`; true once stdout and stderr together pass the cap.
++    fn drain(io: *Pipes, a: Allocator, i: usize, into: *std.ArrayList(u8)) Allocator.Error!bool {
++        var buf: [16 * 1024]u8 = undefined;
++        const rc = linux.read(io.fds[i], &buf, buf.len);
++        switch (linux.errno(rc)) {
++            .SUCCESS => {},
++            .AGAIN, .INTR => return false,
++            else => {
++                io.shut(i);
++                return false;
++            },
++        }
++        if (rc == 0) {
++            io.shut(i);
++            return false;
++        }
++        const room = io.cap -| (io.out.items.len + io.err.items.len);
++        try into.appendSlice(a, buf[0..@min(rc, room)]);
++        return rc > room;
++    }
++};
++
++/// Writes with SIGPIPE blocked on this thread, consuming the one an EPIPE raises.
++fn writeNoSigpipe(fd: linux.fd_t, bytes: []const u8) usize {
++    var set = linux.sigemptyset();
++    linux.sigaddset(&set, .PIPE);
++    var old: linux.sigset_t = undefined;
++    _ = linux.sigprocmask(linux.SIG.BLOCK, &set, &old);
++    defer _ = linux.sigprocmask(linux.SIG.SETMASK, &old, null);
++    const rc = linux.write(fd, bytes.ptr, bytes.len);
++    if (linux.errno(rc) == .PIPE) {
++        const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
++        _ = linux.syscall4(.rt_sigtimedwait, @intFromPtr(&set), 0, @intFromPtr(&zero), @sizeOf(linux.sigset_t));
++    }
++    return rc;
++}
++
++/// Starts the trampoline with the pipe ends as its stdio, an empty signal mask and default handlers; 0 or the errno.
++fn spawn(pid: *linux.pid_t, argv: [:null]?[*:0]const u8, stdin: linux.fd_t, stdout: linux.fd_t, stderr: linux.fd_t) u16 {
++    var actions: Opaque = .{};
++    var attr: Opaque = .{};
++    var empty: Opaque = .{};
++    var all: Opaque = .{};
++    var rc = libc.posix_spawn_file_actions_init(&actions);
++    if (rc != 0) return spawnErrno(rc);
++    defer _ = libc.posix_spawn_file_actions_destroy(&actions);
++    rc = libc.posix_spawnattr_init(&attr);
++    if (rc != 0) return spawnErrno(rc);
++    defer _ = libc.posix_spawnattr_destroy(&attr);
++    for ([_][2]linux.fd_t{ .{ stdin, 0 }, .{ stdout, 1 }, .{ stderr, 2 } }) |d| {
++        if (rc == 0) rc = libc.posix_spawn_file_actions_adddup2(&actions, d[0], d[1]);
++    }
++    if (rc == 0) rc = libc.sigemptyset(&empty) | libc.sigfillset(&all);
++    if (rc == 0) rc = libc.posix_spawnattr_setsigmask(&attr, &empty);
++    if (rc == 0) rc = libc.posix_spawnattr_setsigdefault(&attr, &all);
++    if (rc == 0) rc = libc.posix_spawnattr_setflags(&attr, spawn_setsigmask | spawn_setsigdef);
++    if (rc == 0) rc = libc.posix_spawn(pid, argv[0].?, &actions, &attr, argv.ptr, &[_:null]?[*:0]const u8{});
++    return spawnErrno(rc);
++}
++
++fn spawnErrno(rc: c_int) u16 {
++    return if (rc >= 0 and rc < 4096) @intCast(rc) else @intCast(@backingInt(linux.E.INVAL));
++}
++
++/// The child's wait status, or null when it cannot be reaped.
++fn reap(pid: linux.pid_t) ?u32 {
++    while (true) {
++        var st: i32 = 0;
++        const rc = linux.wait4(pid, &st, 0, null);
++        switch (linux.errno(rc)) {
++            .SUCCESS => return @bitCast(st),
++            .INTR => continue,
++            else => return null,
++        }
++    }
++}
++
++fn unavailable(a: Allocator, step: []const u8, e: u16) Allocator.Error!Outcome {
++    return .{ .status = .unavailable, .stderr = try std.fmt.allocPrint(a, "compute lane: {s} failed (errno {d})", .{ step, e }) };
++}
++
++fn errno(rc: usize) u16 {
++    return @intCast(@backingInt(linux.errno(rc)));
++}
++
++fn close(fd: linux.fd_t) void {
++    _ = linux.close(fd);
++}
++
++fn now() u64 {
++    var ts: linux.timespec = undefined;
++    _ = linux.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
++}
++
++fn sleepMs(ms: u32) void {
++    const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(@as(u64, ms) * ns_per_ms) };
++    _ = linux.nanosleep(&ts, null);
++}
+diff --git a/zig/src/core/compute_lane_test.zig b/zig/src/core/compute_lane_test.zig
+new file mode 100644
+index 000000000..eb2ab2cc7
+--- /dev/null
++++ b/zig/src/core/compute_lane_test.zig
+@@ -0,0 +1,286 @@
++//! Compute lane jobs through the real trampoline: results, limits, cancellation, slots and every confinement layer.
++const std = @import("std");
++const builtin = @import("builtin");
++const lane = @import("compute_lane.zig");
++const linux = std.os.linux;
++const expect = std.testing.expect;
++const expectEqual = std.testing.expectEqual;
++const expectEqualStrings = std.testing.expectEqualStrings;
++
++test {
++    _ = @import("compute_lane_unit_test.zig");
++}
++
++const launcher = [_][]const u8{@import("compute_lane_options").sandbox_exe};
++const python = "/usr/bin/python3";
++
++extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++
++/// Skips off Linux or without the interpreter; a missing Landlock or seccomp is a failure, not a skip.
++fn ready() !void {
++    if (builtin.os.tag != .linux) return error.SkipZigTest;
++    const fd = linux.open(python, .{ .PATH = true, .CLOEXEC = true }, 0);
++    if (linux.errno(fd) != .SUCCESS) return error.SkipZigTest;
++    _ = linux.close(@intCast(fd));
++}
++
++fn now() u64 {
++    if (builtin.os.tag != .linux) return 0;
++    var ts: linux.timespec = undefined;
++    _ = linux.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
++}
++
++const Job = struct {
++    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
++    fn deinit(j: *Job) void {
++        j.arena.deinit();
++    }
++    fn run(j: *Job, cfg: lane.Config, code: []const u8, cancel: ?lane.Cancel) !lane.Outcome {
++        var pool: lane.Pool = .init(cfg, &launcher);
++        return pool.run(j.arena.allocator(), code, cancel);
++    }
++    /// Runs `code` and requires `status`, showing the job's output when it differs.
++    fn expectStatus(j: *Job, cfg: lane.Config, code: []const u8, status: lane.Status) !lane.Outcome {
++        const o = try j.run(cfg, code, null);
++        if (o.status != status) {
++            std.debug.print("status {s}, exit {?d}, signal {?d}\nstdout: {s}\nstderr: {s}\n", .{ @tagName(o.status), o.exit_code, o.signal, o.stdout, o.stderr });
++            return error.TestUnexpectedResult;
++        }
++        return o;
++    }
++};
++
++test "compute sandbox: self test passes (Landlock and seccomp present)" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    var pool: lane.Pool = .init(.{}, &launcher);
++    try pool.selfTest(j.arena.allocator());
++}
++
++test "compute sandbox: a job from a thread at nice 19 runs and keeps that niceness" {
++    try ready();
++    const Run = struct {
++        status: lane.Status = .unavailable,
++        out: []const u8 = "",
++        fn go(r: *@This(), j: *Job) void {
++            _ = linux.syscall3(.setpriority, 0, 0, 19); // this thread only: the job inherits it
++            const o = j.expectStatus(.{}, "import os\nos.nice(0)", .ok) catch return;
++            r.status = o.status;
++            r.out = o.stdout;
++        }
++    };
++    var j: Job = .{};
++    defer j.deinit();
++    var r: Run = .{};
++    const t = try std.Thread.spawn(.{}, Run.go, .{ &r, &j });
++    t.join();
++    try expectEqual(lane.Status.ok, r.status);
++    try expectEqualStrings("19\n", r.out);
++}
++
++test "compute sandbox: final expression prints its repr" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const o = try j.expectStatus(.{}, "x=20\nx+22", .ok);
++    try expectEqualStrings("42\n", o.stdout);
++    try expectEqualStrings("", o.stderr);
++    const s = try j.expectStatus(.{}, "s='a'\ns\nNone", .ok);
++    try expectEqualStrings("", s.stdout);
++}
++
++test "compute sandbox: an exception exits 1 with the user's traceback only" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const o = try j.expectStatus(.{}, "1/0", .exit_error);
++    errdefer std.debug.print("stderr: {s}\n", .{o.stderr});
++    try expectEqual(@as(?u8, 1), o.exit_code);
++    try expect(std.mem.find(u8, o.stderr, "ZeroDivisionError") != null);
++    try expect(std.mem.find(u8, o.stderr, "<code>") != null);
++    try expect(std.mem.find(u8, o.stderr, "<string>") == null); // the runner's own frame
++    try expect(std.mem.find(u8, o.stderr, "ast.py") == null);
++    try expect(std.mem.find(u8, o.stderr, "exec(compile") == null);
++    try expect(std.mem.startsWith(u8, o.stderr, "Traceback (most recent call last):\n  File \"<code>\", line 1, in <module>\n"));
++    const e = try j.expectStatus(.{}, "def f(:\n", .exit_error);
++    try expect(std.mem.find(u8, e.stderr, "SyntaxError") != null);
++    try expect(std.mem.find(u8, e.stderr, "<string>") == null);
++    const x = try j.expectStatus(.{}, "import sys\nprint('bye')\nsys.exit(3)", .exit_error);
++    try expectEqual(@as(?u8, 3), x.exit_code);
++    try expectEqualStrings("bye\n", x.stdout);
++}
++
++test "compute sandbox: no network" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const code = "import socket\ntry:\n socket.socket()\n print('open')\nexcept OSError as e:\n print('denied', e.errno)";
++    try expectEqualStrings("denied 1\n", (try j.expectStatus(.{}, code, .ok)).stdout);
++}
++
++test "compute sandbox: no files outside the interpreter" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const code =
++        \\import os
++        \\def check(name, f):
++        \\    try:
++        \\        f()
++        \\        print(name, 'open')
++        \\    except OSError:
++        \\        print(name, 'denied')
++        \\check('passwd', lambda: open('/etc/passwd').read())
++        \\check('root', lambda: os.listdir('/'))
++        \\check('proc', lambda: os.listdir('/proc'))
++        \\check('home', lambda: os.listdir('/home'))
++        \\check('roothome', lambda: os.listdir('/root'))
++        \\check('tmp', lambda: open('/tmp/x', 'w').write('x'))
++        \\check('cwd', lambda: open('x', 'w').write('x'))
++        \\check('usr', lambda: open('/usr/x', 'w').write('x'))
++    ;
++    const want = "passwd denied\nroot denied\nproc denied\nhome denied\nroothome denied\ntmp denied\ncwd denied\nusr denied\n";
++    try expectEqualStrings(want, (try j.expectStatus(.{}, code, .ok)).stdout);
++}
++
++test "compute sandbox: the engine's environment never reaches the job" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    try expectEqual(@as(c_int, 0), setenv("TF_COMPUTE_CANARY", "secret", 1));
++    const o = try j.expectStatus(.{}, "import os\nsorted(os.environ)", .ok);
++    const keys = "'LANG', 'PATH', 'PYTHONDONTWRITEBYTECODE', 'PYTHONHASHSEED', 'PYTHONIOENCODING'";
++    const with_ctype = "['LANG', 'LC_CTYPE', 'PATH', 'PYTHONDONTWRITEBYTECODE', 'PYTHONHASHSEED', 'PYTHONIOENCODING']\n";
++    if (!std.mem.eql(u8, o.stdout, with_ctype)) try expectEqualStrings("[" ++ keys ++ "]\n", o.stdout);
++}
++
++test "compute sandbox: threads run, fork does not" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const code =
++        \\import os, threading
++        \\try:
++        \\    os.fork()
++        \\    print('forked')
++        \\except OSError as e:
++        \\    print('fork denied', e.errno)
++        \\out = []
++        \\t = threading.Thread(target=lambda: out.append(1))
++        \\t.start()
++        \\t.join()
++        \\print('thread', out)
++    ;
++    try expectEqualStrings("fork denied 1\nthread [1]\n", (try j.expectStatus(.{}, code, .ok)).stdout);
++}
++
++test "compute sandbox: the job cannot signal outside its sandbox" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const code = "import os\ntry:\n os.kill(os.getppid(), 0)\n print('reached')\nexcept OSError as e:\n print('denied', e.errno)";
++    try expectEqualStrings("denied 1\n", (try j.expectStatus(.{}, code, .ok)).stdout);
++}
++
++test "compute sandbox: never runs as root" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const o = try j.expectStatus(.{}, "import os\nprint(os.getuid(), os.geteuid())", .ok);
++    const uid = linux.getuid();
++    const child: u32 = if (uid == 0) 65534 else uid;
++    var buf: [32]u8 = undefined;
++    try expectEqualStrings(try std.fmt.bufPrint(&buf, "{d} {d}\n", .{ child, child }), o.stdout);
++}
++
++test "compute sandbox: the wall limit kills a busy job" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const t = now();
++    const o = try j.expectStatus(.{ .max_ms = 500 }, "print('start')\nwhile True: pass", .timeout);
++    try expect(now() - t < 3 * std.time.ns_per_s);
++    try expect(o.exec_ns >= 500 * std.time.ns_per_ms and o.exec_ns < 3 * std.time.ns_per_s);
++    try expectEqualStrings("start\n", o.stdout);
++}
++
++test "compute sandbox: the output cap keeps the first bytes and kills" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const o = try j.expectStatus(.{ .max_output_bytes = 1000 }, "print('x'*100000)\nimport time\ntime.sleep(5)", .output_limit);
++    try expectEqual(@as(usize, 1000), o.stdout.len);
++    try expect(o.exec_ns < 3 * std.time.ns_per_s);
++}
++
++test "compute sandbox: the memory cap" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const o = try j.expectStatus(.{ .mem_mb = 256 }, "b=bytearray(2*1024**3)", .exit_error);
++    try expect(std.mem.find(u8, o.stderr, "MemoryError") != null);
++}
++
++const Gone = struct {
++    start: u64,
++    fn gone(ctx: *anyopaque) bool {
++        const g: *Gone = @ptrCast(@alignCast(ctx));
++        return now() - g.start > 200 * std.time.ns_per_ms;
++    }
++};
++
++test "compute sandbox: a cancelled job is killed promptly" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    var g: Gone = .{ .start = now() };
++    const o = try j.run(.{}, "import time\ntime.sleep(5)", .{ .ctx = &g, .gone = Gone.gone });
++    try expectEqual(lane.Status.cancelled, o.status);
++    try expect(now() - g.start < 1500 * std.time.ns_per_ms);
++}
++
++fn slot(pool: *lane.Pool, out: *lane.Status) void {
++    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
++    defer arena.deinit();
++    const o = pool.run(arena.allocator(), "import time;time.sleep(0.3);print(1)", null) catch {
++        out.* = .unavailable;
++        return;
++    };
++    out.* = if (std.mem.eql(u8, o.stdout, "1\n")) o.status else .exit_error;
++}
++
++test "compute sandbox: one worker runs jobs one at a time" {
++    try ready();
++    var pool: lane.Pool = .init(.{ .workers = 1 }, &launcher);
++    var got = [_]lane.Status{ .unavailable, .unavailable };
++    const t = now();
++    var threads: [2]std.Thread = undefined;
++    for (&threads, &got) |*th, *g| th.* = try std.Thread.spawn(.{}, slot, .{ &pool, g });
++    for (threads) |th| th.join();
++    try expectEqual([_]lane.Status{ .ok, .ok }, got);
++    try expect(now() - t >= 600 * std.time.ns_per_ms);
++    try expectEqual(@as(u32, 0), pool.busy.load(.acquire));
++}
++
++test "compute sandbox: hash seed and random are fixed" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const code = "print(hash('abc'));import random;print(random.random())";
++    const first = try j.expectStatus(.{}, code, .ok);
++    const second = try j.expectStatus(.{}, code, .ok);
++    try expectEqualStrings(first.stdout, second.stdout);
++}
++
++test "compute sandbox: a missing interpreter is unavailable and fails the self test" {
++    try ready();
++    var j: Job = .{};
++    defer j.deinit();
++    const cfg: lane.Config = .{ .python = "/usr/bin/no-such-python" };
++    const o = try j.expectStatus(cfg, "print(1)", .unavailable);
++    try expect(std.mem.startsWith(u8, o.stderr, "compute sandbox: "));
++    var pool: lane.Pool = .init(cfg, &launcher);
++    try std.testing.expectError(error.SandboxUnavailable, pool.selfTest(j.arena.allocator()));
++}
+diff --git a/zig/src/core/compute_lane_unit_test.zig b/zig/src/core/compute_lane_unit_test.zig
+new file mode 100644
+index 000000000..07e729e77
+--- /dev/null
++++ b/zig/src/core/compute_lane_unit_test.zig
+@@ -0,0 +1,173 @@
++//! Compute lane checks that spawn nothing: knobs, the result body, the trampoline's arguments and the seccomp filter.
++const std = @import("std");
++const builtin = @import("builtin");
++const lane = @import("compute_lane.zig");
++const runner = @import("compute_runner.zig");
++const sandbox = @import("compute_sandbox.zig");
++const seccomp = @import("compute_seccomp.zig");
++const landlock = @import("compute_landlock.zig");
++const expect = std.testing.expect;
++const expectEqual = std.testing.expectEqual;
++const expectEqualStrings = std.testing.expectEqualStrings;
++
++var knobs: []const [2][]const u8 = &.{};
++
++fn lookup(name: []const u8) ?[]const u8 {
++    for (knobs) |k| if (std.mem.eql(u8, k[0], name)) return k[1];
++    return null;
++}
++
++fn parse(set: []const [2][]const u8) error{BadKnob}!?lane.Config {
++    knobs = set;
++    return lane.Config.parse(&lookup, "TF_X");
++}
++
++test "compute lane config: off unless the flag is 1" {
++    try expectEqual(null, try parse(&.{}));
++    try expectEqual(null, try parse(&.{.{ "TF_X", "" }}));
++    try expectEqual(null, try parse(&.{ .{ "TF_X", "0" }, .{ "TF_X_WORKERS", "3" } }));
++    try std.testing.expectError(error.BadKnob, parse(&.{.{ "TF_X", "yes" }}));
++    const c = (try parse(&.{.{ "TF_X", "1" }})).?;
++    try expectEqual(@as(u8, 2), c.workers);
++    try expectEqual(@as(u32, 10_000), c.max_ms);
++    try expectEqual(@as(u32, 64 * 1024), c.max_output_bytes);
++    try expectEqual(@as(u32, 512), c.max_result_tokens);
++    try expectEqual(@as(u32, 8), c.max_calls);
++    try expectEqual(@as(u32, 1024), c.mem_mb);
++    try expectEqualStrings("/usr/bin/python3", c.python);
++    try expectEqualStrings("", c.cpus);
++}
++
++test "compute lane config: every knob parses" {
++    const c = (try parse(&.{
++        .{ "TF_X", "1" },                          .{ "TF_X_WORKERS", "3" },    .{ "TF_X_MAX_MS", "2500" },
++        .{ "TF_X_MAX_RESULT_TOKENS", "64" },       .{ "TF_X_MAX_CALLS", "2" },  .{ "TF_X_MEM_MB", "256" },
++        .{ "TF_X_PYTHON", "/opt/py/bin/python3" }, .{ "TF_X_CPUS", "1,3,5-7" },
++    })).?;
++    try expectEqual(@as(u8, 3), c.workers);
++    try expectEqual(@as(u32, 2500), c.max_ms);
++    try expectEqual(@as(u32, 64), c.max_result_tokens);
++    try expectEqual(@as(u32, 2), c.max_calls);
++    try expectEqual(@as(u32, 256), c.mem_mb);
++    try expectEqualStrings("/opt/py/bin/python3", c.python);
++    try expectEqualStrings("1,3,5-7", c.cpus);
++}
++
++test "compute lane config: malformed or out-of-range knobs refuse" {
++    const bad = [_][2][]const u8{
++        .{ "TF_X_WORKERS", "0" },     .{ "TF_X_WORKERS", "300" },    .{ "TF_X_WORKERS", "two" },
++        .{ "TF_X_MAX_MS", "0" },      .{ "TF_X_MAX_MS", "-5" },      .{ "TF_X_MEM_MB", "8" },
++        .{ "TF_X_MAX_CALLS", "1e3" }, .{ "TF_X_PYTHON", "python3" }, .{ "TF_X_CPUS", "3-1" },
++        .{ "TF_X_CPUS", "a" },        .{ "TF_X_CPUS", "2048" },      .{ "TF_X_MAX_RESULT_TOKENS", "0" },
++    };
++    for (bad) |k| try std.testing.expectError(error.BadKnob, parse(&.{ .{ "TF_X", "1" }, k }));
++}
++
++test "compute lane: cpu lists" {
++    var set: [16]u64 = undefined;
++    try expect(sandbox.cpuList("16-19", &set));
++    try expectEqual(@as(u64, 0xF0000), set[0]);
++    try expect(sandbox.cpuList("1,3,5-7,64", &set));
++    try expectEqual(@as(u64, 0b11101010), set[0]);
++    try expectEqual(@as(u64, 1), set[1]);
++    for ([_][]const u8{ "", ",", "1,", "-3", "4-", "1-1024", "x" }) |t| try expect(!sandbox.cpuList(t, &set));
++}
++
++test "compute lane: trampoline arguments round-trip and refuse other versions" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const job: sandbox.Job = .{ .max_ms = 500, .mem_mb = 256, .cpus = "", .python = "/usr/bin/python3" };
++    const argv = try sandbox.encode(arena.allocator(), &.{ "/proc/self/exe", "__compute_sandbox" }, job);
++    try expectEqual(@as(usize, 7), argv.len);
++    var args: [5][:0]const u8 = undefined;
++    for (&args, argv[2..]) |*d, s| d.* = std.mem.span(s.?);
++    const back = sandbox.decode(&args).?;
++    try expectEqual(job.max_ms, back.max_ms);
++    try expectEqual(job.mem_mb, back.mem_mb);
++    try expectEqualStrings(job.python, back.python);
++    args[0] = "v0";
++    try expectEqual(null, sandbox.decode(&args));
++    try expectEqual(null, sandbox.decode(args[1..]));
++}
++
++test "compute lane: interpreter install root" {
++    try expectEqual(null, try landlock.installRoot("/usr/bin/python3.12"));
++    try expectEqualStrings("/opt/py", (try landlock.installRoot("/opt/py/bin/python3")).?);
++    try std.testing.expectError(error.Root, landlock.installRoot("/bin/python3"));
++}
++
++fn body(o: lane.Outcome) ![]u8 {
++    return runner.body(std.testing.allocator, o, 500, 1000);
++}
++
++test "compute lane: result body for every status" {
++    const cases = [_]struct { o: lane.Outcome, want: []const u8 }{
++        .{ .o = .{ .status = .ok, .stdout = "42\n" }, .want = "42" },
++        .{ .o = .{ .status = .ok, .stdout = "a\n\n" }, .want = "a\n" },
++        .{ .o = .{ .status = .ok }, .want = "[no output]" },
++        .{ .o = .{ .status = .ok, .stdout = "\n" }, .want = "[no output]" },
++        .{ .o = .{ .status = .ok, .stdout = "x\n", .stderr = "warn\n" }, .want = "x\n\n[stderr]\nwarn" },
++        .{ .o = .{ .status = .ok, .stderr = "warn" }, .want = "[stderr]\nwarn" },
++        .{ .o = .{ .status = .exit_error, .exit_code = 1, .stderr = "E\n" }, .want = "[stderr]\nE\n[exit status 1]" },
++        .{ .o = .{ .status = .exit_error, .signal = 24, .stdout = "p" }, .want = "p\n[killed by signal 24]" },
++        .{ .o = .{ .status = .timeout }, .want = "[timed out after 500 ms]" },
++        .{ .o = .{ .status = .output_limit, .stdout = "xx" }, .want = "xx\n[output truncated at 1000 bytes]" },
++        .{ .o = .{ .status = .cancelled, .stdout = "a\n" }, .want = "a\n[cancelled]" },
++        .{ .o = .{ .status = .unavailable, .stderr = "why" }, .want = "[stderr]\nwhy\n[sandbox unavailable]" },
++        .{ .o = .{ .status = .ok, .stdout = "t", .exec_ns = 123456789 }, .want = "t" },
++    };
++    for (cases) |k| {
++        const got = try body(k.o);
++        defer std.testing.allocator.free(got);
++        try expectEqualStrings(k.want, got);
++    }
++}
++
++/// The filter's verdict for one call, by a small classic-BPF interpreter over the instructions seccomp loads.
++fn verdict(nr: u32, arch: u32, arg0: u32) u32 {
++    var data: [16]u32 = @splat(0);
++    data[seccomp.nr_at / 4] = nr;
++    data[seccomp.arch_at / 4] = arch;
++    data[seccomp.arg0_at / 4] = arg0;
++    const BPF = std.os.linux.BPF;
++    var acc: u32 = 0;
++    var pc: usize = 0;
++    while (pc < seccomp.program.len) : (pc += 1) {
++        const i = seccomp.program[pc];
++        switch (i.code) {
++            BPF.LD | BPF.W | BPF.ABS => acc = data[i.k / 4],
++            BPF.RET | BPF.K => return i.k,
++            BPF.JMP | BPF.JEQ | BPF.K => pc += if (acc == i.k) i.jt else i.jf,
++            BPF.JMP | BPF.JGE | BPF.K => pc += if (acc >= i.k) i.jt else i.jf,
++            BPF.JMP | BPF.JSET | BPF.K => pc += if (acc & i.k != 0) i.jt else i.jf,
++            else => return 0xdead,
++        }
++    }
++    return 0xdead; // fell off the end: the kernel refuses such a filter
++}
++
++fn sys(comptime name: []const u8) u32 {
++    return @intCast(@backingInt(@field(std.os.linux.SYS, name)));
++}
++
++test "compute lane: seccomp filter verdicts" {
++    if (!seccomp.supported) return error.SkipZigTest;
++    const RET = std.os.linux.SECCOMP.RET;
++    const arch = seccomp.audit_arch;
++    try expectEqual(RET.KILL_PROCESS, verdict(sys("read"), 0x40000003, 0)); // i386 audit arch
++    try expectEqual(RET.ALLOW, verdict(sys("read"), arch, 0));
++    try expectEqual(RET.ALLOW, verdict(sys("execve"), arch, 0));
++    try expectEqual(RET.ALLOW, verdict(sys("landlock_create_ruleset"), arch, 0));
++    for ([_]u32{ sys("socket"), sys("ptrace"), sys("bpf"), sys("io_uring_setup"), sys("unshare"), sys("mount") }) |n|
++        try expectEqual(RET.ERRNO | seccomp.eperm, verdict(n, arch, 0));
++    inline for (seccomp.denied) |name| if (@hasField(std.os.linux.SYS, name))
++        try expectEqual(RET.ERRNO | seccomp.eperm, verdict(sys(name), arch, 0));
++    try expectEqual(RET.ERRNO | seccomp.enosys, verdict(sys("clone3"), arch, 0));
++    try expectEqual(RET.ERRNO | seccomp.eperm, verdict(sys("clone"), arch, 17)); // SIGCHLD: a fork
++    try expectEqual(RET.ALLOW, verdict(sys("clone"), arch, 0x3d0f00)); // glibc's pthread_create flags
++    if (builtin.cpu.arch == .x86_64) {
++        try expectEqual(RET.KILL_PROCESS, verdict(seccomp.x32_bit | sys("read"), arch, 0));
++        try expectEqual(RET.ERRNO | seccomp.eperm, verdict(sys("fork"), arch, 0));
++        try expectEqual(RET.ERRNO | seccomp.eperm, verdict(sys("vfork"), arch, 0));
++    }
++}
+diff --git a/zig/src/core/compute_runner.zig b/zig/src/core/compute_runner.zig
+new file mode 100644
+index 000000000..30b24f596
+--- /dev/null
++++ b/zig/src/core/compute_runner.zig
+@@ -0,0 +1,59 @@
++//! The compute lane's Python prelude and the canonical, deterministic result text of one job.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const Outcome = @import("compute_lane.zig").Outcome;
++
++/// Passed with -c: runs stdin's source as `<code>`, printing the repr of a final bare expression (REPL convention).
++pub const runner: [:0]const u8 =
++    \\import sys, ast, io, linecache, random, traceback
++    \\random.seed(0)
++    \\src = sys.stdin.read()
++    \\sys.stdin = io.StringIO()
++    \\linecache.cache["<code>"] = (len(src), None, src.splitlines(True), "<code>")
++    \\try:
++    \\    tree = ast.parse(src, "<code>")
++    \\    last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
++    \\    ns = {"__name__": "__main__"}
++    \\    exec(compile(tree, "<code>", "exec"), ns)
++    \\    if last is not None:
++    \\        value = eval(compile(ast.Expression(last.value), "<code>", "eval"), ns)
++    \\        if value is not None:
++    \\            print(repr(value))
++    \\except SystemExit:
++    \\    raise
++    \\except BaseException as e:
++    \\    tb = None if isinstance(e, SyntaxError) else e.__traceback__.tb_next
++    \\    traceback.print_exception(type(e), e, tb)
++    \\    sys.stdout.flush()
++    \\    sys.stderr.flush()
++    \\    sys.exit(1)
++    \\sys.stdout.flush()
++    \\sys.stderr.flush()
++;
++
++/// The result text: stdout, then stderr, then a status line for a non-ok job; never a timing.
++pub fn body(a: Allocator, o: Outcome, max_ms: u32, max_output_bytes: u32) Allocator.Error![]u8 {
++    var t: std.ArrayList(u8) = .empty;
++    try t.appendSlice(a, o.stdout);
++    if (o.stderr.len > 0) {
++        try t.appendSlice(a, if (t.items.len == 0) "[stderr]\n" else "\n[stderr]\n");
++        try t.appendSlice(a, o.stderr);
++    }
++    if (o.status != .ok) {
++        if (t.items.len > 0 and t.items[t.items.len - 1] != '\n') try t.append(a, '\n');
++        switch (o.status) {
++            .ok => unreachable,
++            .exit_error => if (o.signal) |s|
++                try t.print(a, "[killed by signal {d}]", .{s})
++            else
++                try t.print(a, "[exit status {d}]", .{o.exit_code orelse 0}),
++            .timeout => try t.print(a, "[timed out after {d} ms]", .{max_ms}),
++            .output_limit => try t.print(a, "[output truncated at {d} bytes]", .{max_output_bytes}),
++            .cancelled => try t.appendSlice(a, "[cancelled]"),
++            .unavailable => try t.appendSlice(a, "[sandbox unavailable]"),
++        }
++    }
++    if (t.items.len > 0 and t.items[t.items.len - 1] == '\n') t.items.len -= 1;
++    if (t.items.len == 0) try t.appendSlice(a, "[no output]");
++    return t.toOwnedSlice(a);
++}
+diff --git a/zig/src/core/compute_sandbox.zig b/zig/src/core/compute_sandbox.zig
+new file mode 100644
+index 000000000..a6a1061b9
+--- /dev/null
++++ b/zig/src/core/compute_sandbox.zig
+@@ -0,0 +1,119 @@
++//! The compute trampoline: a freshly spawned process drops privileges, limits and confines itself, then execs Python.
++const std = @import("std");
++const builtin = @import("builtin");
++const linux = std.os.linux;
++const Allocator = std.mem.Allocator;
++const landlock = @import("compute_landlock.zig");
++const seccomp = @import("compute_seccomp.zig");
++const runner = @import("compute_runner.zig").runner;
++
++/// The argument format's version, the first argument after the launcher.
++pub const version = "v1";
++/// What the trampoline needs of one job.
++pub const Job = struct { max_ms: u32, mem_mb: u32, cpus: []const u8, python: []const u8 };
++/// The user nobody runs jobs when the trampoline starts as root.
++pub const nobody: u32 = 65534;
++const env = [_:null]?[*:0]const u8{
++    "PYTHONHASHSEED=0", "PYTHONDONTWRITEBYTECODE=1", "PYTHONIOENCODING=utf-8", "LANG=C.UTF-8", "PATH=/usr/bin",
++};
++
++/// The spawn argv: `launcher` then version, max_ms, mem_mb, cpus, python.
++pub fn encode(a: Allocator, launcher: []const []const u8, j: Job) Allocator.Error![:null]?[*:0]const u8 {
++    const argv = try a.allocSentinel(?[*:0]const u8, launcher.len + 5, null);
++    for (launcher, 0..) |s, i| argv[i] = try a.dupeSentinel(u8, s, 0);
++    const tail = argv[launcher.len..];
++    tail[0] = version;
++    tail[1] = try std.fmt.allocPrintSentinel(a, "{d}", .{j.max_ms}, 0);
++    tail[2] = try std.fmt.allocPrintSentinel(a, "{d}", .{j.mem_mb}, 0);
++    tail[3] = try a.dupeSentinel(u8, j.cpus, 0);
++    tail[4] = try a.dupeSentinel(u8, j.python, 0);
++    return argv;
++}
++
++/// The job in the trampoline's arguments (after the launcher), or null when they are not this version's.
++pub fn decode(argv: []const [:0]const u8) ?Job {
++    if (argv.len != 5 or !std.mem.eql(u8, argv[0], version)) return null;
++    const max_ms = std.fmt.parseInt(u32, argv[1], 10) catch return null;
++    const mem_mb = std.fmt.parseInt(u32, argv[2], 10) catch return null;
++    if (max_ms == 0 or mem_mb == 0 or argv[4].len == 0) return null;
++    return .{ .max_ms = max_ms, .mem_mb = mem_mb, .cpus = argv[3], .python = argv[4] };
++}
++
++/// Parses an affinity list such as "16-19" or "1,3,5-7" into `set`; false if malformed or past CPU 1023.
++pub fn cpuList(text: []const u8, set: *[16]u64) bool {
++    set.* = @splat(0);
++    if (text.len == 0) return false;
++    var parts = std.mem.splitScalar(u8, text, ',');
++    while (parts.next()) |part| {
++        const dash = std.mem.findScalar(u8, part, '-');
++        const lo = std.fmt.parseInt(u16, part[0 .. dash orelse part.len], 10) catch return false;
++        const hi = if (dash) |d| std.fmt.parseInt(u16, part[d + 1 ..], 10) catch return false else lo;
++        if (lo > hi or hi >= 1024) return false;
++        for (lo..@as(usize, hi) + 1) |cpu| set[cpu / 64] |= @as(u64, 1) << @intCast(cpu % 64);
++    }
++    return true;
++}
++
++/// Runs in the spawned process: confines it and execs the interpreter, or exits 125 with one line on stderr.
++pub fn main(argv: []const [:0]const u8) noreturn {
++    if (builtin.os.tag != .linux) std.process.exit(125) else confine(argv);
++}
++
++fn confine(argv: []const [:0]const u8) noreturn {
++    const job = decode(argv) orelse die("arguments", code(.INVAL));
++    check("close_range", linux.close_range(3, -1, .{ .UNSHARE = false, .CLOEXEC = false }));
++    check("setsid", linux.setsid());
++    const root = linux.geteuid() == 0;
++    if (root) {
++        const none = [_]linux.gid_t{0};
++        check("setgroups", linux.setgroups(0, &none));
++        check("setresgid", linux.setresgid(nobody, nobody, nobody));
++        check("setresuid", linux.setresuid(nobody, nobody, nobody));
++        if (linux.getuid() == 0 or linux.geteuid() == 0) die("uid drop", code(.PERM));
++    }
++    check("pdeathsig", linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0));
++    limit("RLIMIT_AS", .AS, @as(u64, job.mem_mb) << 20);
++    limit("RLIMIT_CPU", .CPU, (job.max_ms + 999) / 1000 + 1);
++    limit("RLIMIT_FSIZE", .FSIZE, 0);
++    limit("RLIMIT_CORE", .CORE, 0);
++    limit("RLIMIT_NOFILE", .NOFILE, 64);
++    if (root) limit("RLIMIT_NPROC", .NPROC, 512);
++    // nice 10 at least, never less than the engine's own: lowering it needs a privilege the job no longer has
++    const inherited = 20 - @as(isize, @bitCast(linux.syscall2(.getpriority, 0, 0)));
++    if (inherited < 10) check("setpriority", linux.syscall3(.setpriority, 0, 0, 10));
++    if (job.cpus.len > 0) {
++        var set: [16]u64 = undefined;
++        if (!cpuList(job.cpus, &set)) die("cpu list", code(.INVAL));
++        check("sched_setaffinity", linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(set)), @intFromPtr(&set)));
++    }
++    check("no_new_privs", linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
++    const python = argv[4];
++    if (landlock.apply(python)) |f| die(f.step, f.errno);
++    const e = seccomp.install();
++    if (e != .SUCCESS) die("seccomp", code(e));
++    check("chdir", linux.chdir("/"));
++    const args = [_:null]?[*:0]const u8{ python, "-P", "-s", "-B", "-u", "-X", "utf8", "-c", runner };
++    die("exec", code(linux.errno(linux.execve(python, &args, &env))));
++}
++
++fn code(e: linux.E) u16 {
++    return @intCast(@backingInt(e));
++}
++
++fn check(step: []const u8, rc: usize) void {
++    const e = linux.errno(rc);
++    if (e != .SUCCESS) die(step, code(e));
++}
++
++fn limit(step: []const u8, res: linux.rlimit_resource, value: u64) void {
++    const l: linux.rlimit = .{ .cur = value, .max = value };
++    check(step, linux.setrlimit(res, &l));
++}
++
++/// Fails closed: one line on stderr, then exit 125 before anything runs unconfined.
++fn die(step: []const u8, errno: u16) noreturn {
++    var buf: [160]u8 = undefined;
++    const line = std.fmt.bufPrint(&buf, "compute sandbox: {s} failed (errno {d})\n", .{ step, errno }) catch "compute sandbox: failed\n";
++    _ = linux.write(2, line.ptr, line.len);
++    linux.exit_group(125);
++}
+diff --git a/zig/src/core/compute_sandbox_main.zig b/zig/src/core/compute_sandbox_main.zig
+new file mode 100644
+index 000000000..4623c7c0c
+--- /dev/null
++++ b/zig/src/core/compute_sandbox_main.zig
+@@ -0,0 +1,15 @@
++//! The compute trampoline as its own executable, for the host tests (the server enters it as `__compute_sandbox`).
++const std = @import("std");
++const sandbox = @import("compute_sandbox.zig");
++
++pub fn main(init: std.process.Init.Minimal) !u8 {
++    var argv: [16][:0]const u8 = undefined;
++    var n: usize = 0;
++    var it = init.args.iterate();
++    while (it.next()) |arg| : (n += 1) {
++        if (n == argv.len) return 125;
++        argv[n] = arg;
++    }
++    if (n == 0) return 125;
++    sandbox.main(argv[1..n]);
++}
+diff --git a/zig/src/core/compute_seccomp.zig b/zig/src/core/compute_seccomp.zig
+new file mode 100644
+index 000000000..e07e4cc81
+--- /dev/null
++++ b/zig/src/core/compute_seccomp.zig
+@@ -0,0 +1,96 @@
++//! The compute sandbox's seccomp filter: native arch only; no sockets, tracing, namespaces or child processes.
++const std = @import("std");
++const builtin = @import("builtin");
++const linux = std.os.linux;
++const BPF = linux.BPF;
++const RET = linux.SECCOMP.RET;
++
++/// One classic-BPF instruction (struct sock_filter).
++pub const Insn = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
++const Fprog = extern struct { len: u16, filter: [*]const Insn };
++
++/// Architectures the filter is built for; anywhere else `install` refuses.
++pub const supported = builtin.os.tag == .linux and switch (builtin.cpu.arch) {
++    .aarch64 => true,
++    .x86_64 => builtin.abi != .gnux32 and builtin.abi != .muslx32,
++    else => false,
++};
++pub const audit_arch: u32 = switch (builtin.cpu.arch) {
++    .aarch64 => 0xC00000B7,
++    .x86_64 => 0xC000003E,
++    else => 0,
++};
++/// seccomp_data offsets: syscall number, audit arch and the low 32 bits of the first argument (little-endian).
++pub const nr_at = 0;
++pub const arch_at = 4;
++pub const arg0_at = 16;
++pub const x32_bit: u32 = 0x40000000;
++pub const clone_thread: u32 = 0x00010000;
++pub const eperm: u32 = 1;
++pub const enosys: u32 = 38;
++
++/// Calls that fail with EPERM; names missing on the native arch (fork, vfork off x86_64) are skipped.
++pub const denied = [_][]const u8{
++    "socket",            "socketpair",        "ptrace",          "process_vm_readv", "process_vm_writev",
++    "mount",             "umount2",           "pivot_root",      "chroot",           "unshare",
++    "setns",             "bpf",               "perf_event_open", "userfaultfd",      "io_uring_setup",
++    "io_uring_enter",    "io_uring_register", "keyctl",          "add_key",          "request_key",
++    "kexec_load",        "kexec_file_load",   "init_module",     "finit_module",     "delete_module",
++    "reboot",            "swapon",            "swapoff",         "acct",             "name_to_handle_at",
++    "open_by_handle_at", "fork",              "vfork",
++};
++
++fn stmt(code: u16, k: u32) Insn {
++    return .{ .code = code, .jt = 0, .jf = 0, .k = k };
++}
++
++fn jump(code: u16, k: u32, jt: u8, jf: u8) Insn {
++    return .{ .code = code, .jt = jt, .jf = jf, .k = k };
++}
++
++fn nr(comptime name: []const u8) u32 {
++    return @intCast(@backingInt(@field(linux.SYS, name)));
++}
++
++const ld = BPF.LD | BPF.W | BPF.ABS;
++const jeq = BPF.JMP | BPF.JEQ | BPF.K;
++const ret = BPF.RET | BPF.K;
++
++/// The filter for the native arch, built at compile time (empty where unsupported).
++pub const program: []const Insn = if (!supported) &.{} else blk: {
++    @setEvalBranchQuota(20_000);
++    var p: [6 + 2 * denied.len + 7]Insn = undefined;
++    var n: usize = 0;
++    p[n] = stmt(ld, arch_at);
++    p[n + 1] = jump(jeq, audit_arch, 1, 0);
++    p[n + 2] = stmt(ret, RET.KILL_PROCESS);
++    p[n + 3] = stmt(ld, nr_at);
++    n += 4;
++    if (builtin.cpu.arch == .x86_64) {
++        p[n] = jump(BPF.JMP | BPF.JGE | BPF.K, x32_bit, 0, 1);
++        p[n + 1] = stmt(ret, RET.KILL_PROCESS);
++        n += 2;
++    }
++    for (denied) |name| if (@hasField(linux.SYS, name)) {
++        p[n] = jump(jeq, nr(name), 0, 1);
++        p[n + 1] = stmt(ret, RET.ERRNO | eperm);
++        n += 2;
++    };
++    p[n] = jump(jeq, nr("clone3"), 0, 1);
++    p[n + 1] = stmt(ret, RET.ERRNO | enosys); // glibc falls back to clone
++    p[n + 2] = jump(jeq, nr("clone"), 0, 3);
++    p[n + 3] = stmt(ld, arg0_at);
++    p[n + 4] = jump(BPF.JMP | BPF.JSET | BPF.K, clone_thread, 1, 0);
++    p[n + 5] = stmt(ret, RET.ERRNO | eperm);
++    p[n + 6] = stmt(ret, RET.ALLOW);
++    n += 7;
++    const out = p[0..n].*;
++    break :blk &out;
++};
++
++/// Installs the filter on the calling thread (no_new_privs already set); the errno, or SUCCESS.
++pub fn install() linux.E {
++    if (!supported) return .NOSYS;
++    const prog: Fprog = .{ .len = program.len, .filter = program.ptr };
++    return linux.errno(linux.seccomp(linux.SECCOMP.SET_MODE_FILTER, 0, &prog));
++}

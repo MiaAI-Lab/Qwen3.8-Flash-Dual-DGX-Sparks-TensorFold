@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 14:42:16 +0700
+Subject: [PATCH 17/79] flashnext_mia: test-flashnext-mia-host, run by
+ test-cuda-host
+
+Her module's host tests, roce_mia's, the lane opt-ins her family takes and its native contract
+test as one step; test-cuda-host depends on it instead of running her module in its own loop.
+---
+ zig/build/cuda.zig          |  3 ++-
+ zig/build/flashnext_mia.zig | 11 +++++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index fd8984d10..15f1a1976 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -345,9 +345,10 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     @import("pull_tests.zig").add(b, host, .debug, native_modules.engines, mods.core, step);
+     b.step("test-save-reopen-host", "Unresolved save through actual checkpoint admission").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.core, .filters = &.{"Save recovery:"} })).step);
+     b.step("test-trainer-close-host", "Actual native close and real Flash Next trainer ownership sentinels").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"Save recovery:"} })).step);
++    @import("flashnext_mia.zig").hostTests(b, cuda, native_modules.engines.import_table.get("flashnext_mia").?, mods.lanes, native, step);
+     const template, const server_tests = @import("cuda_server_host.zig").steps(b, host, cuda, mods, native_modules, build_options, windows_port, step, server_steps);
+     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
+-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), native_modules.engines.import_table.get("flashnext_mia").?, mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
++    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+     const selected = b.option([]const u8, "modelopt-host-filter", "One portable ModelOpt regression") orelse "modelopt host:";
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{selected} }));
+     run.has_side_effects = true;
+diff --git a/zig/build/flashnext_mia.zig b/zig/build/flashnext_mia.zig
+index 124068152..634e33fe2 100644
+--- a/zig/build/flashnext_mia.zig
++++ b/zig/build/flashnext_mia.zig
+@@ -20,3 +20,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
+     const weights_exe = b.addExecutable(.{ .name = "tf-flashnext-mia-weights", .root_module = weights });
+     b.step("flashnext-mia-weights", "tf-flashnext-mia-weights SNAPSHOT [WEIGHTS.json]: loaded weights' digests against the oracle's").dependOn(&b.addInstallArtifact(weights_exe, .{}).step);
+ }
++
++/// Her module's host tests, roce_mia's, the lane opt-ins her family takes and its native contract; in test-cuda-host.
++pub fn hostTests(b: *std.Build, cuda: *std.Build.Module, mia: *std.Build.Module, lanes: *std.Build.Module, native: *std.Build.Module, all: *std.Build.Step) void {
++    const step = b.step("test-flashnext-mia-host", "MiaAI-Lab's Flash Next engine: its host tests and the lane opt-ins it takes, no GPU");
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mia })).step);
++    const roce = &.{ "the timeout reader compiles", "prefetch blocks:", "NCCL_IB_HCA lists", "the region layout:" };
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = roce })).step);
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{ "join batch:", "head stops:" } })).step);
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"flashnext_mia family:"} })).step);
++    all.dependOn(step);
++}

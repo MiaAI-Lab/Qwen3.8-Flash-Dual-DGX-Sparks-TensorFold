@@ -57,6 +57,15 @@ third-party notices that go with it (TensorFold's MIT and Apache-2.0 notices, Zi
   implementation is new code written for this engine. It carries the ranks' small exchanges over both CX7 rails.
 - **[Zig](https://ziglang.org)** by the Zig Software Foundation and the Zig contributors (MIT): the language and
   compiler TensorFold's Zig engine is written in and built with (0.17.0).
+- **Compute lanes (opt-in, `ENGINE=lanes`).**
+  - The lane engine is upstream TensorFold's Zig engine (`LANES_REPO` @ `LANES_REF`, unmodified) plus the patches in
+    `lanes/`, which carry this recipe's engine patches 0001-0008 and 0010-0012 ported in (`lanes/` 0002-0012). Those are MiaAI-Lab's commits, with her authorship and her license, notice and
+    credits kept in the engine's `LICENSES/`.
+  - The port, the compute lane, the in-model runner and their binding to her engine are by Jay Leaton
+    ([jayleaton](https://github.com/jayleaton)), on TensorFold by Ash Hart and the TensorFold contributors.
+  - The runner's circuit (`calc.tfpc`) is compiled from [Qwenputer](https://github.com/divagr18/qwenputer) by Divyansh
+    Agrawal (MIT; the license ships in the lane image at `/opt/tensorfold/licenses/runtime-deps/Qwenputer-MIT.txt`).
+  - The runner frontend uses Ubuntu's clang-18 and lld-18 (LLVM, Apache-2.0 with LLVM exceptions).
 
 ## Recipe
 

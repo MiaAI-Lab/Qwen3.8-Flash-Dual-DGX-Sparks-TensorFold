@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:36:27 +0700
+Subject: [PATCH 73/79] lanes: the budget-hold test puts the result's EOS in
+ its last rows, where it lands with the cut
+
+---
+ zig/src/core/lanes/budget_hold_test.zig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/src/core/lanes/budget_hold_test.zig b/zig/src/core/lanes/budget_hold_test.zig
+index da90467e0..2ee9d8a2b 100644
+--- a/zig/src/core/lanes/budget_hold_test.zig
++++ b/zig/src/core/lanes/budget_hold_test.zig
+@@ -10,7 +10,7 @@ const gpa = std.testing.allocator;
+ const close = [_]u32{ 90, 91, 92 };
+ const think_end: i64 = 91;
+ const base_result = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89, 13, 24 };
+-const eos_row = 2; // the result's own template EOS (ChatML's <|im_end|> closing the tool turn) sits on this row
++const eos_row = base_result.len - 3; // ChatML's <|im_end|>: in the last rows, which land with the cut
+ 
+ /// The tool result a hold resumes with: its row `eos_row` is the reply's EOS, as a ChatML tool turn's rows hold one.
+ fn resultWith(eos: ?u32) [base_result.len]u32 {

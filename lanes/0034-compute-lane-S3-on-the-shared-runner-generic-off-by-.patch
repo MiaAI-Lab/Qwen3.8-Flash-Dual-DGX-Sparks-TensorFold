@@ -1,0 +1,1608 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:16:49 +0700
+Subject: [PATCH 34/79] compute lane: S3 on the shared runner (generic, off by
+ default)
+
+A compute lane call whose code the runner's frontend accepts runs on the circuit; anything it declines runs in the
+sandbox as before. Off unless the boot sets TF_COMPUTE_LANE_RUNNER=1 (DeepSeek-V4.1: or TF_DSV41_COMPUTE_LANE_RUNNER=1)
+beside an enabled compute lane.
+
+- compute_circuit.zig: the executor (Exec.run: a fresh python fence cell, a busy wait under _BUSY_MS, the _WALL_MS
+  safety net, cancel on a gone client), its knobs (_WALL_MS, _BUSY_MS, _VERIFY, _ELF) and the decline reasons
+  (`markup` among them). compute_circuit.binding puts S3's switch and knobs under a family's compute lane names;
+  compute_circuit.open opens its runner, sharing the family runner's loaded circuit and bank when they name the
+  same files; with the lane off it warns and stays off.
+- Engine API: Info.compute_runner. Flash-Next's native CUDA host and DeepSeek-V4.1's serve engine open it from
+  their compute lane bindings.
+- Server: compute_exec runs built-in calls on the circuit first. Each report names its executor ("in-model runner"
+  or "code tool"), call_ms, the program and steps or the decline reason; _VERIFY inserts the sandbox's result and
+  reports same or differ. runtime compute counts runner_calls and tool_calls. With S3 off, replies are unchanged.
+- Tests: compute_circuit_test (scripted frontend and backend; the knob names), compute_circuit_proof_test (recorded
+  arm-d calls through the real frontend and CPU circuit print the sandbox's bytes; the circuit loads once beside
+  the cell runner), the chat route with S3 in compute_lane_http_test (test-compute-lane-http-host
+  now runs them). bench-runner-s3 measures lane calls through a served runner (TF_COMPUTE_LANE_RUNNER* knobs).
+
+Ported from the dsv41 release line (s86 7b79ef92d).
+---
+ zig/build/cuda_server_host.zig                |   2 +-
+ zig/build/runner_cost.zig                     |   3 +
+ zig/src/core/compute_circuit.zig              | 178 ++++++++++
+ zig/src/core/compute_circuit_armd.json        | 264 +++++++++++++++
+ zig/src/core/compute_circuit_proof_test.zig   | 178 ++++++++++
+ zig/src/core/compute_circuit_test.zig         | 220 ++++++++++++
+ zig/src/core/engine_api.zig                   |   3 +
+ zig/src/core/lane_host_tests.zig              |   2 +
+ zig/src/core/runner_s3_bench.zig              | 316 ++++++++++++++++++
+ .../families/deepseek_v41/serve_engine.zig    |   2 +
+ zig/src/native/cuda.zig                       |   6 +-
+ zig/src/server/compute_lane_http_test.zig     | 129 +++++++
+ zig/src/server/compute_segments.zig           |  72 +++-
+ zig/src/server/server.zig                     |   6 +
+ 14 files changed, 1374 insertions(+), 7 deletions(-)
+ create mode 100644 zig/src/core/compute_circuit.zig
+ create mode 100644 zig/src/core/compute_circuit_armd.json
+ create mode 100644 zig/src/core/compute_circuit_proof_test.zig
+ create mode 100644 zig/src/core/compute_circuit_test.zig
+ create mode 100644 zig/src/core/runner_s3_bench.zig
+
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+index 9d81f82b2..13aa334d4 100644
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -58,7 +58,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     b.step("test-http-limits-host", "Total HTTP read deadlines and connection admission without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"HTTP limits:"} })).step);
+     b.step("test-server-recovery-host", "Incomplete replies, token allocation and bounded SSE storage without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Server recovery:"} })).step);
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+-    b.step("test-compute-lane-http-host", "The compute lane through the chat route: a held python call's result forced in").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"compute lane:"} })).step);
++    b.step("test-compute-lane-http-host", "The compute lane through the chat route: a held python call's result forced in (S3 too)").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "compute lane:", "compute runner:" } })).step);
+     b.step("test-runner-server-host", "The in-model runner through the chat route: guide, live records, field anchors").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{ "runner guide:", "runner commit ask:", "runner projection:", "runner live records:" } })).step);
+     b.step("test-request-deadline-host", "deadline_s: the server ends a reply at its deadline with usage and ids").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request deadline:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+diff --git a/zig/build/runner_cost.zig b/zig/build/runner_cost.zig
+index 15a6c6962..dbc8f082d 100644
+--- a/zig/build/runner_cost.zig
++++ b/zig/build/runner_cost.zig
+@@ -12,4 +12,7 @@ pub fn steps(b: *std.Build) void {
+     const hold = b.createModule(.{ .root_source_file = b.path("zig/src/core/runner_hold_bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "dsv41_tokenizer", .module = tok } } });
+     const hold_exe = b.addExecutable(.{ .name = "runner-hold-bench", .root_module = hold });
+     b.step("bench-runner-hold", "A runner hold's parts through the served runner (TF_RUNNER* knobs; tokenizer.json, replies.jsonl)").dependOn(&b.addInstallArtifact(hold_exe, .{}).step);
++    const s3 = b.createModule(.{ .root_source_file = b.path("zig/src/core/runner_s3_bench.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
++    const s3_exe = b.addExecutable(.{ .name = "runner-s3-bench", .root_module = s3 });
++    b.step("bench-runner-s3", "S3 lane calls through the served runner: route, steps, ms (TF_COMPUTE_LANE_RUNNER* knobs; cells.jsonl)").dependOn(&b.addInstallArtifact(s3_exe, .{}).step);
+ }
+diff --git a/zig/src/core/compute_circuit.zig b/zig/src/core/compute_circuit.zig
+new file mode 100644
+index 000000000..e3916d508
+--- /dev/null
++++ b/zig/src/core/compute_circuit.zig
+@@ -0,0 +1,178 @@
++//! S3: a compute lane call whose code the frontend accepts runs on the circuit (in-model runner), else in the sandbox.
++const std = @import("std");
++pub const api = @import("runner_api.zig"); // the frontend and backend S3 drives (a server test scripts them)
++const runner = @import("runner.zig");
++const lane = @import("compute_lane.zig");
++const Allocator = std.mem.Allocator;
++
++/// The executor names a report gives; a number never adds the two.
++pub const in_model = "in-model runner";
++pub const code_tool = "code tool";
++
++/// S3's knobs beside the runner's under the same prefix (PREFIX_WALL_MS, PREFIX_BUSY_MS, PREFIX_VERIFY, PREFIX_ELF).
++pub const Config = struct {
++    wall_ms: u32 = 2000, // the safety net: a run still going is cancelled and the call goes to the sandbox
++    busy_ms: u32 = 2000, // how long a call waits for a free backend slot before it goes to the sandbox
++    verify: bool = false, // shadow: the sandbox runs too, its result is inserted and the bodies compared
++    elf: bool = false, // compile ELF programs too: off, as clang alone (80-410 ms) loses to the sandbox (~15 ms)
++
++    pub fn parse(get: *const fn ([]const u8) ?[]const u8, comptime prefix: []const u8) error{BadKnob}!Config {
++        var c: Config = .{};
++        c.wall_ms = try knob(u32, get, prefix ++ "_WALL_MS", c.wall_ms, 1, 3_600_000);
++        c.busy_ms = try knob(u32, get, prefix ++ "_BUSY_MS", c.busy_ms, 0, 3_600_000);
++        c.verify = try knob(u1, get, prefix ++ "_VERIFY", 0, 0, 1) == 1;
++        c.elf = try knob(u1, get, prefix ++ "_ELF", 0, 0, 1) == 1;
++        return c;
++    }
++
++    fn knob(comptime T: type, get: *const fn ([]const u8) ?[]const u8, comptime name: []const u8, default: T, min: T, max: T) error{BadKnob}!T {
++        const text = get(name) orelse return default;
++        if (text.len == 0) return default;
++        const v = std.fmt.parseInt(T, text, 10) catch return bad(name, text);
++        return if (v < min or v > max) bad(name, text) else v;
++    }
++
++    fn bad(name: []const u8, value: []const u8) error{BadKnob} {
++        std.log.warn("{s}={s} is not a valid value", .{ name, value });
++        return error.BadKnob;
++    }
++};
++
++/// What the engine hands the server: the runner S3 opened for itself (its own backend) and S3's knobs.
++pub const Setup = struct { runner: *runner.Runner, cfg: Config };
++
++/// S3's switch and knobs under a family's compute lane names (TF_COMPUTE_LANE_RUNNER*, or its alias's): off by default.
++pub fn binding(comptime b: @import("compute_binding.zig").Binding) @import("runner_binding.zig").Binding {
++    return .{ .prefix = b.prefix ++ "_RUNNER", .alias = if (b.alias) |a| a ++ "_RUNNER" else null };
++}
++
++/// S3 when switched on beside a lane: its own runner, sharing `with`'s circuit and bank when they name the same files.
++pub fn open(comptime b: @import("compute_binding.zig").Binding, gpa: Allocator, get: *const fn ([]const u8) ?[]const u8, lane_on: bool, with: ?*runner.Runner, engine: @FieldType(runner.place.Config, "engine")) !?Setup {
++    const rb = comptime binding(b);
++    var rc = (try rb.parse(get)) orelse return null;
++    if (!lane_on) {
++        std.log.warn("{s}=1 needs the compute lane ({s}=1); S3 stays off", .{ rb.active(get), b.prefix });
++        return null;
++    }
++    const cfg = if (rb.alias != null and std.mem.eql(u8, rb.active(get), rb.alias.?)) try Config.parse(get, rb.alias.?) else try Config.parse(get, rb.prefix);
++    rc.place.engine = engine; // PREFIX_CPUS=auto keeps its threads off the engine's CPUs
++    rc.compile = cfg.elf;
++    return .{ .runner = try @import("runner_open.zig").openSharing(gpa, rc, with), .cfg = cfg };
++}
++
++/// Why a call went to the sandbox: an abstain, an ELF with _ELF off, a non-ok run, no slot, the wall net, or gone.
++pub const Decline = enum { language, unsupported, syntax, name, too_long, too_big, context, markup, abstain, elf, budget, fault, busy, wall, cancelled };
++pub const Kind = @FieldType(api.Program, "kind");
++/// A call the circuit ran to its halt: the lane's result body made of its stdout, and what ran it.
++pub const Owned = struct { body: []const u8, kind: Kind, steps: u64, exec_ns: u64 };
++pub const Outcome = union(enum) { owned: Owned, declined: Decline };
++
++/// One server's S3 executor; request threads share it, and every backend call happens under its lock.
++pub const Exec = struct {
++    frontend: api.Frontend,
++    backend: api.Backend,
++    max_steps: u64,
++    cfg: Config,
++    lock: std.atomic.Value(bool) = .init(false),
++    next_stream: std.atomic.Value(u64) = .init(1),
++
++    pub fn init(s: Setup) Exec {
++        return .{ .frontend = s.runner.frontend, .backend = s.runner.backend, .max_steps = s.runner.cfg.max_steps, .cfg = s.cfg };
++    }
++
++    /// The call's code as a fresh fence cell (a lane call sees no earlier call's names), run to its halt or declined.
++    pub fn run(e: *Exec, a: Allocator, code: []const u8, hook: ?lane.Cancel) Allocator.Error!Outcome {
++        const t = try e.frontend.translate(e.frontend.ctx, a, .{ .form = .fence, .lang = "python", .code = code });
++        const program = switch (t) {
++            .program => |p| p,
++            .abstain => |why| return .{ .declined = from(why) },
++        };
++        // the no-compile frontend builds none, yet a cached ELF may come back: S3 runs one only under _ELF=1
++        if (program.kind == .elf and !e.cfg.elf) return .{ .declined = .elf };
++        const stream = e.next_stream.fetchAdd(1, .monotonic);
++        defer e.release(stream);
++        const t0 = nowNs();
++        const job = while (true) {
++            if (e.start(stream, program)) |j| break j else |err| switch (err) {
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Busy => if (nowNs() - t0 >= @as(u64, e.cfg.busy_ms) * std.time.ns_per_ms) return .{ .declined = .busy },
++            }
++            if (gone(hook)) return .{ .declined = .cancelled };
++            sleepMs(1);
++        };
++        const t1 = nowNs();
++        while (true) {
++            switch (e.poll(job)) {
++                .running => {},
++                .done => |r| return switch (r.status) {
++                    // `out` is the backend's until its next call for this stream: the body is copied first
++                    .ok => .{ .owned = .{ .body = try body(a, r.out), .kind = program.kind, .steps = r.steps, .exec_ns = r.exec_ns } },
++                    .abstain => .{ .declined = if (r.abstain) |why| from(why) else .abstain },
++                    .budget => .{ .declined = .budget },
++                    .fault => .{ .declined = .fault },
++                },
++            }
++            const late = nowNs() - t1 >= @as(u64, e.cfg.wall_ms) * std.time.ns_per_ms;
++            if (late or gone(hook)) {
++                e.cancel(job);
++                return .{ .declined = if (late) .wall else .cancelled };
++            }
++            sleepMs(1);
++        }
++    }
++
++    fn start(e: *Exec, stream: u64, program: api.Program) error{ OutOfMemory, Busy }!api.JobId {
++        e.acquire();
++        defer e.lock.store(false, .release);
++        return e.backend.start(stream, program, e.max_steps);
++    }
++
++    fn poll(e: *Exec, job: api.JobId) api.Poll {
++        e.acquire();
++        defer e.lock.store(false, .release);
++        return e.backend.poll(job);
++    }
++
++    fn cancel(e: *Exec, job: api.JobId) void {
++        e.acquire();
++        defer e.lock.store(false, .release);
++        e.backend.vtable.cancel(e.backend.ctx, job);
++    }
++
++    fn release(e: *Exec, stream: u64) void {
++        e.acquire();
++        defer e.lock.store(false, .release);
++        e.backend.vtable.release(e.backend.ctx, stream);
++    }
++
++    fn acquire(e: *Exec) void {
++        while (e.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
++    }
++};
++
++/// The lane's result body for a run that printed `out` and ended ok: the sandbox's rule, so the bytes match.
++pub fn body(a: Allocator, out: []const u8) Allocator.Error![]u8 {
++    return lane.runner.body(a, .{ .status = .ok, .stdout = out }, 0, 0);
++}
++
++fn from(why: api.Abstain) Decline {
++    return switch (why) {
++        inline else => |w| @field(Decline, @tagName(w)),
++    };
++}
++
++fn gone(hook: ?lane.Cancel) bool {
++    const c = hook orelse return false;
++    return c.gone(c.ctx);
++}
++
++fn sleepMs(ms: u64) void {
++    const ts: std.c.timespec = .{ .sec = 0, .nsec = @intCast(ms * std.time.ns_per_ms) };
++    _ = std.c.nanosleep(&ts, null);
++}
++
++pub fn nowNs() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
++}
+diff --git a/zig/src/core/compute_circuit_armd.json b/zig/src/core/compute_circuit_armd.json
+new file mode 100644
+index 000000000..d35fd2445
+--- /dev/null
++++ b/zig/src/core/compute_circuit_armd.json
+@@ -0,0 +1,264 @@
++{
++ "source": "imr-measure-20261101T155322Z off/d (G 58bece1d3 + compute lane, greedy, c=4)",
++ "calls": [
++  {
++   "task": "add30-06",
++   "call": 0,
++   "code": "a=140857552301908510213574088100\nb=690019271788334891377792747413\nprint(a+b)",
++   "status": "ok",
++   "output": "830876824090243401591366835513"
++  },
++  {
++   "task": "add30-11",
++   "call": 0,
++   "code": "a=461609435149449013647033723574\nb=681984820754533573978520423340\nprint(a+b)",
++   "status": "ok",
++   "output": "1143594255903982587625554146914"
++  },
++  {
++   "task": "add30-22",
++   "call": 0,
++   "code": "a=264278028996235349740985471434\nb=771565915835769397012014492734\nprint(a+b)",
++   "status": "ok",
++   "output": "1035843944832004746752999964168"
++  },
++  {
++   "task": "add30-23",
++   "call": 0,
++   "code": "a=201353929467531947324387649049\nb=878008121024580933149930071041\nprint(a+b)",
++   "status": "ok",
++   "output": "1079362050492112880474317720090"
++  },
++  {
++   "task": "add30-25",
++   "call": 0,
++   "code": "a=113795210844261092862101166842\nb=132376119681879481561963467234\nprint(a+b)",
++   "status": "ok",
++   "output": "246171330526140574424064634076"
++  },
++  {
++   "task": "add30-30",
++   "call": 0,
++   "code": "a=692917166071944244802612751294\nb=637124983390994126179087347218\nprint(a+b)",
++   "status": "ok",
++   "output": "1330042149462938370981700098512"
++  },
++  {
++   "task": "add30-33",
++   "call": 0,
++   "code": "a=522246220506633173639726478281\nb=738473471932250682253360151658\nprint(a+b)",
++   "status": "ok",
++   "output": "1260719692438883855893086629939"
++  },
++  {
++   "task": "add30-40",
++   "call": 0,
++   "code": "a=373587962793998036961665294312\nb=745804667042638645410155978295\nprint(a+b)",
++   "status": "ok",
++   "output": "1119392629836636682371821272607"
++  },
++  {
++   "task": "algo-36",
++   "call": 0,
++   "code": "import sys\ndata=list(map(int, sys.stdin.buffer.read().split()))\nn=data[0]\na=sorted(data[1:1+n])\nprefix=0\nans=0\nfor i,x in enumerate(a):\n    ans += x*i - prefix\n    prefix += x\nprint(ans)\n",
++   "status": "exit_error",
++   "output": "[stderr]\nTraceback (most recent call last):\n  File \"<code>\", line 2, in <module>\n    data=list(map(int, sys.stdin.buffer.read().split()))\n                       ^^^^^^^^^^^^^^^^\nAttributeError: '_io.StringIO' object has no attribute 'buffer'\n[exit status 1]"
++  },
++  {
++   "task": "algo-36",
++   "call": 1,
++   "code": "import sys\ns='''5\n884459 -967751 -759299 145943 -533788\n'''\ndata=list(map(int, s.split()))\nn=data[0]\na=sorted(data[1:1+n])\nprefix=0\nans=0\nfor i,x in enumerate(a):\n    ans += x*i - prefix\n    prefix += x\nprint(ans)\n",
++   "status": "ok",
++   "output": "9219324"
++  },
++  {
++   "task": "bignum-10",
++   "call": 0,
++   "code": "a=11232463670103386525\nb=732667528837627997\nc=242246186388029\nprint(a-b*129+c)\nprint(b*129)\n",
++   "status": "ok",
++   "output": "-83281405303764237059\n94514111220054011613"
++  },
++  {
++   "task": "bignum-18",
++   "call": 0,
++   "code": "print(2**114 - 3**67)",
++   "status": "ok",
++   "output": "20676477970991412677036223391469797"
++  },
++  {
++   "task": "div_big-04",
++   "call": 0,
++   "code": "a=-23777868243178464\nb=-41832496\nprint(a//b, a%b)\nprint(a/b)\nprint(divmod(a,b))\n",
++   "status": "ok",
++   "output": "568406634 0\n568406634.0\n(568406634, 0)"
++  },
++  {
++   "task": "div_big-08",
++   "call": 0,
++   "code": "from fractions import Fraction\nn=44253970636272\nprint(n//48, n%48)\nprint(Fraction(n,-48))\nprint(n/-48)\n",
++   "status": "ok",
++   "output": "921957721589 0\n-921957721589\n-921957721589.0"
++  },
++  {
++   "task": "div_big-20",
++   "call": 0,
++   "code": "from fractions import Fraction\nn=-160371104\nd=932\nf=Fraction(n,d)\nprint(f, float(f))\nprint(n//d, n%d)\nimport math\nprint(math.gcd(abs(n),d))\n",
++   "status": "ok",
++   "output": "-172072 -172072.0\n-172072 0\n932"
++  },
++  {
++   "task": "div_big-23",
++   "call": 0,
++   "code": "from fractions import Fraction\nn=32685677580\nd=-4826\nf=Fraction(n,d)\nprint(f, f.numerator, f.denominator)\nprint(n/d)\nimport math\nprint(math.gcd(n,4826))\n",
++   "status": "ok",
++   "output": "-6772830 -6772830 1\n-6772830.0\n4826"
++  },
++  {
++   "task": "div_big-32",
++   "call": 0,
++   "code": "from fractions import Fraction\nn=-334567426983174\nd=-8613\nprint(n//d, n%d)\nprint(Fraction(n,d))\nprint(divmod(n,d))\n",
++   "status": "ok",
++   "output": "38844470798 0\n38844470798\n(38844470798, 0)"
++  },
++  {
++   "task": "div_big-36",
++   "call": 0,
++   "code": "from fractions import Fraction\nn=392764052; d=116\nprint(n//d, n%d)\nprint(Fraction(n,d))\nprint(n/d)",
++   "status": "ok",
++   "output": "3385897 0\n3385897\n3385897.0"
++  },
++  {
++   "task": "mbpp-11",
++   "call": 0,
++   "code": "def remove_Occ(s, ch):\n    first = s.find(ch)\n    if first == -1:\n        return s\n\n    last = s.rfind(ch)\n    if first == last:\n        return s[:first] + s[first + 1:]\n\n    return s[:first] + s[first + 1:last] + s[last + 1:]\n\nassert remove_Occ(\"hello\", \"l\") == \"heo\"\nassert remove_Occ(\"banana\", \"a\") == \"bnan\"\nassert remove_Occ(\"abc\", \"x\") == \"abc\"\nassert remove_Occ(\"a\", \"a\") == \"\"\nassert remove_Occ(\"lll\", \"l\") == \"l\"\nprint(\"all tests passed\")",
++   "status": "ok",
++   "output": "all tests passed"
++  },
++  {
++   "task": "mbpp-12",
++   "call": 0,
++   "code": "def sort_matrix(matrix):\n    return sorted(matrix, key=sum)\n\nassert sort_matrix([[1, 2, 3], [2, 4, 5], [1, 1, 1]]) == [[1, 1, 1], [1, 2, 3], [2, 4, 5]]\nprint(\"passed\")",
++   "status": "ok",
++   "output": "passed"
++  },
++  {
++   "task": "mbpp-56",
++   "call": 0,
++   "code": "def check(n):\n    rev = int(str(n)[::-1])\n    return n == 2 * rev - 1\n\nprint(check(70))\nprint(check(13))\nprint(check(0))\n",
++   "status": "ok",
++   "output": "False\nFalse\nFalse"
++  },
++  {
++   "task": "mbpp-57",
++   "call": 0,
++   "code": "def find_Max_Num(digits):\n    if not digits:\n        return 0\n    return int(''.join(map(str, sorted(digits, reverse=True))))\n\nassert find_Max_Num([1,2,3]) == 321\nprint(find_Max_Num([1,2,3]))\nprint(find_Max_Num([0,0,0]))\nprint(find_Max_Num([9,0,1,5]))\n",
++   "status": "ok",
++   "output": "321\n0\n9510"
++  },
++  {
++   "task": "mbpp-61",
++   "call": 0,
++   "code": "s='112112'\nc=0\nsubs=[]\nfor i in range(len(s)):\n    sm=0\n    for j in range(i,len(s)):\n        sm+=int(s[j])\n        if sm==j-i+1:\n            c+=1; subs.append(s[i:j+1])\nprint(c, subs)\n",
++   "status": "ok",
++   "output": "6 ['1', '11', '1', '1', '11', '1']"
++  },
++  {
++   "task": "mbpp-66",
++   "call": 0,
++   "code": "def pos_count(numbers):\n    return sum(1 for number in numbers if number > 0)\n\nassert pos_count([1, -2, 3, -4]) == 2\nprint(pos_count([1, -2, 3, -4]))",
++   "status": "ok",
++   "output": "2"
++  },
++  {
++   "task": "mbpp-74",
++   "call": 0,
++   "code": "def is_samepatterns(colors, patterns):\n    if len(colors) != len(patterns):\n        return False\n\n    color_to_pattern = {}\n    pattern_to_color = {}\n\n    for color, pattern in zip(colors, patterns):\n        if color in color_to_pattern:\n            if color_to_pattern[color] != pattern:\n                return False\n        else:\n            color_to_pattern[color] = pattern\n\n        if pattern in pattern_to_color:\n            if pattern_to_color[pattern] != color:\n                return False\n        else:\n            pattern_to_color[pattern] = color\n\n    return True\n\nassert is_samepatterns([\"red\",\"green\",\"green\"], [\"a\", \"b\", \"b\"]) == True\nassert is_samepatterns([\"red\",\"green\",\"greenn\"], [\"a\",\"b\",\"b\"]) == False\nassert is_samepatterns([\"red\",\"green\",\"green\"], [\"a\",\"b\",\"c\"]) == False\nprint(\"ok\")",
++   "status": "ok",
++   "output": "ok"
++  },
++  {
++   "task": "mbpp-80",
++   "call": 0,
++   "code": "def tetrahedral_number(n):\n    return n * (n + 1) * (n + 2) // 6\n\nassert tetrahedral_number(5) == 35\nprint(tetrahedral_number(5))",
++   "status": "ok",
++   "output": "35"
++  },
++  {
++   "task": "mbpp-82",
++   "call": 0,
++   "code": "import math\n\ndef volume_sphere(radius):\n    return (4/3) * math.pi * radius ** 3\n\nprint(volume_sphere(10))\nprint(math.isclose(volume_sphere(10), 4188.790204786391, rel_tol=0.001))",
++   "status": "ok",
++   "output": "4188.790204786391\nTrue"
++  },
++  {
++   "task": "mbpp-86",
++   "call": 0,
++   "code": "def centered_hexagonal_number(n):\n    return 3 * n * (n - 1) + 1\n\nassert centered_hexagonal_number(10) == 271\nprint(centered_hexagonal_number(10))",
++   "status": "ok",
++   "output": "271"
++  },
++  {
++   "task": "mbpp-91",
++   "call": 0,
++   "code": "def find_substring(strings, substring):\n    return any(substring in s for s in strings)\n\nassert find_substring([\"red\", \"black\", \"white\", \"green\", \"orange\"], \"ack\") == True\nprint(\"passed\")",
++   "status": "ok",
++   "output": "passed"
++  },
++  {
++   "task": "mul30-14",
++   "call": 0,
++   "code": "a=831680992073052982499463120866\nb=548277608446792630955630629392\nprint(a*b)",
++   "status": "ok",
++   "output": "455992065324469389066179825281039054396652721075268148093472"
++  },
++  {
++   "task": "mul30-16",
++   "call": 0,
++   "code": "a=282668092539785370248997280888\nb=816005819957362936377102597457\nprint(a*b)",
++   "status": "ok",
++   "output": "230658808628711306228254750906181282393137692640595023501816"
++  },
++  {
++   "task": "mul_big-05",
++   "call": 0,
++   "code": "print(213625928 * 48215)",
++   "status": "ok",
++   "output": "10299974118520"
++  },
++  {
++   "task": "mul_big-08",
++   "call": 0,
++   "code": "from decimal import Decimal\nprint(Decimal('-27.201')*Decimal('4952356'))",
++   "status": "ok",
++   "output": "-134709035.556"
++  },
++  {
++   "task": "mul_big-17",
++   "call": 0,
++   "code": "from decimal import Decimal\nprint(Decimal('562.1') * Decimal('7.691'))",
++   "status": "ok",
++   "output": "4323.1111"
++  },
++  {
++   "task": "mul_big-18",
++   "call": 0,
++   "code": "from decimal import Decimal\nprint(Decimal('-540262.6')*Decimal('703773'))",
++   "status": "ok",
++   "output": "-380222230789.8"
++  },
++  {
++   "task": "mul_big-30",
++   "call": 0,
++   "code": "print(-502290021 * 145302369)",
++   "status": "ok",
++   "output": "-72983929976359749"
++  },
++  {
++   "task": "mul_big-40",
++   "call": 0,
++   "code": "print(28424792 * 72455974)",
++   "status": "ok",
++   "output": "2059545990107408"
++  }
++ ]
++}
+\ No newline at end of file
+diff --git a/zig/src/core/compute_circuit_proof_test.zig b/zig/src/core/compute_circuit_proof_test.zig
+new file mode 100644
+index 000000000..f7e7ea5c7
+--- /dev/null
++++ b/zig/src/core/compute_circuit_proof_test.zig
+@@ -0,0 +1,178 @@
++//! S3 on recorded arm-d calls (imr-measure-20261101T155322Z): real frontend, CPU circuit, graph first given a bank.
++const std = @import("std");
++const s3 = @import("compute_circuit.zig");
++const circuit = @import("runner_circuit.zig");
++const backend = @import("runner_circuit_backend.zig");
++const frontend = @import("runner_frontend.zig");
++const graph = @import("runner_graph.zig");
++const route = @import("runner_graph_route.zig");
++const ropen = @import("runner_open.zig");
++
++const gpa = std.testing.allocator;
++const Recorded = struct { task: []const u8, call: u32, code: []const u8, status: []const u8, output: []const u8 };
++const File = struct { source: []const u8, calls: []const Recorded };
++
++/// Calls each route must own, so the proof is never empty: calc lowers these on any backend.
++const calc_owned = [_][]const u8{ "add30-06", "add30-11", "add30-22", "add30-23", "add30-25", "add30-30", "add30-33", "add30-40", "mul30-14", "mul30-16", "mul_big-05", "mul_big-30", "mul_big-40", "bignum-18" };
++/// Two prints: one graph sequence on the bank, or an ELF when compiling (the build has the whole translate deadline).
++const bank_owned = [_][]const u8{"bignum-10"};
++/// Floor division with divmod and Fraction, Decimal: the graph bank's, or an ELF's when compiling.
++const graph_owned = [_][]const u8{ "div_big-04", "div_big-08", "div_big-20", "div_big-23", "div_big-32", "div_big-36", "mul_big-08", "mul_big-17", "mul_big-18" };
++/// Integer defs with asserts (mbpp-66 over a static int list, mbpp-56 reversing digits): the bank's, else an ELF's.
++const def_owned = [_][]const u8{ "mbpp-80", "mbpp-86", "mbpp-66", "mbpp-56" };
++
++test "compute runner proof: served S3 (no ELF): owned calls print the sandbox's bytes, never as an ELF" {
++    try proof(false);
++}
++
++test "compute runner proof: S3 with ELF programs: owned calls print the sandbox's bytes" {
++    try proof(true);
++}
++
++fn listed(list: []const []const u8, task: []const u8) bool {
++    for (list) |t| if (std.mem.eql(u8, t, task)) return true;
++    return false;
++}
++
++fn proof(elf: bool) !void {
++    const path = std.c.getenv("TF_RUNNER_CIRCUIT") orelse {
++        std.debug.print("skip compute runner proof: TF_RUNNER_CIRCUIT unset\n", .{});
++        return error.SkipZigTest;
++    };
++    var c = try circuit.Circuit.load(gpa, std.mem.span(path));
++    defer c.deinit(gpa);
++    const b = try backend.backend(gpa, &c, 2);
++    defer backend.destroy(b);
++    var ctx: frontend.Context = .{ .io = std.testing.io };
++    if (std.c.getenv("TF_RUNNER_CLANG")) |cxx| ctx.compiler.clang = std.mem.span(cxx);
++    if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
++    if (!elf) ctx.compiler.scratch_root = ""; // runner_open's no-compile frontend (TF_COMPUTE_LANE_RUNNER_ELF=0)
++    var e: s3.Exec = .{ .frontend = ctx.frontend(), .backend = b, .max_steps = 4_000_000, .cfg = .{ .wall_ms = 600_000, .elf = elf } };
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // TF_RUNNER_GRAPH_BANK: the served graph backend's route (runner_open), T1's bank first and the circuit behind it
++    var bank: graph.Bank = undefined;
++    var routed: route.Routed = undefined;
++    var dispatch: route.Dispatch = undefined;
++    const with_bank = std.c.getenv("TF_RUNNER_GRAPH_BANK");
++    if (with_bank) |g| {
++        bank = try graph.Bank.load(gpa, std.mem.span(g));
++        routed = .{ .inner = e.frontend, .bank = &bank };
++        dispatch = .{ .gpa = gpa, .circuit = b, .graph = try graph.backend(gpa, &bank, 2), .bank = &bank };
++        e.frontend = routed.frontend();
++        e.backend = dispatch.backend();
++    }
++    defer if (with_bank != null) {
++        const on_graph = dispatch.graph;
++        dispatch.deinit();
++        graph.destroy(on_graph);
++        bank.deinit();
++    };
++    std.debug.print("compute runner proof: backend {s}, ELF {s}\n", .{ if (with_bank != null) "graph, circuit behind it" else "circuit", if (elf) "on" else "off" });
++    const file = try std.json.parseFromSliceLeaky(File, a, @embedFile("compute_circuit_armd.json"), .{});
++    var owned: u32 = 0;
++    var wrong: u32 = 0;
++    for (file.calls) |r| {
++        const got = try e.run(a, r.code, null);
++        switch (got) {
++            .owned => |w| {
++                owned += 1;
++                std.debug.print("{s}#{d}: in-model runner ({t}, {d} steps, {d} us)\n", .{ r.task, r.call, w.kind, w.steps, w.exec_ns / 1000 });
++                // only a call the sandbox ran ok can match: its recorded body is then the same bytes
++                if (!std.mem.eql(u8, r.status, "ok") or !std.mem.eql(u8, r.output, w.body)) {
++                    std.debug.print("  DIFFERS: sandbox {s} [{s}], circuit [{s}]\n", .{ r.status, r.output, w.body });
++                    wrong += 1;
++                }
++                if (!elf and w.kind == .elf) {
++                    std.debug.print("  ELF: built with the compile off\n", .{});
++                    wrong += 1;
++                }
++            },
++            .declined => |why| std.debug.print("{s}#{d}: code tool ({t})\n", .{ r.task, r.call, why }),
++        }
++        const must = listed(&calc_owned, r.task) or (listed(&bank_owned, r.task) and (with_bank != null or elf)) or
++            (listed(&graph_owned, r.task) and (with_bank != null or elf)) or
++            (listed(&def_owned, r.task) and (with_bank != null or elf));
++        if (must and got != .owned) {
++            std.debug.print("  MUST OWN: {s} went to the code tool\n", .{r.task});
++            wrong += 1;
++        }
++    }
++    std.debug.print("compute runner proof: {d} of {d} recorded calls ran on the circuit\n", .{ owned, file.calls.len });
++    try std.testing.expectEqual(@as(u32, 0), wrong);
++}
++
++test "compute runner proof: S3 beside the cell runner loads the circuit (and graph bank) once and runs on it" {
++    const path = std.c.getenv("TF_RUNNER_CIRCUIT") orelse return error.SkipZigTest;
++    // a runner lives as long as the engine (no deinit, workers idle on its memory): this test never frees them
++    const p = std.heap.page_allocator;
++    var cfg: ropen.Config = .{ .circuit = std.mem.span(path), .workers = 1 };
++    if (std.c.getenv("TF_RUNNER_GRAPH_BANK")) |g| {
++        cfg.backend = .graph;
++        cfg.graph_bank = std.mem.span(g);
++    }
++    const files: u32 = if (cfg.backend == .graph) 2 else 1;
++    const before = ropen.loaded();
++    const cells = try ropen.open(p, cfg);
++    try std.testing.expectEqual(before + files, ropen.loaded());
++    var lane_cfg = cfg;
++    lane_cfg.compile = false; // as served: S3's runner never compiles
++    const lane = try ropen.openSharing(p, lane_cfg, cells);
++    try std.testing.expectEqual(before + files, ropen.loaded());
++    try std.testing.expect(ropen.compiles(cells) and !ropen.compiles(lane));
++    var e = s3.Exec.init(.{ .runner = lane, .cfg = .{ .wall_ms = 600_000 } });
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const got = try e.run(arena.allocator(), "a = 6\nb = 7\nprint(a * b)", null);
++    try std.testing.expect(got == .owned);
++    try std.testing.expectEqualStrings("42", got.owned.body);
++    // another path to the same file is another file to this rule: it loads (strings compare, never inodes)
++    var other = cfg;
++    other.circuit = try std.fmt.allocPrint(p, "/{s}", .{cfg.circuit});
++    _ = try ropen.openSharing(p, other, cells);
++    try std.testing.expectEqual(before + files + 1, ropen.loaded());
++}
++
++/// Python cells built as ELF: CPython's stdout as the sandbox shows it, in pinned steps (a tf_py_print call per value).
++const Golden = struct { code: []const u8, stdout: []const u8, steps: u64 };
++const goldens = [_]Golden{
++    .{ .code = "def square_perimeter(side):\n    return 4 * side\n\nassert square_perimeter(10) == 40\nprint(square_perimeter(10))", .stdout = "40\n", .steps = 85 },
++    .{ .code = "def factorial(n):\n    result = 1\n    for i in range(2, n + 1):\n        result *= i\n    return result\n\nfor n in [0, 1, 5, 12]:\n    print(factorial(n))\n", .stdout = "1\n1\n120\n479001600\n", .steps = 589 },
++    .{ .code = "def check(n):\n    rev = int(str(n)[::-1])\n    return n == 2 * rev - 1\n\nprint(check(70))\nprint(check(13))\nprint(check(0))\n", .stdout = "False\nFalse\nFalse\n", .steps = 187 },
++    .{ .code = "def pos_count(numbers):\n    return sum(1 for number in numbers if number > 0)\n\nassert pos_count([1, -2, 3, -4]) == 2\nprint(pos_count([1, -2, 3, -4]))", .stdout = "2\n", .steps = 195 },
++    .{ .code = "def tetrahedral_number(n):\n    return n * (n + 1) * (n + 2) // 6\n\nassert tetrahedral_number(5) == 35\nprint(tetrahedral_number(5))", .stdout = "35\n", .steps = 121 },
++    .{ .code = "def centered_hexagonal_number(n):\n    return 3 * n * (n - 1) + 1\n\nassert centered_hexagonal_number(10) == 271\nprint(centered_hexagonal_number(10))", .stdout = "271\n", .steps = 115 },
++    .{ .code = "def edge(x):\n    return x * 3 - 7\n\nprint(edge(0), edge(-5), edge(2), edge(715827882))\nprint(edge(3) == 2, edge(1) > 0, 'done')\n", .stdout = "-7 -22 -1 2147483639\nTrue False done\n", .steps = 508 },
++    .{ .code = "def total(xs):\n    return sum(1 for x in xs if x < 0) - len(xs)\n\nprint(total([-1, 2, -3]), total([5]))\nprint(-10 // 3, -10 % 3, 0 - 2147483647)\n", .stdout = "-1 -1\n-4 2 -2147483647\n", .steps = 563 },
++    .{ .code = "def low(x):\n    return x - 1\n\nprint(low(-2147483647), low(1) == 0)\n", .stdout = "-2147483648 True\n", .steps = 293 },
++};
++
++test "compute runner goldens: Python cells as ELF print CPython's bytes in pinned circuit steps" {
++    const path = std.c.getenv("TF_RUNNER_CIRCUIT") orelse return error.SkipZigTest;
++    var c = try circuit.Circuit.load(gpa, std.mem.span(path));
++    defer c.deinit(gpa);
++    const b = try backend.backend(gpa, &c, 1);
++    defer backend.destroy(b);
++    var ctx: frontend.Context = .{ .io = std.testing.io };
++    if (std.c.getenv("TF_RUNNER_CLANG")) |l| ctx.compiler.clang = std.mem.span(l);
++    if (std.c.getenv("TF_RUNNER_LLD")) |l| ctx.compiler.linker = std.mem.span(l);
++    var e: s3.Exec = .{ .frontend = ctx.frontend(), .backend = b, .max_steps = 4_000_000, .cfg = .{ .wall_ms = 600_000, .elf = true } };
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    var wrong: u32 = 0;
++    for (goldens) |g| {
++        switch (try e.run(arena.allocator(), g.code, null)) {
++            .owned => |w| {
++                const sandbox = try @import("compute_lane.zig").runner.body(arena.allocator(), .{ .status = .ok, .stdout = g.stdout }, 0, 0);
++                std.debug.print("golden {t}, {d} steps: {s}\n", .{ w.kind, w.steps, w.body });
++                if (w.kind != .elf or !std.mem.eql(u8, w.body, sandbox) or w.steps != g.steps) wrong += 1;
++            },
++            .declined => |why| {
++                std.debug.print("golden declined ({t}): {s}\n", .{ why, g.code });
++                wrong += 1;
++            },
++        }
++    }
++    try std.testing.expectEqual(@as(u32, 0), wrong);
++}
+diff --git a/zig/src/core/compute_circuit_test.zig b/zig/src/core/compute_circuit_test.zig
+new file mode 100644
+index 000000000..65be3573e
+--- /dev/null
++++ b/zig/src/core/compute_circuit_test.zig
+@@ -0,0 +1,220 @@
++//! S3 (core/compute_circuit.zig) with a scripted frontend and backend (the arm-d proof: compute_circuit_proof_test).
++const std = @import("std");
++const api = @import("runner_api.zig");
++const s3 = @import("compute_circuit.zig");
++const lane = @import("compute_lane.zig");
++
++const gpa = std.testing.allocator;
++
++/// Code "abstain:<reason>" abstains; other code is a calc program whose bytes are the code (the backend's script).
++const Front = struct {
++    cells: u32 = 0,
++    last: api.Cell = .{ .form = .repl, .lang = "", .code = "" },
++
++    fn frontend(f: *Front) api.Frontend {
++        return .{ .ctx = f, .translate = translate };
++    }
++
++    fn translate(ctx: ?*anyopaque, a: std.mem.Allocator, cell: api.Cell) std.mem.Allocator.Error!api.Translation {
++        _ = a;
++        const f: *Front = @ptrCast(@alignCast(ctx.?));
++        f.cells += 1;
++        f.last = cell;
++        if (std.mem.startsWith(u8, cell.code, "abstain:")) return .{ .abstain = std.meta.stringToEnum(api.Abstain, cell.code["abstain:".len..]).? };
++        if (std.mem.startsWith(u8, cell.code, "elf:")) return .{ .program = .{ .kind = .elf, .bytes = cell.code["elf:".len..] } };
++        return .{ .program = .{ .kind = .calc, .bytes = cell.code } };
++    }
++};
++
++/// Program bytes script the run: ok:<out>, budget:<out>, fault:<out>, abstain, forever, else ok; `busy` refuses starts.
++const Back = struct {
++    busy: u32 = 0,
++    started: u32 = 0,
++    cancelled: u32 = 0,
++    released: u32 = 0,
++    script: []const u8 = "",
++
++    fn backend(b: *Back) api.Backend {
++        return .{ .ctx = b, .vtable = &.{ .start = start, .poll = poll, .cancel = cancel, .release = release } };
++    }
++
++    fn start(ctx: *anyopaque, stream: u64, p: api.Program, budget: u64) error{ OutOfMemory, Busy }!api.JobId {
++        _ = .{ stream, budget };
++        const b: *Back = @ptrCast(@alignCast(ctx));
++        if (b.busy > 0) {
++            b.busy -= 1;
++            return error.Busy;
++        }
++        b.started += 1;
++        b.script = p.bytes;
++        return b.started;
++    }
++
++    fn poll(ctx: *anyopaque, job: api.JobId) api.Poll {
++        _ = job;
++        const b: *Back = @ptrCast(@alignCast(ctx));
++        const colon = std.mem.findScalar(u8, b.script, ':') orelse b.script.len;
++        const out = if (colon < b.script.len) b.script[colon + 1 ..] else "";
++        const head = b.script[0..colon];
++        if (std.mem.eql(u8, head, "forever")) return .running;
++        if (std.mem.eql(u8, head, "abstain")) return .{ .done = .{ .status = .abstain, .abstain = .too_big } };
++        const status = std.meta.stringToEnum(api.Status, head) orelse .ok; // a real cell: runs ok
++        return .{ .done = .{ .status = status, .out = out, .steps = 7, .exec_ns = 1000 } };
++    }
++
++    fn cancel(ctx: *anyopaque, job: api.JobId) void {
++        _ = job;
++        const b: *Back = @ptrCast(@alignCast(ctx));
++        b.cancelled += 1;
++    }
++
++    fn release(ctx: *anyopaque, stream: u64) void {
++        _ = stream;
++        const b: *Back = @ptrCast(@alignCast(ctx));
++        b.released += 1;
++    }
++};
++
++const Fixture = struct {
++    front: Front = .{},
++    back: Back = .{},
++    arena: std.heap.ArenaAllocator = .init(gpa),
++
++    fn exec(f: *Fixture, cfg: s3.Config) s3.Exec {
++        return .{ .frontend = f.front.frontend(), .backend = f.back.backend(), .max_steps = 1000, .cfg = cfg };
++    }
++
++    fn run(f: *Fixture, cfg: s3.Config, code: []const u8, hook: ?lane.Cancel) !s3.Outcome {
++        var e = f.exec(cfg);
++        return e.run(f.arena.allocator(), code, hook);
++    }
++};
++
++fn expectOwned(want: []const u8, got: s3.Outcome) !void {
++    try std.testing.expect(got == .owned);
++    try std.testing.expectEqualStrings(want, got.owned.body);
++}
++
++fn expectDeclined(want: s3.Decline, got: s3.Outcome) !void {
++    try std.testing.expect(got == .declined);
++    try std.testing.expectEqual(want, got.declined);
++}
++
++test "compute runner: a run that halts ok is the lane's body: one trailing newline cut, nothing printed is [no output]" {
++    var f: Fixture = .{};
++    defer f.arena.deinit();
++    try expectOwned("42", try f.run(.{}, "ok:42\n", null));
++    try expectOwned("1\n2", try f.run(.{}, "ok:1\n2\n", null));
++    try expectOwned("[no output]", try f.run(.{}, "ok:", null));
++    // the sandbox's own rule on the same stdout gives the same bytes
++    const sandbox = try lane.runner.body(f.arena.allocator(), .{ .status = .ok, .stdout = "830876824090243401591366835513\n" }, 0, 0);
++    try expectOwned(sandbox, try f.run(.{}, "ok:830876824090243401591366835513\n", null));
++    const o = try f.run(.{}, "ok:x\n", null);
++    try std.testing.expectEqual(s3.Kind.calc, o.owned.kind);
++    try std.testing.expectEqual(@as(u64, 7), o.owned.steps);
++}
++
++test "compute runner: an ELF program runs only with _ELF on; off, it declines as elf and starts nothing" {
++    var f: Fixture = .{};
++    defer f.arena.deinit();
++    try expectDeclined(.elf, try f.run(.{}, "elf:ok:42\n", null));
++    try std.testing.expectEqual(@as(u32, 0), f.back.started);
++    const o = try f.run(.{ .elf = true }, "elf:ok:42\n", null);
++    try expectOwned("42", o);
++    try std.testing.expectEqual(s3.Kind.elf, o.owned.kind);
++}
++
++test "compute runner: a lane call is a fresh python fence cell: no earlier call's names" {
++    var f: Fixture = .{};
++    defer f.arena.deinit();
++    _ = try f.run(.{}, "ok:1\n", null);
++    _ = try f.run(.{}, "ok:2\n", null);
++    try std.testing.expectEqual(api.Form.fence, f.front.last.form);
++    try std.testing.expectEqualStrings("python", f.front.last.lang);
++    try std.testing.expectEqual(@as(usize, 0), f.front.last.prior.len);
++}
++
++test "compute runner: every frontend abstain declines with its reason and starts nothing" {
++    var f: Fixture = .{};
++    defer f.arena.deinit();
++    inline for (@typeInfo(api.Abstain).@"enum".field_names) |name| {
++        try expectDeclined(@field(s3.Decline, name), try f.run(.{}, "abstain:" ++ name, null));
++    }
++    try std.testing.expectEqual(@as(u32, 0), f.back.started);
++}
++
++test "compute runner: backend abstain, budget and fault decline; their partial output is never a body" {
++    var f: Fixture = .{};
++    defer f.arena.deinit();
++    try expectDeclined(.too_big, try f.run(.{}, "abstain", null));
++    try expectDeclined(.budget, try f.run(.{}, "budget:12", null));
++    try expectDeclined(.fault, try f.run(.{}, "fault:12", null));
++    try std.testing.expectEqual(@as(u32, 3), f.back.released);
++}
++
++test "compute runner: a busy backend is retried until a slot frees; past busy_ms the call declines busy" {
++    var f: Fixture = .{};
++    defer f.arena.deinit();
++    f.back.busy = 3;
++    try expectOwned("5", try f.run(.{}, "ok:5\n", null));
++    f.back.busy = 1 << 30;
++    try expectDeclined(.busy, try f.run(.{ .busy_ms = 5 }, "ok:5\n", null));
++    try std.testing.expectEqual(@as(u32, 1), f.back.started);
++}
++
++test "compute runner: a run past wall_ms is cancelled and declines wall; a gone client declines cancelled" {
++    var f: Fixture = .{};
++    defer f.arena.deinit();
++    try expectDeclined(.wall, try f.run(.{ .wall_ms = 5 }, "forever", null));
++    try std.testing.expectEqual(@as(u32, 1), f.back.cancelled);
++    const Gone = struct {
++        fn yes(ctx: *anyopaque) bool {
++            _ = ctx;
++            return true;
++        }
++    };
++    var dummy: u8 = 0;
++    try expectDeclined(.cancelled, try f.run(.{}, "forever", .{ .ctx = &dummy, .gone = Gone.yes }));
++    try std.testing.expectEqual(@as(u32, 2), f.back.cancelled);
++    try std.testing.expectEqual(@as(u32, 2), f.back.released);
++}
++
++test "compute runner: S3 knobs: defaults, values and bad values" {
++    const Env = struct {
++        var pairs: []const [2][]const u8 = &.{};
++        fn get(name: []const u8) ?[]const u8 {
++            for (pairs) |p| if (std.mem.eql(u8, p[0], name)) return p[1];
++            return null;
++        }
++    };
++    Env.pairs = &.{};
++    try std.testing.expectEqual(s3.Config{}, try s3.Config.parse(Env.get, "X"));
++    Env.pairs = &.{ .{ "X_WALL_MS", "50" }, .{ "X_BUSY_MS", "0" }, .{ "X_VERIFY", "1" }, .{ "X_ELF", "1" } };
++    try std.testing.expectEqual(s3.Config{ .wall_ms = 50, .busy_ms = 0, .verify = true, .elf = true }, try s3.Config.parse(Env.get, "X"));
++    Env.pairs = &.{.{ "X_VERIFY", "2" }};
++    try std.testing.expectError(error.BadKnob, s3.Config.parse(Env.get, "X"));
++    Env.pairs = &.{.{ "X_WALL_MS", "0" }};
++    try std.testing.expectError(error.BadKnob, s3.Config.parse(Env.get, "X"));
++}
++
++test "compute runner: S3's switch sits under the lane's names, off by default and off without the lane" {
++    const Env = struct {
++        var pairs: []const [2][]const u8 = &.{};
++        fn get(name: []const u8) ?[]const u8 {
++            for (pairs) |kv| if (std.mem.eql(u8, kv[0], name)) return kv[1];
++            return null;
++        }
++    };
++    const lanes = @import("compute_binding.zig");
++    try std.testing.expectEqualStrings("TF_COMPUTE_LANE_RUNNER", s3.binding(.{}).prefix);
++    try std.testing.expectEqualStrings("TF_DSV41_COMPUTE_LANE_RUNNER", s3.binding(lanes.dsv41).alias.?);
++    Env.pairs = &.{ .{ "TF_COMPUTE_LANE", "1" }, .{ "TF_RUNNER", "1" }, .{ "TF_RUNNER_CIRCUIT", "/c.tfpc" } };
++    try std.testing.expectEqual(null, try s3.open(.{}, gpa, &Env.get, true, null, null)); // the lane and runner on: S3 off
++    Env.pairs = &.{ .{ "TF_COMPUTE_LANE_RUNNER", "1" }, .{ "TF_COMPUTE_LANE_RUNNER_CIRCUIT", "/c.tfpc" } };
++    try std.testing.expectEqual(null, try s3.open(.{}, gpa, &Env.get, false, null, null)); // no lane: nothing to run
++    Env.pairs = &.{ .{ "TF_COMPUTE_LANE_RUNNER", "1" }, .{ "TF_DSV41_COMPUTE_LANE_RUNNER", "1" } };
++    try std.testing.expectError(error.BadKnob, s3.open(lanes.dsv41, gpa, &Env.get, true, null, null));
++    // DeepSeek-V4.1's switch reads S3's knobs under its own names (a bad one stops the boot before a runner opens)
++    Env.pairs = &.{ .{ "TF_DSV41_COMPUTE_LANE_RUNNER", "1" }, .{ "TF_DSV41_COMPUTE_LANE_RUNNER_CIRCUIT", "/c.tfpc" }, .{ "TF_DSV41_COMPUTE_LANE_RUNNER_WALL_MS", "0" } };
++    try std.testing.expectError(error.BadKnob, s3.open(lanes.dsv41, gpa, &Env.get, true, null, null));
++}
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 2fe462e46..4751619ad 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -19,6 +19,8 @@ pub const kv_ledger = @import("kv_ledger.zig");
+ pub const hold = @import("engine_hold.zig");
+ /// The in-model runner a family opens from its binding's knobs (runner_binding.zig); the server gives it the tokenizer.
+ pub const runner = @import("runner_open.zig");
++/// S3: the compute lane's calls the in-model runner can run, on the circuit (off by default; compute_circuit.zig).
++pub const compute_circuit = @import("compute_circuit.zig");
+ /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
+ pub const Image = lanes.stream.Image;
+ 
+@@ -241,6 +243,7 @@ pub const Info = struct {
+     compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
+     compute_tool: hold.compute_lane.Tool = .{}, // the built-in tool its binding names (compute_binding.zig)
+     runner: ?*runner.Runner = null, // the in-model runner: the server gives it the tokenizer and chats set run_cells
++    compute_runner: ?compute_circuit.Setup = null, // S3: lane calls the circuit can run go there (compute_circuit.zig)
+ 
+     pub const Capability = @import("engine_capabilities.zig").Capability;
+ 
+diff --git a/zig/src/core/lane_host_tests.zig b/zig/src/core/lane_host_tests.zig
+index a52e7b9b8..3ba5f4c23 100644
+--- a/zig/src/core/lane_host_tests.zig
++++ b/zig/src/core/lane_host_tests.zig
+@@ -33,6 +33,8 @@ test {
+     _ = @import("runner_test.zig");
+     _ = @import("runner_binding.zig");
+     _ = @import("runner_proof_test.zig");
++    _ = @import("compute_circuit_test.zig");
++    _ = @import("compute_circuit_proof_test.zig");
+     _ = @import("runner_place_test.zig");
+     _ = @import("runner_graph_route.zig");
+     _ = @import("runner_graph_dispatch.zig");
+diff --git a/zig/src/core/runner_s3_bench.zig b/zig/src/core/runner_s3_bench.zig
+new file mode 100644
+index 000000000..99a87e8ef
+--- /dev/null
++++ b/zig/src/core/runner_s3_bench.zig
+@@ -0,0 +1,316 @@
++//! S3 lane calls (whole tool scripts) through the served runner, run as S3 runs them: route, steps, ms; no GPU.
++const std = @import("std");
++const api = @import("runner_api.zig");
++const runner = @import("runner.zig");
++const ropen = @import("runner_open.zig");
++const prog = @import("runner_graph_program.zig");
++const lane = @import("compute_lane.zig");
++const rc = @import("runner_circuit.zig");
++const elf_cache = @import("runner_frontend_elf_cache.zig");
++const s3 = @import("compute_circuit.zig");
++const linux = std.os.linux;
++
++fn now() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
++}
++
++/// The process environment main was given, for the knob lookup the lane, runner and S3 configs parse with.
++var environ: ?*const std.process.Environ.Map = null;
++
++fn env(name: []const u8) ?[]const u8 {
++    const v = (environ orelse return null).get(name) orelse return null;
++    return if (v.len == 0) null else v;
++}
++
++fn pinTo(cpu: u32) void {
++    var set: [16]u64 = @splat(0);
++    set[cpu / 64] = @as(u64, 1) << @intCast(cpu % 64);
++    _ = linux.syscall3(.sched_setaffinity, 0, @sizeOf(@TypeOf(set)), @intFromPtr(&set));
++}
++
++const Cell = struct { id: []const u8, code: []const u8, want: []const u8 };
++
++/// The route a program takes on the served backend: one bank packet, a sequence of them, calc or ELF on the circuit.
++fn route(p: api.Program) []const u8 {
++    return switch (p.kind) {
++        .graph => if (std.mem.startsWith(u8, p.bytes, prog.seq_magic_v2)) "graph-seq2" else if (std.mem.startsWith(u8, p.bytes, prog.seq_magic)) "graph-seq" else "graph",
++        .calc => "calc",
++        .elf => "elf",
++    };
++}
++
++/// Pieces in a graph sequence (1 for anything else).
++fn pieces(p: api.Program) usize {
++    if (p.kind != .graph or !std.mem.startsWith(u8, p.bytes, "TFGS")) return 1;
++    return std.mem.count(u8, p.bytes[prog.seq_magic.len..], "\n");
++}
++
++/// One cell's staged run: translate, then start and spin-poll to the end (the backend's own time, no S3 naps).
++const Staged = struct { route: []const u8 = "abstain", pieces: usize = 0, bytes: usize = 0, translate: u64 = 0, run: u64 = 0, steps: u64 = 0, exec: u64 = 0, boot: u64 = 0, eval: u64 = 0, ok: bool = false };
++
++/// A circuit program's boot (the snapshot and the program loaded) and its steps, timed apart on this thread.
++fn split(c: *const rc.Circuit, p: api.Program, budget: u64, s: *Staged) !void {
++    const gpa = std.heap.c_allocator;
++    const t0 = now();
++    var m = try rc.Machine.boot(gpa, c, p);
++    defer m.deinit(gpa);
++    const t1 = now();
++    var out: std.ArrayList(u8) = .empty;
++    defer out.deinit(gpa);
++    const never: std.atomic.Value(bool) = .init(false);
++    _ = try m.run(budget, &out, null, &never);
++    s.boot = t1 - t0;
++    s.eval = now() - t1;
++}
++
++fn staged(a: std.mem.Allocator, r: *runner.Runner, c: Cell, stream: u64, circuit: ?*const rc.Circuit) !Staged {
++    var s: Staged = .{};
++    const t0 = now();
++    const t = try r.frontend.translate(r.frontend.ctx, a, .{ .form = .fence, .lang = "python", .code = c.code });
++    const t1 = now();
++    s.translate = t1 - t0;
++    const p = switch (t) {
++        .program => |p| p,
++        .abstain => return s,
++    };
++    s.route = route(p);
++    s.pieces = pieces(p);
++    s.bytes = p.bytes.len;
++    defer r.backend.release(stream);
++    const job = try r.backend.start(stream, p, r.cfg.max_steps);
++    const res = while (true) switch (r.backend.poll(job)) {
++        .running => std.atomic.spinLoopHint(),
++        .done => |x| break x,
++    };
++    s.run = now() - t1;
++    s.steps = res.steps;
++    s.exec = res.exec_ns;
++    s.ok = res.status == .ok and std.mem.eql(u8, res.out, c.want);
++    if (circuit) |k| if (p.kind != .graph) try split(k, p, r.cfg.max_steps, &s);
++    return s;
++}
++
++/// One S3 call as compute_circuit.Exec.run makes it: translate, start, poll with 1 ms naps; its body.
++fn call(a: std.mem.Allocator, r: *runner.Runner, code: []const u8, stream: u64) !?[]u8 {
++    const t = try r.frontend.translate(r.frontend.ctx, a, .{ .form = .fence, .lang = "python", .code = code });
++    const p = switch (t) {
++        .program => |p| p,
++        .abstain => return null,
++    };
++    defer r.backend.release(stream);
++    const job = while (true) {
++        if (r.backend.start(stream, p, r.cfg.max_steps)) |j| break j else |e| switch (e) {
++            error.OutOfMemory => return e,
++            error.Busy => nap(),
++        }
++    };
++    while (true) {
++        switch (r.backend.poll(job)) {
++            .running => {},
++            .done => |x| return if (x.status == .ok) try lane.runner.body(a, .{ .status = .ok, .stdout = x.out }, 0, 0) else null,
++        }
++        nap();
++    }
++}
++
++fn nap() void {
++    const ts: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
++    _ = std.c.nanosleep(&ts, null);
++}
++
++const Row = struct { st: Staged, e2e: [2]u64, served_ok: bool };
++
++fn median(xs: []u64) u64 {
++    std.mem.sort(u64, xs, {}, std.sort.asc(u64));
++    return xs[xs.len / 2];
++}
++
++fn ms(ns: u64) f64 {
++    return @as(f64, @floatFromInt(ns)) / 1e6;
++}
++
++/// The code tool S3 falls back to (TF_S3_BENCH_SANDBOX=1): each call in the lane's sandbox, first and p50 as S3's.
++fn sandboxed(gpa: std.mem.Allocator, cells: []const Cell, reps: u32) !u8 {
++    const cfg = (try lane.Config.parse(&env, "TF_COMPUTE_LANE")) orelse {
++        std.debug.print("TF_COMPUTE_LANE is off\n", .{});
++        return 2;
++    };
++    var pool = lane.Pool.init(cfg, &.{ "/proc/self/exe", "__compute_sandbox" });
++    const e2es = try gpa.alloc(u64, reps);
++    var first: std.ArrayList(u64) = .empty;
++    var all: std.ArrayList(u64) = .empty;
++    var same: u32 = 0;
++    std.debug.print("| cell | route | exec ms | sandbox first ms | sandbox p50 ms | body |\n|---|---|---|---|---|---|\n", .{});
++    for (cells) |c| {
++        var ok = true;
++        var exec: u64 = 0;
++        for (0..reps) |i| {
++            var arena = std.heap.ArenaAllocator.init(gpa);
++            defer arena.deinit();
++            const t0 = now();
++            const o = try pool.run(arena.allocator(), c.code, null);
++            e2es[i] = now() - t0;
++            exec = o.exec_ns;
++            if (o.status != .ok or !std.mem.eql(u8, o.stdout, c.want)) ok = false;
++        }
++        try first.append(gpa, e2es[0]);
++        try all.append(gpa, median(e2es));
++        same += @intFromBool(ok);
++        std.debug.print("| {s} | sandbox | {d:.2} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, ms(exec), ms(e2es[0]), ms(median(e2es)), if (ok) "= CPython" else "DIFFERS" });
++    }
++    std.mem.sort(u64, all.items, {}, std.sort.asc(u64));
++    std.mem.sort(u64, first.items, {}, std.sort.asc(u64));
++    const v = all.items;
++    std.debug.print("\nS3 call p50 over cells: median {d:.2} ms, p90 {d:.2} ms, max {d:.2} ms; {d}/{d} bodies = CPython\n", .{ ms(v[v.len / 2]), ms(v[(v.len * 9) / 10]), ms(v[v.len - 1]), same, v.len });
++    std.debug.print("S3 first call over cells: median {d:.2} ms, max {d:.2} ms; sandbox\n", .{ ms(first.items[first.items.len / 2]), ms(first.items[first.items.len - 1]) });
++    return if (same == v.len) 0 else 1;
++}
++
++/// n request threads at once (TF_S3_BENCH_THREADS=n), as the server's at c=n: S3's own executor or the lane's pool.
++const Load = struct { cells: []const Cell, reps: u32, threads: usize, exec: ?*s3.Exec, pool: ?*lane.Pool, io: std.Io, ns: []u64, ok: []bool };
++
++fn worker(l: *Load, t: usize) void {
++    const n = l.cells.len;
++    for (0..l.reps) |rep| for (0..n) |k| {
++        // threads start three cells apart, so calls at one time are mostly different cells
++        const i = (k + t * 3) % n;
++        const c = l.cells[i];
++        var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
++        defer arena.deinit();
++        const want = lane.runner.body(arena.allocator(), .{ .status = .ok, .stdout = c.want }, 0, 0) catch return;
++        const t0 = now();
++        const good = if (l.exec) |e| blk: {
++            elf_cache.reset(l.io);
++            const o = e.run(arena.allocator(), c.code, null) catch break :blk false;
++            break :blk o == .owned and std.mem.eql(u8, o.owned.body, want);
++        } else blk: {
++            const o = l.pool.?.run(arena.allocator(), c.code, null) catch break :blk false;
++            break :blk o.status == .ok and std.mem.eql(u8, o.stdout, c.want);
++        };
++        l.ns[(t * l.reps + rep) * n + i] = now() - t0;
++        if (!good) l.ok[i] = false;
++    };
++}
++
++/// Per cell: first = median of the threads' first calls, p50 over all; the ELF arm empties the image cache per call.
++fn concurrent(gpa: std.mem.Allocator, io: std.Io, cells: []const Cell, reps: u32, threads: usize, r: ?*runner.Runner) !u8 {
++    var exec: s3.Exec = undefined;
++    var pool: lane.Pool = undefined;
++    var l: Load = .{ .cells = cells, .reps = reps, .threads = threads, .exec = null, .pool = null, .io = io, .ns = try gpa.alloc(u64, threads * reps * cells.len), .ok = try gpa.alloc(bool, cells.len) };
++    @memset(l.ok, true);
++    if (r) |served| {
++        var cfg = try s3.Config.parse(&env, "TF_COMPUTE_LANE_RUNNER");
++        cfg.elf = true;
++        exec = s3.Exec.init(.{ .runner = served, .cfg = cfg });
++        l.exec = &exec;
++    } else {
++        const cfg = (try lane.Config.parse(&env, "TF_COMPUTE_LANE")) orelse return 2;
++        pool = lane.Pool.init(cfg, &.{ "/proc/self/exe", "__compute_sandbox" });
++        l.pool = &pool;
++    }
++    const hits = elf_cache.hitCount(io);
++    const handles = try gpa.alloc(std.Thread, threads);
++    for (handles, 0..) |*h, t| h.* = try std.Thread.spawn(.{}, worker, .{ &l, t });
++    for (handles) |h| h.join();
++    const arm = if (r != null) "elf" else "sandbox";
++    std.debug.print("| cell | route | first ms | p50 ms | body |\n|---|---|---|---|---|\n", .{});
++    const firsts = try gpa.alloc(u64, threads);
++    const calls = try gpa.alloc(u64, threads * reps);
++    var same: u32 = 0;
++    for (cells, 0..) |c, i| {
++        for (0..threads) |t| {
++            firsts[t] = l.ns[(t * reps) * cells.len + i];
++            for (0..reps) |rep| calls[t * reps + rep] = l.ns[(t * reps + rep) * cells.len + i];
++        }
++        same += @intFromBool(l.ok[i]);
++        std.debug.print("| {s} | {s} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, arm, ms(median(firsts)), ms(median(calls)), if (l.ok[i]) "= CPython" else "DIFFERS" });
++    }
++    std.debug.print("\n{s} at c={d}: {d}/{d} bodies = CPython; image cache hits {d}\n", .{ arm, threads, same, cells.len, elf_cache.hitCount(io) - hits });
++    return if (same == cells.len) 0 else 1;
++}
++
++/// runner-s3-bench <cells.jsonl> [reps] [engine-cpu]; a line is {"id", "code", "want"} (want: CPython's stdout).
++pub fn main(init: std.process.Init) !u8 {
++    environ = init.environ_map;
++    const gpa = std.heap.c_allocator;
++    const argv = try init.minimal.args.toSlice(init.arena.allocator());
++    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "__compute_sandbox")) lane.sandbox.main(argv[2..]);
++    if (argv.len < 2) {
++        std.debug.print("usage: runner-s3-bench <cells.jsonl> [reps] [engine-cpu] (TF_COMPUTE_LANE_RUNNER* knobs)\n", .{});
++        return 2;
++    }
++    const reps = if (argv.len > 2) try std.fmt.parseInt(u32, argv[2], 10) else 5;
++    if (argv.len > 3) pinTo(try std.fmt.parseInt(u32, argv[3], 10));
++    const text = try std.Io.Dir.cwd().readFileAlloc(init.io, argv[1], gpa, .limited(1 << 26));
++    var cells: std.ArrayList(Cell) = .empty;
++    var lines = std.mem.splitScalar(u8, text, '\n');
++    while (lines.next()) |line| if (line.len > 0) {
++        const p = try std.json.parseFromSlice(Cell, gpa, line, .{ .ignore_unknown_fields = true });
++        try cells.append(gpa, p.value);
++    };
++    const threads = if (env("TF_S3_BENCH_THREADS")) |v| try std.fmt.parseInt(usize, v, 10) else 0;
++    if (env("TF_S3_BENCH_SANDBOX") != null) return if (threads > 0) concurrent(gpa, init.io, cells.items, reps, threads, null) else sandboxed(gpa, cells.items, reps);
++    const cfg = (try runner.Config.parse(&env, "TF_COMPUTE_LANE_RUNNER")) orelse {
++        std.debug.print("TF_COMPUTE_LANE_RUNNER is off\n", .{});
++        return 2;
++    };
++    const r = try ropen.open(gpa, cfg);
++    if (threads > 0) return concurrent(gpa, init.io, cells.items, reps, threads, r);
++    // a second copy of the circuit: ELF and calc programs' boot and steps timed apart from the backend
++    var circuit = try rc.Circuit.load(gpa, cfg.circuit);
++    defer circuit.deinit(gpa);
++    const rows = try gpa.alloc(Row, cells.items.len);
++    const e2es = try gpa.alloc(u64, reps);
++    const tr = try gpa.alloc(u64, reps);
++    const run = try gpa.alloc(u64, reps);
++    var stream: u64 = 1 << 40;
++    // TF_S3_BENCH_COLD=1 empties the compiled-image cache before every call: each ELF cell pays its compile
++    const cold = env("TF_S3_BENCH_COLD") != null;
++    std.debug.print("| cell | route | pieces | bytes | steps | translate ms | backend ms | exec ms | boot ms | steps ms | S3 first ms | S3 p50 ms | body |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n", .{});
++    for (cells.items, rows) |c, *row| {
++        row.* = .{ .st = .{}, .e2e = .{ 0, 0 }, .served_ok = true };
++        for (0..reps) |i| {
++            var arena = std.heap.ArenaAllocator.init(gpa);
++            defer arena.deinit();
++            // the served call first (cold on rep 0: no translation or run of this cell before it)
++            stream += 1;
++            if (cold) elf_cache.reset(init.io);
++            const t0 = now();
++            const got = try call(arena.allocator(), r, c.code, stream);
++            e2es[i] = now() - t0;
++            const want = try lane.runner.body(arena.allocator(), .{ .status = .ok, .stdout = c.want }, 0, 0);
++            if (got == null or !std.mem.eql(u8, got.?, want)) row.served_ok = false;
++            stream += 1;
++            if (cold) elf_cache.reset(init.io);
++            const st = try staged(arena.allocator(), r, c, stream, &circuit);
++            row.st = st;
++            row.st.route = st.route;
++            tr[i] = st.translate;
++            run[i] = st.run;
++            if (!st.ok) row.served_ok = false;
++        }
++        row.e2e = .{ e2es[0], median(e2es) };
++        row.st.translate = median(tr);
++        row.st.run = median(run);
++        std.debug.print("| {s} | {s} | {d} | {d} | {d} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {d:.2} | {s} |\n", .{ c.id, row.st.route, row.st.pieces, row.st.bytes, row.st.steps, ms(row.st.translate), ms(row.st.run), ms(row.st.exec), ms(row.st.boot), ms(row.st.eval), ms(row.e2e[0]), ms(row.e2e[1]), if (row.served_ok) "= CPython" else if (std.mem.eql(u8, row.st.route, "abstain")) "declined" else "DIFFERS" });
++    }
++    var all: std.ArrayList(u64) = .empty;
++    var first: std.ArrayList(u64) = .empty;
++    var under: u32 = 0;
++    var same: u32 = 0;
++    for (rows) |row| {
++        try all.append(gpa, row.e2e[1]);
++        try first.append(gpa, row.e2e[0]);
++        under += @intFromBool(row.e2e[1] < 40 * std.time.ns_per_ms);
++        same += @intFromBool(row.served_ok);
++    }
++    const v = all.items;
++    std.mem.sort(u64, v, {}, std.sort.asc(u64));
++    std.debug.print("\nS3 call p50 over cells: median {d:.2} ms, p90 {d:.2} ms, max {d:.2} ms; {d}/{d} under 40 ms; {d}/{d} bodies = CPython\n", .{ ms(v[v.len / 2]), ms(v[(v.len * 9) / 10]), ms(v[v.len - 1]), under, v.len, same, v.len });
++    const w = first.items;
++    std.mem.sort(u64, w, {}, std.sort.asc(u64));
++    std.debug.print("S3 first call over cells: median {d:.2} ms, max {d:.2} ms; image cache {s}, {d} hits\n", .{ ms(w[w.len / 2]), ms(w[w.len - 1]), if (cold) "emptied per call" else "kept", elf_cache.hitCount(init.io) });
++    return if (same == v.len) 0 else 1;
++}
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index 0af4dde9f..a1cacb5bf 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -143,6 +143,8 @@ pub const Served = struct {
+             s.host.info_.runner = s.host.runner;
+             try api.runner.bindings.dsv41.openRoundTrace(&@import("serve_knobs.zig").env); // PREFIX_TRACE
+         }
++        // TF_COMPUTE_LANE_RUNNER=1 or TF_DSV41_COMPUTE_LANE_RUNNER=1 (S3, off by default): lane calls on the circuit
++        s.host.info_.compute_runner = try api.compute_circuit.open(binding, gpa, &@import("serve_knobs.zig").env, s.host.info_.compute != null, s.host.runner, engineCpus);
+         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
+         s.host.on_thread = .{ .ctx = m, .run = bindContext };
+         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 3d2f4c6eb..1bebb6951 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -444,6 +444,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     // TF_RUNNER*: the family's in-model runner, open for the engine's life; the server gives it the tokenizer
+     const runner = if (@hasDecl(F, "runner")) if (try F.runner.parse(&cuda_device.knob)) |rc| try api.runner.open(gpa, rc) else null else null;
+     if (runner != null) try F.runner.openRoundTrace(&cuda_device.knob);
++    const compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null; // replies hold at EOS
++    // TF_COMPUTE_LANE_RUNNER=1 (S3, off by default): lane calls the circuit can run go there, sharing its circuit
++    const s3 = if (@hasDecl(F, "compute")) try api.compute_circuit.open(F.compute, gpa, &cuda_device.knob, compute != null, runner, null) else null;
+     try h.serve(io, served.facts, loaded.rows, .{
+         .benchmark_ranks = bench.ranks,
+         .benchmark_group = bench.group,
+@@ -468,9 +471,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .slide_conversations = conversations,
+         .readouts = readouts,
+         .text_generation = readouts == null, // a readout engine answers its readouts only (Clef's /v1/systemone)
+-        .compute = if (@hasDecl(F, "compute")) try F.compute.parse(&cuda_device.knob) else null, // replies hold at EOS
++        .compute = compute,
+         .compute_tool = if (@hasDecl(F, "compute")) F.compute.tool else .{},
+         .runner = runner,
++        .compute_runner = s3,
+     }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0 or share, if (paged) |p| p.taken else 0, std.log); // TF_KV_SHARE: no copied rows
+diff --git a/zig/src/server/compute_lane_http_test.zig b/zig/src/server/compute_lane_http_test.zig
+index 360c068c9..cc6dbac38 100644
+--- a/zig/src/server/compute_lane_http_test.zig
++++ b/zig/src/server/compute_lane_http_test.zig
+@@ -154,6 +154,8 @@ test "compute lane: a held python call's result is forced in as the template's t
+     try t.expectEqualStrings("42", report.strField("output").?);
+     try t.expectEqualStrings("ok", report.strField("status").?);
+     try t.expect(report.get("inserted").?.bool);
++    // S3 off: the reply names no executor and counts none (the lane's reply as before)
++    try t.expect(report.get("executor") == null and report.get("call_ms") == null and compute.get("runner_calls") == null);
+ }
+ 
+ test "compute lane: code_interpreter on a server without the lane is refused before the engine sees it" {
+@@ -180,3 +182,130 @@ test "compute lane: code_interpreter on a server without the lane is refused bef
+     try t.expect(reply.code >= 400);
+     try t.expect(script.sink == null);
+ }
++
++const rapi = api.compute_circuit.api;
++
++/// S3's scripted circuit: code with "abstain" abstains (unsupported), else it runs and prints `out`.
++const Circuit = struct {
++    out: []const u8,
++    fn frontend(c: *Circuit) rapi.Frontend {
++        return .{ .ctx = c, .translate = translate };
++    }
++    fn translate(_: ?*anyopaque, _: Allocator, cell: rapi.Cell) Allocator.Error!rapi.Translation {
++        if (std.mem.indexOf(u8, cell.code, "abstain") != null) return .{ .abstain = .unsupported };
++        return .{ .program = .{ .kind = .calc, .bytes = cell.code } };
++    }
++    fn backend(c: *Circuit) rapi.Backend {
++        return .{ .ctx = c, .vtable = &.{ .start = start, .poll = poll, .cancel = noop, .release = noop } };
++    }
++    fn start(_: *anyopaque, _: u64, _: rapi.Program, _: u64) error{ OutOfMemory, Busy }!rapi.JobId {
++        return 1;
++    }
++    fn poll(ctx: *anyopaque, _: rapi.JobId) rapi.Poll {
++        const c: *Circuit = @ptrCast(@alignCast(ctx));
++        return .{ .done = .{ .status = .ok, .out = c.out, .steps = 3 } };
++    }
++    fn noop(_: *anyopaque, _: u64) void {}
++};
++
++/// A report's millisecond field: a float, or an int when it printed without a fraction.
++fn ms(v: json.Value) f64 {
++    return switch (v) {
++        .float => |x| x,
++        .int => |text| std.fmt.parseFloat(f64, text) catch -1,
++        else => -1,
++    };
++}
++
++/// One held call of `code` through the chat route with S3 on: the forced tokens and the result turn they must equal.
++const S3Run = struct { reply: Reply, inserted: []const u32, want: []const u32, report: json.Value, compute: json.Value };
++
++fn s3Run(a: Allocator, code: []const u8, circuit: *Circuit, sandbox_ok: bool, verify: bool, result: []const u8) !S3Run {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // the lane's executor runs on Linux only
++    const python = "/usr/bin/python3";
++    std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
++    var tmp = try fixture(a);
++    defer tmp.deinit();
++    var problem: []const u8 = "";
++    const hf = try HfText.load(a, t.io, tmp.path, null, a, &problem);
++    defer hf.deinit();
++    const text = hf.text();
++    const history = try tf.messages(a, "What is 6*7?");
++    const call_turn = try obj(a,
++        \\{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"python","arguments":""}}]}
++    );
++    const args = try json.newObject(a);
++    try args.put(a, "code", .{ .string = code });
++    const function = call_turn.get("tool_calls").?.array[0].get("function").?;
++    try function.object.put(a, "arguments", .{ .string = try json.stringify(a, .{ .object = args }, .{}) });
++    const asked = try text.renderIds(a, history, .{ .add_generation_prompt = true }, &problem);
++    const called = try text.renderIds(a, try appendTo(a, history, &.{call_turn}), .{ .add_generation_prompt = false }, &problem);
++    const eos = called[called.len - 1];
++    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, "It is 42."), &.{eos} });
++    const script = try a.create(Script);
++    script.* = .{ .a = a, .call = called[asked.len..], .answer = answer };
++    const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
++    defer srv.deinit();
++    const cfg: lane.Config = .{ .python = python };
++    srv.info.compute = cfg;
++    // a sandbox that cannot run python would print something else: a circuit-owned call never reaches it
++    const launcher: []const []const u8 = if (sandbox_ok) &.{ "/bin/sh", "-c", "exec \"$0\" -I -B -u -c \"$1\"", python, lane.runner.runner } else &.{"/nonexistent"};
++    srv.compute = lane.Pool.init(cfg, launcher);
++    srv.compute_exec = .{ .frontend = circuit.frontend(), .backend = circuit.backend(), .max_steps = 1000, .cfg = .{ .verify = verify } };
++    var reply: Reply = .{ .a = a };
++    var conn = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
++    defer conn.deinit();
++    const body = try json.newObject(a);
++    try body.put(a, "model", .{ .string = "m" });
++    try body.put(a, "max_tokens", try json.intValue(a, 400));
++    try body.put(a, "messages", history);
++    try body.put(a, "tools", try obj(a, "[{\"type\":\"code_interpreter\"}]"));
++    @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
++    errdefer std.debug.print("S3_REPLY {s}\n", .{json.stringify(a, reply.body, .{}) catch ""});
++    try t.expectEqual(@as(u16, 200), reply.code);
++    const turn = try obj(a, "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"\"}");
++    try turn.object.put(a, "content", .{ .string = result });
++    const full = try text.renderIds(a, try appendTo(a, history, &.{ call_turn, turn }), .{ .add_generation_prompt = true }, &problem);
++    const compute = reply.body.get("tensorfold").?.get("compute").?;
++    return .{ .reply = reply, .inserted = script.resumes.items[0], .want = full[called.len..], .report = compute.get("calls").?.array[0], .compute = compute };
++}
++
++test "compute runner: a held call the circuit runs inserts the lane's own result turn, named in-model runner" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    var c: Circuit = .{ .out = "42\n" };
++    const r = try s3Run(arena.allocator(), "print(6*7)", &c, false, false, "42");
++    try t.expectEqualSlices(u32, r.want, r.inserted);
++    try t.expectEqualStrings("in-model runner", r.report.strField("executor").?);
++    try t.expectEqualStrings("calc", r.report.strField("program").?);
++    // the server's time on the call covers the run's own
++    try t.expect(ms(r.report.get("call_ms").?) >= ms(r.report.get("exec_ms").?));
++    try t.expectEqual(@as(i64, 1), r.compute.get("runner_calls").?.int64().?);
++    try t.expectEqual(@as(i64, 0), r.compute.get("tool_calls").?.int64().?);
++}
++
++test "compute runner: a call the circuit declines runs in the sandbox, named code tool with the reason" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    var c: Circuit = .{ .out = "wrong\n" };
++    const r = try s3Run(arena.allocator(), "print(42)  # abstain", &c, true, false, "42");
++    try t.expectEqualSlices(u32, r.want, r.inserted);
++    try t.expectEqualStrings("code tool", r.report.strField("executor").?);
++    try t.expectEqualStrings("unsupported", r.report.strField("runner_abstain").?);
++    try t.expect(r.report.get("program") == null);
++    try t.expectEqual(@as(i64, 0), r.compute.get("runner_calls").?.int64().?);
++    try t.expectEqual(@as(i64, 1), r.compute.get("tool_calls").?.int64().?);
++}
++
++test "compute runner: verify inserts the sandbox's result and reports a circuit that printed otherwise" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    var c: Circuit = .{ .out = "41\n" };
++    const r = try s3Run(arena.allocator(), "print(6*7)", &c, true, true, "42");
++    try t.expectEqualSlices(u32, r.want, r.inserted);
++    try t.expectEqualStrings("code tool", r.report.strField("executor").?);
++    try t.expectEqualStrings("differ", r.report.strField("verify").?);
++    var same: Circuit = .{ .out = "42\n" };
++    const s = try s3Run(arena.allocator(), "print(6*7)", &same, true, true, "42");
++    try t.expectEqualStrings("same", s.report.strField("verify").?);
++}
+diff --git a/zig/src/server/compute_segments.zig b/zig/src/server/compute_segments.zig
+index a9a737e8e..7d2cea983 100644
+--- a/zig/src/server/compute_segments.zig
++++ b/zig/src/server/compute_segments.zig
+@@ -116,7 +116,7 @@ fn segmentAnswer(g: *Generation) chat.Failure!Answer {
+     return .{ .prose = parsed.content, .reasoning = read.reasoning, .calls = parsed.calls };
+ }
+ 
+-/// Runs each call in order (results in call order); past the call cap, a note; `executed` counts calls the sandbox ran.
++/// Runs each call in order (results in call order); past the call cap, a note; `executed` counts calls an executor ran.
+ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ran: *u32, executed: *usize, gone: anytype) chat.Failure![]Value {
+     const Watch = struct {
+         gone: @TypeOf(gone),
+@@ -131,20 +131,68 @@ fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ra
+         const code = try codeOf(a, c);
+         var o: lane.Outcome = .{ .status = .unavailable, .stderr = "the call has no string argument \"code\"" };
+         var body: []const u8 = undefined;
++        var s3: ?s3_api.Outcome = null;
++        var verify: ?bool = null;
++        const t0 = s3_api.nowNs();
+         if (ran.* >= cfg.max_calls) {
+             body = "[call limit reached: answer without running more code]";
+         } else {
+-            if (code) |src| o = try srv.compute.?.run(a, src, .{ .ctx = &watch, .gone = Watch.left });
+-            if (o.status == .cancelled) return error.Cancelled;
+-            if (code != null and o.status != .unavailable) executed.* += 1;
+-            body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
++            const hook: lane.Cancel = .{ .ctx = &watch, .gone = Watch.left };
++            // S3: the circuit first; a decline, or verify's shadow run, goes to the sandbox as the lane always did
++            if (code) |src| if (srv.compute_exec) |*e| {
++                s3 = try e.run(a, src, hook);
++            };
++            if (s3) |r| if (r == .declined and r.declined == .cancelled) return error.Cancelled;
++            const owned = ownedOf(s3);
++            const shadow = owned != null and srv.compute_exec.?.cfg.verify;
++            var started = owned != null;
++            if (owned == null or shadow) {
++                if (code) |src| o = try srv.compute.?.run(a, src, hook);
++                if (o.status == .cancelled) return error.Cancelled;
++                if (code != null and o.status != .unavailable) started = true;
++                body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
++            }
++            if (started) executed.* += 1;
++            if (owned) |w| if (shadow) {
++                verify = std.mem.eql(u8, w.body, body);
++                if (!verify.?) log.line("warning: compute lane verify: the circuit printed [{s}], the sandbox [{s}]", .{ w.body, body });
++            } else {
++                body = w.body;
++                o = .{ .status = .ok, .exec_ns = w.exec_ns };
++            };
+             ran.* += 1;
+         }
+         slot.* = try report(a, srv.info.compute_tool.name, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
++        if (srv.compute_exec != null) try executor(a, slot.object, s3, verify, s3_api.nowNs() - t0);
+     }
+     return out;
+ }
+ 
++const s3_api = api.compute_circuit;
++
++/// The circuit's run when it ran the call to its halt; null when declined or S3 is off.
++fn ownedOf(s3: ?s3_api.Outcome) ?s3_api.Owned {
++    const r = s3 orelse return null;
++    return switch (r) {
++        .owned => |w| w,
++        .declined => null,
++    };
++}
++
++/// S3's report fields: who produced the inserted body (never both), what ran it or why the circuit declined.
++fn executor(a: Allocator, r: *json.Object, s3: ?s3_api.Outcome, verify: ?bool, call_ns: u64) Allocator.Error!void {
++    const w = ownedOf(s3);
++    // the server's whole time on the call (translate, queue, run; both executors under verify), beside exec_ms's run
++    try r.put(a, "call_ms", .{ .float = @as(f64, @floatFromInt(call_ns)) / 1e6 });
++    const by_circuit = w != null and verify == null;
++    try r.put(a, "executor", .{ .string = if (by_circuit) s3_api.in_model else s3_api.code_tool });
++    if (by_circuit) {
++        try r.put(a, "program", .{ .string = @tagName(w.?.kind) });
++        try r.put(a, "steps", try json.intValue(a, w.?.steps));
++    } else if (s3) |x| if (x == .declined) try r.put(a, "runner_abstain", .{ .string = @tagName(x.declined) });
++    if (verify) |same| try r.put(a, "verify", .{ .string = if (same) "same" else "differ" });
++}
++
+ /// The call's "code" argument, its arguments a JSON object or a JSON string; null when missing or not a string.
+ fn codeOf(a: Allocator, call: Value) Allocator.Error!?[]const u8 {
+     const f = call.get("function") orelse return null;
+@@ -267,6 +315,20 @@ fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.
+     try c.put(a, "calls", .{ .array = m.calls.items });
+     try c.put(a, "inserted_tokens", try json.intValue(a, m.inserted));
+     try c.put(a, "prefix_tokens", try json.intValue(a, m.ids.items.len));
++    try counts(a, c, m.calls.items);
+     try rt.put(a, "compute", .{ .object = c });
+     return r;
+ }
++
++/// S3's per-executor call counts (only when the reports name executors): in-model runner and code tool, never summed.
++fn counts(a: Allocator, c: *json.Object, calls: []const Value) Allocator.Error!void {
++    var by_circuit: i64 = 0;
++    var by_tool: i64 = 0;
++    for (calls) |r| {
++        const e = r.strField("executor") orelse return;
++        if (std.mem.eql(u8, e, s3_api.in_model)) by_circuit += 1 else by_tool += 1;
++    }
++    if (calls.len == 0) return;
++    try c.put(a, "runner_calls", try json.intValue(a, by_circuit));
++    try c.put(a, "tool_calls", try json.intValue(a, by_tool));
++}
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 622529d48..7ed362403 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -166,6 +166,8 @@ pub const Server = struct {
+     idle_manager: ?*idle_unload.Manager = null,
+     /// The compute lane's sandboxes when the engine serves it (Info.compute); null: code_interpreter is refused.
+     compute: ?api.hold.compute_lane.Pool = null,
++    /// S3 (Info.compute_runner): built-in calls the circuit can run run there; null: every call goes to the sandbox.
++    compute_exec: ?api.compute_circuit.Exec = null,
+     preparing: std.atomic.Value(i64) = .init(0),
+     speech_inflight: std.atomic.Value(u32) = .init(0),
+     arena: std.heap.ArenaAllocator,
+@@ -212,6 +214,10 @@ pub const Server = struct {
+             return srv;
+         }
+         if (srv.info.compute) |c| srv.compute = try @import("compute_turns.zig").open(srv, c);
++        if (srv.compute != null) if (srv.info.compute_runner) |s| {
++            srv.compute_exec = .init(s);
++            std.log.info("compute lane: calls the circuit can run run there (in-model runner), the rest in the sandbox (code tool){s}", .{if (s.cfg.verify) "; verify: the sandbox's result is inserted" else ""});
++        };
+         if (srv.info.runner) |r| {
+             try @import("runner_text.zig").attach(srv.arena.allocator(), text, r);
+             srv.guides = try @import("runner_guide.zig").Set.load(srv.arena.allocator(), io, r.cfg.guide);

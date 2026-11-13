@@ -1,0 +1,499 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:57:30 +0300
+Subject: [PATCH 02/79] flashnext_mia: build module, kernel images and the
+ TF_FLASHNEXT_ENGINE=mia selector
+
+MiaAI-Lab's Flash Next (qwen4_exp) CUDA engine joins the build and the native CUDA server: her kernel
+images, the family module with its RoCE proxy, the tensorfold CLI's Flash Next commands, her two-rank
+check steps, and an opener that serves a qwen4_exp checkpoint with her engine (one or two ranks, the rank 1
+follower loop, kept prompt states, fp8 KV).
+
+Source: patches/0001-build-registry-server.patch @ MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold dc05c912342e
+Port: family module is flashnext_mia (zig/src/families/flashnext_mia/cuda.zig, build/flashnext_mia.zig); upstream's flashnext is untouched.
+Port: selector: TF_FLASHNEXT_ENGINE (word upstream|mia, registered in platform/environment.zig and docs/environment.md); native/cuda.zig open() routes qwen4_exp to native/cuda_flashnext_mia.zig only for mia, else upstream's registry; her family is not added to cuda_families.registry or the capability list.
+Port: her openWith/Host moved into native/cuda_flashnext_mia.zig: f212's cuda_bound.vtable replaces her hand-written prefill_* wrappers, f212's contextWindow and TF_CUDA_DEVICE setting replace hers; her modelWindow, kernelDir, prompt-cache Store wiring and follow kept.
+Port: options mapped to f212's flags: --kv-dtype fp8 -> --kv-cache fp8 (Open.kv8), --parallel -> Open.lanes, --tp/--rank/--master/--master-port and --prompt-cache-gib as f212 parses them; --vision is refused for this engine.
+Port: build: her 18 images appended to build/cuda_kernels.zig and cuda/kernels.zig; the roce_proxy C file (stub without infiniband/verbs.h) is compiled into the cuda runtime module as in her patch, now in build/cuda_runtime.zig runtimeFor; her comm/weights steps renamed flashnext-mia-comm / flashnext-mia-weights; her module joins test-cuda-host and the CLI via the engines module's instance.
+Port: cli/cuda_main.zig dispatches to her flashnext_cuda.zig only when TF_FLASHNEXT_ENGINE=mia.
+Port: already in f212, skipped: engine_api Open tp/rank/master/master_port, Opened.follow, the rank>0 follow in server/main.zig, server --tp/--rank/--master flags and engines.zig mapping, hf_text's config+tokenizer eos union, graph instantiate's recoverable NOT_PERMITTED (her warn-level soft() logging dropped to keep f212's fault publication).
+Port: dropped: her --vision Python helper path (server/vision.zig, messages splitMedia, prompt prepareMedia, openai/chat/serve/server/main/http_body/cli vision wiring, engine_api Media/Info.media): f212 serves --vision natively and the helper's Python is patch 0009, not ported.
+Port: dropped: tool_choice call gates (engine_api CallGate.lex, server.zig callBlank/Text/Encode): f212 enforces tool_choice required through tool_grammar structures; metal.zig's --kv-dtype refusal (f212 uses --kv-cache); request_log video redaction (would change upstream behaviour).
+---
+ docs/environment.md                     |   1 +
+ zig/build/cuda.zig                      |   6 +-
+ zig/build/cuda_engines.zig              |   1 +
+ zig/build/cuda_kernels.zig              |  19 +++
+ zig/build/cuda_runtime.zig              |   4 +
+ zig/build/flashnext_mia.zig             |  22 ++++
+ zig/src/cli/cuda_main.zig               |   4 +
+ zig/src/cuda/kernels.zig                |  19 +++
+ zig/src/families/flashnext_mia/cuda.zig |  67 ++++++++++
+ zig/src/native/cuda.zig                 |   3 +
+ zig/src/native/cuda_flashnext_mia.zig   | 161 ++++++++++++++++++++++++
+ zig/src/platform/environment.zig        |   1 +
+ 12 files changed, 306 insertions(+), 2 deletions(-)
+ create mode 100644 zig/build/flashnext_mia.zig
+ create mode 100644 zig/src/families/flashnext_mia/cuda.zig
+ create mode 100644 zig/src/native/cuda_flashnext_mia.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 1ac146dd0..1d7ccd8d8 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -27,6 +27,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS` | Exactly `0` or `1`, checked when the CUDA backend starts; default off ([profiles](profiles.md)) |
+ | `TF_HEAD_GEOMETRY` | Whole native-size nonnegative geometry count in the head benchmark |
+ | `TF_ROCE_GID_INDEX` | Whole index 0 through 2147483647; unset searches for a RoCE v2 IPv4 GID |
++| `TF_FLASHNEXT_ENGINE` | Exactly `upstream` or `mia`; `mia` serves qwen4_exp checkpoints with MiaAI-Lab's Flash Next engine; default `upstream` |
+ | `TF_GEMMA4_CHUNK_SOLO` | Gemma 4 on CUDA: a multiple of 512 from 512 through 4096; unset, empty or 512 is off. Checked when the model loads, with the family's own message |
+ | `TF_DRAMA_PREFILL_ROWS` | Drama 3 on CUDA: whole prompt rows a chunk, 1 through 1024; default 1. Checked when the checkpoint opens, with its own message |
+ | `TF_DRAMA_REFERENCE_CACHE` | Drama 3 on CUDA: kept reference states, 0 (off) through 16; default 0. Checked when the checkpoint opens, with its own message |
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 4fd4d5646..fd8984d10 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -82,7 +82,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const mods = family(b, target, optimize, cuda, draft_ids);
+     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+     const native = engines(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision);
+-    for ([_]struct { []const u8, *std.Build.Module }{ .{ "cuda", cuda }, .{ "core", mods.core }, .{ "lanes", mods.lanes }, .{ "nemotron", mods.nemotron }, .{ "dory", native.engines.import_table.get("dory").? }, .{ "cluster", @import("cluster_cuda.zig").module(b, target, optimize, mods.lanes, mods.core, native.canon, native.verbs) } }) |m| cli.addImport(m[0], m[1]);
++    for ([_]struct { []const u8, *std.Build.Module }{ .{ "cuda", cuda }, .{ "core", mods.core }, .{ "lanes", mods.lanes }, .{ "nemotron", mods.nemotron }, .{ "dory", native.engines.import_table.get("dory").? }, .{ "flashnext_mia", native.engines.import_table.get("flashnext_mia").? }, .{ "cluster", @import("cluster_cuda.zig").module(b, target, optimize, mods.lanes, mods.core, native.canon, native.verbs) } }) |m| cli.addImport(m[0], m[1]);
+     cli.addOptions("build_options", build_options);
+     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
+     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
+@@ -120,6 +120,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     b.installArtifact(b.addExecutable(.{ .name = "tf-tp-watch-check", .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/tp_watch_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip, .imports = &.{.{ .name = "cuda", .module = cuda }} }) }));
+     @import("living_dense.zig").target(b, target, optimize, cuda, mods.qwen35);
+     flashnextChecks(b, target, optimize, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api, opts);
++    @import("flashnext_mia.zig").steps(b, target, optimize, cuda, native.engines.import_table.get("flashnext_mia").?);
+     b.step("compile-cuda-tests", "Compile CUDA runner without executing a GPU").dependOn(&runner_exe.step);
+     const startup = b.addObject(.{ .name = "modelopt-startup", .root_module = b.createModule(.{ .root_source_file = b.path("zig/modelopt_startup_compile.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "native", .module = native.engines }} }) });
+     _ = startup.getEmittedBin();
+@@ -346,7 +347,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     b.step("test-trainer-close-host", "Actual native close and real Flash Next trainer ownership sentinels").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"Save recovery:"} })).step);
+     const template, const server_tests = @import("cuda_server_host.zig").steps(b, host, cuda, mods, native_modules, build_options, windows_port, step, server_steps);
+     // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
+-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
++    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), native_modules.engines.import_table.get("flashnext_mia").?, mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+     const selected = b.option([]const u8, "modelopt-host-filter", "One portable ModelOpt regression") orelse "modelopt host:";
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{selected} }));
+     run.has_side_effects = true;
+@@ -387,6 +388,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     cli.addImport("core", mods.core);
+     cli.addImport("lanes", mods.lanes);
+     cli.addImport("nemotron", mods.nemotron);
++    cli.addImport("flashnext_mia", native_modules.engines.import_table.get("flashnext_mia").?);
+     cli.addOptions("build_options", build_options);
+     cli.addImport("checkpoint_cli", checkpointCli(b, host, .debug, false, native_modules.engines, mods.core));
+     const memory_cli = checkpointCli(b, host, .debug, false, native_modules.engines, mods.core);
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index 9c5c49a0d..c29320d94 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -70,6 +70,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "spark25", .module = @import("spark25.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "lfm2_moe_cuda", .module = @import("lfm2_moe_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "dory", .module = @import("dory.zig").module(b, target, optimize, cuda, core, lanes) },
++            .{ .name = "flashnext_mia", .module = @import("flashnext_mia.zig").module(b, target, optimize, cuda, core, lanes) },
+         },
+     });
+     mod.addImport("qwen4", @import("qwen4.zig").module(b, target, optimize, core));
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 3efe2c86d..950845f5d 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -166,6 +166,25 @@ pub const kernels = [_]Kernel{
+     .{ .name = "drama3", .flags = &.{"-O3"} },
+     .{ .name = "drama3_fp8", .flags = &.{"-O3"} },
+     .{ .name = "drama3_codec", .flags = &.{"-O3"} },
++    // MiaAI-Lab's Flash Next engine (families/flashnext_mia): her qwen4_exp extension copies and kernels
++    .{ .name = "fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py
++    .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py
++    .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
++    .{ .name = "fn_gdn_tree", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
++    .{ .name = "fn_nvfp4_experts", .flags = &.{"-O3"} }, // cuda/nvfp4/linear.py, tensorfold_nvfp4_v3
++    .{ .name = "fn_qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
++    .{ .name = "fn_qmm_prefill", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
++    .{ .name = "fn_pack", .flags = &.{"-O3"} }, // the n-gram table's GPU gather
++    .{ .name = "torch_fn_ops", .src = "torch_ops/fn_ops", .flags = torch_ops }, // SwiGLU, sampler packing
++    .{ .name = "torch_fn_logsumexp", .src = "torch_ops/fn_logsumexp", .flags = torch_ops }, // ATen's logsumexp order
++    .{ .name = "fn_experts_prompt", .flags = &.{"-O3"} }, // routed NVFP4 experts reading weights once a prompt call
++    .{ .name = "fn_qmmf", .flags = &.{"-O3"} }, // cuda/nvfp4/qmmf.cu (FP8G lane matmul), tensorfold_nvfp4_v3
++    .{ .name = "fn_int4", .flags = &.{"-O3"} }, // GPTQ int4 g128 routed experts and lm_head (W4A16, fp32 sums)
++    .{ .name = "fn_qmmf_ld", .flags = &.{"-O3"} }, // fn_qmmf.cu with an output row stride
++    .{ .name = "fn_nvfp4_shape", .flags = &.{"-O3"} }, // fn_nvfp4_experts' unit arithmetic in other launch shapes
++    .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // qmm_kernel's K-slice cluster forms for the 4-bit MTP head
++    .{ .name = "fn_roce", .flags = &.{"-O3"} }, // the one-shot RoCE all-gather's GPU half (cuda/roce_mia.zig)
++    .{ .name = "fn_qsa_scores", .flags = &.{"-O3"} }, // attention._scores' bits from row tiles (the prompt indexer)
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+diff --git a/zig/build/cuda_runtime.zig b/zig/build/cuda_runtime.zig
+index ba524c68b..bc2116f7f 100644
+--- a/zig/build/cuda_runtime.zig
++++ b/zig/build/cuda_runtime.zig
+@@ -26,6 +26,10 @@ pub fn runtimeFor(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
+     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     cuda.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
+     cuda.addOptions("kernel_options", options);
++    // MiaAI-Lab's one-shot RoCE all-gather proxy (cuda/roce_mia.zig): C over libibverbs' header, else a refusing stub
++    const verbs = if (std.Io.Dir.accessAbsolute(b.graph.io, "/usr/include/infiniband/verbs.h", .{})) |_| true else |_| false;
++    const proxy = if (verbs) "zig/src/cuda/roce_proxy.c" else "zig/src/cuda/roce_proxy_stub.c";
++    cuda.addCSourceFile(.{ .file = b.path(proxy), .flags = &.{ "-std=gnu11", "-O2", "-idirafter", "/usr/include" } });
+     cuda.addImport("stagger", stagger(b, target, optimize));
+     if (with) for (@import("cuda_kernels.zig").kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
+     return cuda;
+diff --git a/zig/build/flashnext_mia.zig b/zig/build/flashnext_mia.zig
+new file mode 100644
+index 000000000..124068152
+--- /dev/null
++++ b/zig/build/flashnext_mia.zig
+@@ -0,0 +1,22 @@
++//! MiaAI-Lab's Flash Next engine on CUDA (zig/src/families/flashnext_mia): its module and its own check steps.
++const std = @import("std");
++
++/// The family over the runtime, the core and the lane core.
++pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext_mia/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    m.addImport("cuda", cuda);
++    m.addImport("core", core);
++    m.addImport("lanes", lanes);
++    return m;
++}
++
++/// Her two-rank transport test and weights check as their own steps, not in `install`.
++pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, mia: *std.Build.Module) void {
++    const imports: []const std.Build.Module.Import = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext_mia", .module = mia } };
++    const comm = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext_mia/comm_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = imports });
++    const comm_exe = b.addExecutable(.{ .name = "tf-flashnext-mia-comm", .root_module = comm });
++    b.step("flashnext-mia-comm", "tf-flashnext-mia-comm RANK MASTER PORT: two-rank all-gathers, exact and timed").dependOn(&b.addInstallArtifact(comm_exe, .{}).step);
++    const weights = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext_mia/weights_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = imports });
++    const weights_exe = b.addExecutable(.{ .name = "tf-flashnext-mia-weights", .root_module = weights });
++    b.step("flashnext-mia-weights", "tf-flashnext-mia-weights SNAPSHOT [WEIGHTS.json]: loaded weights' digests against the oracle's").dependOn(&b.addInstallArtifact(weights_exe, .{}).step);
++}
+diff --git a/zig/src/cli/cuda_main.zig b/zig/src/cli/cuda_main.zig
+index eedad46c9..216f9aa9f 100644
+--- a/zig/src/cli/cuda_main.zig
++++ b/zig/src/cli/cuda_main.zig
+@@ -16,6 +16,8 @@ const lanes_cli = @import("cuda_lanes.zig");
+ const segments_cli = @import("cuda_segments.zig");
+ const train_check = @import("cuda_train_check.zig");
+ const dory_cli = @import("cuda_dory.zig");
++const flashnext_mia = @import("flashnext_mia");
++const flashnext_cli = @import("flashnext_cuda.zig");
+ const decode = nemotron.decode;
+ 
+ const usage =
+@@ -81,6 +83,8 @@ pub fn main(init: std.process.Init) !u8 {
+         std.debug.print("{s}", .{usage});
+         return 2;
+     }
++    // MiaAI-Lab's Flash Next engine takes its own commands for qwen4_exp checkpoints when TF_FLASHNEXT_ENGINE=mia
++    if (flashnext_mia.selected() and flashnext_cli.wants(gpa, init.io, args[2])) return flashnext_cli.main(init, args);
+     var opts = Options{ .model = args[2] };
+     var positional: std.ArrayList([]const u8) = .empty;
+     defer positional.deinit(gpa);
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 2333ad8fb..c6e2e7b4f 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -107,6 +107,25 @@ pub const act_rows: []const u8 = if (available) &Blob("fatbin_act_rows").bytes e
+ pub const gdn_prep: []const u8 = if (available) &Blob("fatbin_gdn_prep").bytes else &.{};
+ pub const qk_rows: []const u8 = if (available) &Blob("fatbin_qk_rows").bytes else &.{};
+ pub const roce_gather: []const u8 = if (available) &Blob("fatbin_roce_gather").bytes else &.{};
++/// MiaAI-Lab's Flash Next engine (families/flashnext_mia).
++pub const fn_gdn: []const u8 = if (available) &Blob("fatbin_fn_gdn").bytes else &.{};
++pub const fn_gdn_io: []const u8 = if (available) &Blob("fatbin_fn_gdn_io").bytes else &.{};
++pub const fn_gdn_prefill: []const u8 = if (available) &Blob("fatbin_fn_gdn_prefill").bytes else &.{};
++pub const fn_gdn_tree: []const u8 = if (available) &Blob("fatbin_fn_gdn_tree").bytes else &.{};
++pub const fn_nvfp4_experts: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_experts").bytes else &.{};
++pub const fn_qmm: []const u8 = if (available) &Blob("fatbin_fn_qmm").bytes else &.{};
++pub const fn_qmm_prefill: []const u8 = if (available) &Blob("fatbin_fn_qmm_prefill").bytes else &.{};
++pub const fn_pack: []const u8 = if (available) &Blob("fatbin_fn_pack").bytes else &.{};
++pub const torch_fn_ops: []const u8 = if (available) &Blob("fatbin_torch_fn_ops").bytes else &.{};
++pub const torch_fn_logsumexp: []const u8 = if (available) &Blob("fatbin_torch_fn_logsumexp").bytes else &.{};
++pub const fn_experts_prompt: []const u8 = if (available) &Blob("fatbin_fn_experts_prompt").bytes else &.{};
++pub const fn_qmmf: []const u8 = if (available) &Blob("fatbin_fn_qmmf").bytes else &.{};
++pub const fn_int4: []const u8 = if (available) &Blob("fatbin_fn_int4").bytes else &.{};
++pub const fn_qmmf_ld: []const u8 = if (available) &Blob("fatbin_fn_qmmf_ld").bytes else &.{};
++pub const fn_qmm_cluster: []const u8 = if (available) &Blob("fatbin_fn_qmm_cluster").bytes else &.{};
++pub const fn_roce: []const u8 = if (available) &Blob("fatbin_fn_roce").bytes else &.{};
++pub const fn_nvfp4_shape: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_shape").bytes else &.{};
++pub const fn_qsa_scores: []const u8 = if (available) &Blob("fatbin_fn_qsa_scores").bytes else &.{};
+ pub const l2pf: []const u8 = if (available) &Blob("fatbin_l2pf").bytes else &.{};
+ pub const l2pace: []const u8 = if (available) &Blob("fatbin_l2pace").bytes else &.{};
+ pub const route_rows: []const u8 = if (available) &Blob("fatbin_route_rows").bytes else &.{};
+diff --git a/zig/src/families/flashnext_mia/cuda.zig b/zig/src/families/flashnext_mia/cuda.zig
+new file mode 100644
+index 000000000..532500f82
+--- /dev/null
++++ b/zig/src/families/flashnext_mia/cuda.zig
+@@ -0,0 +1,67 @@
++//! Flash Next (qwen4_exp) on CUDA in Zig: the Python 0.6.5 engine's kernels and layouts for NVIDIA's ModelOpt NVFP4
++//! export, so tokens match it bit for bit on one GPU, and the same arithmetic split over two ranks (work/PLAN.md).
++//! The Metal family's host files (config.zig, affine.zig, ...) reach core by relative paths, so this module reads the
++//! checkpoint through its own cuda_*.zig files and the `core` module.
++
++pub const native = @import("cuda_native.zig");
++pub const ngram = @import("cuda_ngram.zig");
++pub const rope = @import("cuda_rope.zig");
++pub const sampler = @import("cuda_sampler.zig");
++pub const link = @import("cuda_link.zig");
++pub const comm = @import("cuda_comm.zig");
++pub const kernels = @import("cuda_kernels.zig");
++pub const state = @import("cuda_state.zig");
++pub const decode = @import("cuda_decode.zig");
++pub const triton = @import("cuda_triton.zig");
++pub const torch_ops = @import("cuda_torch_ops.zig");
++pub const config = @import("cuda_config.zig");
++pub const layouts = @import("cuda_layouts.zig");
++pub const weights = @import("cuda_weights.zig");
++pub const forward = @import("cuda_forward.zig");
++pub const vmm = @import("cuda_vmm.zig");
++pub const nucleus = @import("cuda_nucleus.zig");
++pub const mtp = @import("cuda_mtp.zig");
++pub const mtp_q4 = @import("cuda_mtp_q4.zig");
++pub const engine = @import("cuda_engine.zig");
++pub const prompt = @import("cuda_prompt.zig");
++pub const fp4_serial = @import("cuda_fp4_serial.zig");
++pub const prof = @import("cuda_prof.zig");
++pub const moe_prompt = @import("cuda_moe_prompt.zig");
++pub const fp8 = @import("cuda_fp8.zig");
++pub const int4 = @import("cuda_int4.zig");
++pub const int4_check = @import("cuda_int4_check.zig");
++pub const Engine = engine.Engine;
++
++/// TF_FLASHNEXT_ENGINE=mia picks this engine for qwen4_exp checkpoints; unset or upstream: upstream's flashnext family.
++pub fn selected() bool {
++    return (@import("sys").environment.read(u32, "TF_FLASHNEXT_ENGINE", 0) catch 0) == 1;
++}
++
++test {
++    _ = native;
++    _ = ngram;
++    _ = rope;
++    _ = sampler;
++    _ = link;
++    _ = comm;
++    _ = kernels;
++    _ = state;
++    _ = decode;
++    _ = triton;
++    _ = torch_ops;
++    _ = fp4_serial;
++    _ = config;
++    _ = layouts;
++    _ = weights;
++    _ = forward;
++    _ = vmm;
++    _ = nucleus;
++    _ = mtp;
++    _ = engine;
++    _ = prompt;
++    _ = prof;
++    _ = moe_prompt;
++    _ = fp8;
++    _ = int4;
++    _ = int4_check;
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 365ea9165..1c41e2435 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -23,6 +23,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
+ const drafted = @import("cuda_drafted.zig");
+ const kv_pages = @import("cuda_kv_pool.zig");
+ const cuda_families = @import("cuda_families.zig");
++const flashnext_mia = @import("cuda_flashnext_mia.zig");
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+ pub const registry = cuda_families.registry;
+ /// --record opens here (engines.zig refuses it for a backend without this).
+@@ -163,6 +164,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+     }
+     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text")) return @import("qwen4_cuda.zig").open(a, gpa, io, o, problem);
++    // MiaAI-Lab's Flash Next engine also reads qwen4_exp: TF_FLASHNEXT_ENGINE=mia picks it over upstream's flashnext
++    if (flashnext_mia.wanted(o)) return flashnext_mia.open(a, gpa, io, o, problem);
+     inline for (registry) |F| if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
+         if (refusals.lfm2(o)) |why| {
+diff --git a/zig/src/native/cuda_flashnext_mia.zig b/zig/src/native/cuda_flashnext_mia.zig
+new file mode 100644
+index 000000000..b1483f509
+--- /dev/null
++++ b/zig/src/native/cuda_flashnext_mia.zig
+@@ -0,0 +1,161 @@
++//! MiaAI-Lab's Flash Next engine (flashnext_mia) for qwen4_exp checkpoints, opened only with TF_FLASHNEXT_ENGINE=mia.
++const std = @import("std");
++const cuda = @import("cuda");
++const api = @import("engine_api");
++const lanes = @import("lanes");
++const mia = @import("flashnext_mia");
++const lane_backend = @import("cuda_bound.zig");
++const windows = @import("cuda_window.zig");
++const setting = @import("cuda_device.zig").setting;
++const Allocator = std.mem.Allocator;
++const F = mia.native;
++
++/// The context a lane thread needs current: the lane host steps rounds on its own thread, CUDA binds per thread.
++threadlocal var bound: ?*const cuda.Context = null;
++
++/// Whether `o` asks for this engine: a qwen4_exp checkpoint with TF_FLASHNEXT_ENGINE=mia (unset: upstream's flashnext).
++pub fn wanted(o: api.Open) bool {
++    return std.mem.eql(u8, o.model_type, F.model_type) and mia.selected();
++}
++
++/// One loaded model behind the lane host: the family, its lane core and its kept prompt states.
++const Host = struct {
++    gpa: Allocator,
++    driver: cuda.Driver,
++    ctx: cuda.Context,
++    family: *anyopaque,
++    release: *const fn (*anyopaque) void,
++    follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // rank 1's loop (two ranks)
++    inner: lanes.backend.Backend,
++    vtable: lanes.backend.Backend.VTable,
++    cfg: lanes.Config,
++    clock: lanes.backend.WallClock,
++    core: lanes.Engine,
++    host: api.LaneHost,
++    store: ?api.prompt_cache.Store = null, // kept prompt states when the family's Loaded.cache has a budget
++    store_vt: api.prompt_cache.Snapshots.VTable = undefined,
++
++    fn close(p: *anyopaque) void {
++        const h: *Host = @ptrCast(@alignCast(p));
++        h.host.stop();
++        h.core.deinit();
++        h.cfg.deinit(h.gpa);
++        h.ctx.makeCurrent() catch {};
++        if (h.store) |*st| st.deinit(); // its states go back to the family before the family goes
++        h.release(h.family);
++        h.ctx.deinit();
++        h.driver.close();
++        h.gpa.destroy(h);
++    }
++
++    fn halt(p: *anyopaque, reason: []const u8) void {
++        const h: *Host = @ptrCast(@alignCast(p));
++        h.host.halt(reason);
++    }
++
++    fn follow(p: *anyopaque) anyerror!void {
++        const h: *Host = @ptrCast(@alignCast(p));
++        try h.ctx.makeCurrent();
++        return h.follow_fn.?(h.family);
++    }
++
++    pub fn bind(p: *anyopaque) *Host {
++        const h: *Host = @ptrCast(@alignCast(p));
++        if (bound != &h.ctx) {
++            h.ctx.makeCurrent() catch |e| std.log.err("cuCtxSetCurrent on the lane thread: {s}", .{@errorName(e)});
++            bound = &h.ctx;
++        }
++        return h;
++    }
++
++    /// The family's backend, each entry it gives called with the context current (cuda_bound.zig).
++    fn backend(h: *Host) lanes.backend.Backend {
++        h.vtable = lane_backend.vtable(Host, h.inner.vtable.*);
++        return .{ .ptr = h, .round_observer = h.inner.round_observer, .vtable = &h.vtable, .first_before_draft = h.inner.first_before_draft, .penalties = h.inner.penalties, .chunk_invariant = h.inner.chunk_invariant };
++    }
++};
++
++/// Frees a host whose family never opened or is already released: its context, driver and memory.
++fn discard(h: *Host) void {
++    bound = null;
++    h.ctx.deinit();
++    h.driver.close();
++    h.gpa.destroy(h);
++}
++
++/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary.
++fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
++    if (std.c.getenv("TENSORFOLD_CUDA_KERNELS")) |dir| return a.dupe(u8, std.mem.span(dir));
++    const exe = try std.process.executableDirPathAlloc(io, a);
++    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
++}
++
++/// The engine for `o.dir` on this family, or null with `problem` set.
++pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
++    // a window past config.json's with YaRN: the family's modelWindow says how far
++    const native = F.modelWindow(a, io, o.dir);
++    const window = windows.contextWindow(o.context, native, F.default_context) catch {
++        problem.* = try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ o.context orelse 0, native });
++        return null;
++    };
++    if (o.vision != null) {
++        problem.* = "--vision: TF_FLASHNEXT_ENGINE=mia serves text only; unset it to serve images with upstream's engine";
++        return null;
++    }
++    if (o.tp != 1 and o.tp != 2) {
++        problem.* = try std.fmt.allocPrint(a, "--tp {d}: TF_FLASHNEXT_ENGINE=mia runs on one or two ranks", .{o.tp});
++        return null;
++    }
++    const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
++    const h = try gpa.create(Host);
++    h.gpa = gpa;
++    h.driver = cuda.Driver.open() catch |e| {
++        problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
++        gpa.destroy(h); // a null return runs no errdefer
++        return null;
++    };
++    h.ctx = cuda.Context.init(&h.driver, @intCast(device)) catch |e| {
++        h.driver.close();
++        gpa.destroy(h);
++        return e;
++    };
++    bound = &h.ctx;
++    errdefer discard(h);
++    const kernels = try kernelDir(a, io, try h.ctx.capability());
++    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts };
++    fo.kv_dtype = if (o.kv8) .fp8 else .bf16; // --kv-cache fp8 (her --kv-dtype fp8)
++    fo.parallel = o.lanes; // --parallel: streams one shared forward holds
++    fo.prompt_cache_gib = o.prompt_cache_gib;
++    fo.tp = o.tp;
++    fo.rank = o.rank;
++    fo.master = o.master;
++    fo.master_port = o.master_port;
++    const loaded = F.open(gpa, io, &h.ctx, o.dir, kernels, fo) catch |e| {
++        problem.* = try std.fmt.allocPrint(a, "TF_FLASHNEXT_ENGINE=mia cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
++        discard(h); // a null return runs no errdefer
++        return null;
++    };
++    errdefer loaded.deinit(loaded.ctx);
++    h.family = loaded.ctx;
++    h.release = loaded.deinit;
++    h.follow_fn = loaded.follow;
++    h.inner = loaded.backend;
++    h.store = null;
++    h.cfg = try lanes.Config.init(gpa, loaded.facts, loaded.rows, loaded.rows - 1);
++    errdefer h.cfg.deinit(gpa);
++    h.clock = .{ .io = io };
++    h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
++    errdefer h.core.deinit();
++    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step });
++    if (loaded.cache) |c| if (c.budget > 0) {
++        // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
++        h.store_vt = .{ .bytes = c.bytes, .save = c.save, .restore = c.restore, .drop = c.drop };
++        const rules: api.prompt_cache.Rules = .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned };
++        h.store = api.prompt_cache.Store.init(gpa, .{ .ptr = c.ptr, .vtable = &h.store_vt }, rules, c.budget);
++        h.host.cache = &h.store.?;
++    };
++    errdefer if (h.store) |*st| st.deinit();
++    try h.host.start();
++    const follower: ?*const fn (*anyopaque) anyerror!void = if (h.follow_fn != null) Host.follow else null;
++    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .halt = Host.halt, .follow = follower };
++}
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index b60308143..3d1dbaa45 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -47,6 +47,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_QMMF_HALF_BELOW", .scope = .cuda, .kind = .size, .forms = "a whole nonnegative native-size block count (0 disables half tiles)" },
+     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_ROCE_GID_INDEX", .scope = .cuda, .kind = .u32, .forms = "a whole GID index from 0 to 2147483647" },
++    .{ .name = "TF_FLASHNEXT_ENGINE", .scope = .cuda, .kind = .word, .trim = " ", .words = &.{ "upstream", "mia" }, .forms = "upstream or mia" },
+     .{ .name = "TF_GEMMA4_CHUNK_SOLO", .scope = .gemma4, .kind = .size, .forms = "a solo prompt pass's rows, a multiple of 512 up to 4096" },
+     .{ .name = "TF_DRAMA_PREFILL_ROWS", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "whole prompt rows a chunk, 1 through 1024 (checked when a Drama 3 checkpoint opens)" },
+     .{ .name = "TF_DRAMA_REFERENCE_CACHE", .scope = .drama3, .kind = .u32, .trim = " ", .forms = "kept reference states, 0 (off) through 16 (checked when a Drama 3 checkpoint opens)" },

@@ -1,0 +1,1904 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 03:17:34 +0700
+Subject: [PATCH 21/79] dsv41: engine-native compute lane (opt-in
+ TF_DSV41_COMPUTE_LANE)
+
+A request that lists {"type": "code_interpreter"}, or offers the lane's own
+python function definition, gets a built-in python tool. Its reply holds at
+each EOS (Request.hold_eos): the stream keeps its slot and KV, and the
+engine skips it while the server runs the calls in the sandboxed executor.
+The server renders the template's tool-result turn and resumes the stream
+with those tokens as forced rows, so the model continues with the same ids
+a client round trip would send, without re-prefilling.
+
+- lanes: hold_eos/held on Stream, a held EOS stays pending (window cut),
+  hold.resumeHeld and hold.runnableCount for the idle checks
+- lane host: resume_held queued like cancel and applied on the engine
+  thread; at most one resume a hold; a held request never goes lone
+- engine API: Request.hold_eos, Info.compute, vtable resume_held and
+  engine_hold.zig (the executor, Resume, resumeHeld)
+- server: compute_turns (opt-in, arming, client stream filter; DeepSeek's
+  native tool check for the client's own tools) and compute_segments
+  (segment loop, result insertion, merged reply with tensorfold.compute);
+  Generation.readText is the reply reading finish and the segment loop
+  share; deadline_s carries across segments
+- serve: __compute_sandbox trampoline entry in main (Linux)
+- dsv41: TF_DSV41_COMPUTE_LANE and its _WORKERS, _MAX_MS, _MAX_RESULT_TOKENS,
+  _MAX_CALLS, _MEM_MB, _PYTHON and _CPUS knobs on the CUDA serve path
+
+Not armed: stop strings, structured output, a forced call, logprobs,
+background or zero-token requests, and Kimi's native reply reader.
+Flag unset: no pool, hold_eos never set, replies unchanged.
+
+test-compute-hold-host (lanes and lane host), test-compute-lane-http-host
+(a held python call's result forced in as the template's tool turn through
+the chat route, the filter, the definition) and test-lane-api-host.
+---
+ zig/build/cuda_server_host.zig                |   1 +
+ zig/build/lane_halt_host.zig                  |   3 +
+ zig/src/core/compute_lane.zig                 |   3 +-
+ zig/src/core/engine_api.zig                   |  32 +--
+ zig/src/core/engine_hold.zig                  |  15 +
+ zig/src/core/engine_lone.zig                  |  27 ++
+ zig/src/core/lane_host.zig                    |   7 +-
+ zig/src/core/lane_host_hold.zig               |  74 +++++
+ zig/src/core/lane_host_hold_test.zig          | 166 +++++++++++
+ zig/src/core/lane_host_lone.zig               |   2 +-
+ zig/src/core/lane_host_tests.zig              |   1 +
+ zig/src/core/lane_rounds.zig                  |   3 +-
+ zig/src/core/lane_stream.zig                  |   1 +
+ zig/src/core/lanes/engine.zig                 |   2 +-
+ zig/src/core/lanes/hold.zig                   |  45 +++
+ zig/src/core/lanes/hold_test.zig              | 165 +++++++++++
+ zig/src/core/lanes/lanes.zig                  |   2 +
+ zig/src/core/lanes/short_loop.zig             |  32 +++
+ zig/src/core/lanes/stream.zig                 |  47 +---
+ .../families/deepseek_v41/serve_engine.zig    |   7 +-
+ zig/src/server/chat.zig                       |   7 +-
+ zig/src/server/chat_generation.zig            |  79 ++++--
+ zig/src/server/compute_lane_http_test.zig     | 180 ++++++++++++
+ zig/src/server/compute_segments.zig           | 263 ++++++++++++++++++
+ zig/src/server/compute_turns.zig              | 189 +++++++++++++
+ zig/src/server/main.zig                       |   2 +
+ zig/src/server/openai.zig                     |   2 +-
+ zig/src/server/root.zig                       |   3 +
+ zig/src/server/server.zig                     |   3 +
+ 29 files changed, 1272 insertions(+), 91 deletions(-)
+ create mode 100644 zig/src/core/engine_hold.zig
+ create mode 100644 zig/src/core/engine_lone.zig
+ create mode 100644 zig/src/core/lane_host_hold.zig
+ create mode 100644 zig/src/core/lane_host_hold_test.zig
+ create mode 100644 zig/src/core/lanes/hold.zig
+ create mode 100644 zig/src/core/lanes/hold_test.zig
+ create mode 100644 zig/src/core/lanes/short_loop.zig
+ create mode 100644 zig/src/server/compute_lane_http_test.zig
+ create mode 100644 zig/src/server/compute_segments.zig
+ create mode 100644 zig/src/server/compute_turns.zig
+
+diff --git a/zig/build/cuda_server_host.zig b/zig/build/cuda_server_host.zig
+index ec58a14d9..c6634bb4b 100644
+--- a/zig/build/cuda_server_host.zig
++++ b/zig/build/cuda_server_host.zig
+@@ -58,6 +58,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     b.step("test-http-limits-host", "Total HTTP read deadlines and connection admission without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"HTTP limits:"} })).step);
+     b.step("test-server-recovery-host", "Incomplete replies, token allocation and bounded SSE storage without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Server recovery:"} })).step);
+     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
++    b.step("test-compute-lane-http-host", "The compute lane through the chat route: a held python call's result forced in").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"compute lane:"} })).step);
+     b.step("test-request-deadline-host", "deadline_s: the server ends a reply at its deadline with usage and ids").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request deadline:"} })).step);
+     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+     @import("request_starts_host.zig").steps(b, native_modules.engines, server_tests);
+diff --git a/zig/build/lane_halt_host.zig b/zig/build/lane_halt_host.zig
+index 9220a26ed..07f1802da 100644
+--- a/zig/build/lane_halt_host.zig
++++ b/zig/build/lane_halt_host.zig
+@@ -14,6 +14,9 @@ pub fn steps(b: *std.Build) void {
+     b.step("test-rows-prefetch-host", "Disk states read ahead for queued requests: equality, cancellation, fallbacks").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"prefetch:"} })).step);
+     b.step("test-embedding-lane-host", "Prompt-only embedding jobs on the actual lane worker without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"embedding lane:"} })).step);
+     b.step("test-prefill-service-host", "The opt-in prompt-row budget beside decoding streams on the lane host with a fake backend").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"prefill service:"} })).step);
++    const hold = b.step("test-compute-hold-host", "Replies held at an EOS for a server tool's result, then resumed or ended, without devices");
++    hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"compute hold:"} })).step);
++    hold.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"compute hold:"} })).step);
+     const copies = b.step("test-root-copy-host", "Root copy precedence, drafter absorption and real worker checks without GPU");
+     copies.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lanes, .filters = &.{"root copy:"} })).step);
+     copies.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api, .filters = &.{"root copy:"} })).step);
+diff --git a/zig/src/core/compute_lane.zig b/zig/src/core/compute_lane.zig
+index 84796dfc2..99f71458c 100644
+--- a/zig/src/core/compute_lane.zig
++++ b/zig/src/core/compute_lane.zig
+@@ -3,7 +3,8 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ const linux = std.os.linux;
+ const Allocator = std.mem.Allocator;
+-const sandbox = @import("compute_sandbox.zig");
++pub const sandbox = @import("compute_sandbox.zig");
++pub const runner = @import("compute_runner.zig");
+ const log = std.log.scoped(.compute_lane);
+ 
+ pub const Config = struct {
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 27e955133..aa74a15ae 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -16,7 +16,7 @@ pub const EmbeddingBatch = lanes.embedding.Batch;
+ pub const embedding_vector = @import("embedding_vector.zig");
+ pub const load_ledger = @import("load_ledger.zig");
+ pub const kv_ledger = @import("kv_ledger.zig");
+-
++pub const hold = @import("engine_hold.zig");
+ /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
+ pub const Image = lanes.stream.Image;
+ 
+@@ -89,6 +89,7 @@ pub const Request = struct {
+     images: []const Image = &.{},
+     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
+     cache_key: []const u32 = &.{},
++    hold_eos: bool = false, // at an EOS the stream holds for hold.resumeHeld (a built-in tool's result), not finishing
+ 
+     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
+     pub fn cacheKey(r: *const Request) []const u32 {
+@@ -231,6 +232,7 @@ pub const Info = struct {
+     admit: ?Admit = null,
+     /// A byte budget each request promises its caches from as it is admitted (null: none); never beside `admit`.
+     ledger: ?Ledger = null,
++    compute: ?hold.compute_lane.Config = null, // the family's built-in code execution: replies hold at EOS for results
+ 
+     pub const Capability = @import("engine_capabilities.zig").Capability;
+ 
+@@ -450,6 +452,7 @@ pub const Engine = struct {
+         load: ?*const fn (ctx: *anyopaque, producer: ?load_ledger.Producer) void = null,
+         /// Asked once per whole request: the returned message is the refusal, up to `refusal_bytes`; null: accepted.
+         refusal: ?*const fn (ctx: *anyopaque, request: *const Request, out: []u8) ?[]const u8 = null,
++        resume_held: ?*const fn (ctx: *anyopaque, id: Id, r: hold.Resume) void = null, // engine_hold.zig
+     };
+ 
+     pub fn info(e: Engine) Info {
+@@ -536,30 +539,9 @@ pub const Engine = struct {
+     }
+ };
+ 
+-/// A backend's own driver for a lone greedy stream (the GPU round), which LaneHost runs while the stream is alone.
+-pub const Lone = struct {
+-    ctx: *anyopaque,
+-    sampled: bool = false, // it drives sampled streams too
+-    plain: bool = false, // it drives streams with drafts off too
+-    logprobs: bool = false, // it gives each token its logprob row too
+-    structures: bool = false, // it masks each window's rows by the stream's grammar too
+-    images: bool = true, // it takes image requests too (false: they stay in the lane core)
+-    // thinking budgets above this and loop guards: it hands the stream over before a forced close (0: never)
+-    min_budget: u32 = 0,
+-    resumes: bool = false, // it takes the lane core's stream back between rounds (LoneHooks.resumed); else only opens
+-    /// Prefills (or resumes) `s` and decodes it until it finishes (false) or `hooks.yield` hands it to the lane core.
+-    run: *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: LoneHooks) anyerror!bool,
+-};
+-
+-/// What a lone driver tells the host between rounds: tokens landed; and asks: hand the stream over now?
+-pub const LoneHooks = struct {
+-    ctx: *anyopaque,
+-    committed: *const fn (ctx: *anyopaque) void,
+-    yield: *const fn (ctx: *anyopaque) bool,
+-    resumed: bool = false, // the stream comes from the lane core between rounds: no prompt pass, its drafts the core's
+-    // After a completed nonfinal prompt call, true transfers the unfinished pass to the shared fill queue.
+-    prefill_yield: ?*const fn (ctx: *anyopaque) bool = null,
+-};
++/// A backend's own driver for a lone greedy stream and its hooks between rounds (engine_lone.zig).
++pub const Lone = @import("engine_lone.zig").Lone;
++pub const LoneHooks = @import("engine_lone.zig").LoneHooks;
+ 
+ /// The lane core served to the HTTP threads (lane_host.zig).
+ pub const LaneHost = @import("lane_host.zig").LaneHost;
+diff --git a/zig/src/core/engine_hold.zig b/zig/src/core/engine_hold.zig
+new file mode 100644
+index 000000000..0253c9f20
+--- /dev/null
++++ b/zig/src/core/engine_hold.zig
+@@ -0,0 +1,15 @@
++//! A reply held at its EOS for a built-in tool's result: ``Request.hold_eos`` and ``Engine.vtable.resume_held``.
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++
++/// The compute lane's executor: its knobs and sandbox pool (the server runs the calls).
++pub const compute_lane = @import("compute_lane.zig");
++/// A held reply's result tokens (empty: it ends at its EOS), forced after the EOS between rounds.
++pub const Resume = lanes.hold.Resume;
++
++/// Continues a ``hold_eos`` request held at its EOS, once; false when the engine holds no replies.
++pub fn resumeHeld(e: api.Engine, id: api.Id, r: Resume) bool {
++    const f = e.vtable.resume_held orelse return false;
++    f(e.ctx, id, r);
++    return true;
++}
+diff --git a/zig/src/core/engine_lone.zig b/zig/src/core/engine_lone.zig
+new file mode 100644
+index 000000000..b366f5cb1
+--- /dev/null
++++ b/zig/src/core/engine_lone.zig
+@@ -0,0 +1,27 @@
++//! A backend's own driver for a lone greedy stream, which LaneHost runs while the stream is alone.
++const lanes = @import("lanes");
++
++/// A backend's own driver for a lone greedy stream (the GPU round), which LaneHost runs while the stream is alone.
++pub const Lone = struct {
++    ctx: *anyopaque,
++    sampled: bool = false, // it drives sampled streams too
++    plain: bool = false, // it drives streams with drafts off too
++    logprobs: bool = false, // it gives each token its logprob row too
++    structures: bool = false, // it masks each window's rows by the stream's grammar too
++    images: bool = true, // it takes image requests too (false: they stay in the lane core)
++    // thinking budgets above this and loop guards: it hands the stream over before a forced close (0: never)
++    min_budget: u32 = 0,
++    resumes: bool = false, // it takes the lane core's stream back between rounds (LoneHooks.resumed); else only opens
++    /// Prefills (or resumes) `s` and decodes it until it finishes (false) or `hooks.yield` hands it to the lane core.
++    run: *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: LoneHooks) anyerror!bool,
++};
++
++/// What a lone driver tells the host between rounds: tokens landed; and asks: hand the stream over now?
++pub const LoneHooks = struct {
++    ctx: *anyopaque,
++    committed: *const fn (ctx: *anyopaque) void,
++    yield: *const fn (ctx: *anyopaque) bool,
++    resumed: bool = false, // the stream comes from the lane core between rounds: no prompt pass, its drafts the core's
++    // After a completed nonfinal prompt call, true transfers the unfinished pass to the shared fill queue.
++    prefill_yield: ?*const fn (ctx: *anyopaque) bool = null,
++};
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 2f55f03af..f29c517ec 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -10,6 +10,7 @@ const fill = @import("lane_host_fill.zig");
+ const admit = @import("lane_host_admit.zig");
+ const recalls = @import("lane_host_recall.zig");
+ const ends = @import("lane_host_end.zig");
++const holds = @import("lane_host_hold.zig");
+ const rows_host = @import("lane_host_rows.zig");
+ const pressure = @import("lane_host_pressure.zig");
+ const load = @import("lane_host_load.zig");
+@@ -46,6 +47,7 @@ pub const LaneHost = struct {
+     admitted: std.ArrayList(*Job) = .empty,
+     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
+     cancels: std.ArrayList(Id) = .empty,
++    resumes: std.ArrayList(holds.Pending) = .empty, // results for held replies (lane_host_hold.zig)
+     closing: bool = false,
+     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
+     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
+@@ -141,6 +143,7 @@ pub const LaneHost = struct {
+         h.admitted.deinit(h.gpa);
+         h.filling.deinit(h.gpa);
+         h.cancels.deinit(h.gpa);
++        holds.close(h);
+         h.decoded.deinit(h.gpa);
+         h.live_tokens.deinit(h.gpa);
+         h.pieces.deinit(h.gpa);
+@@ -161,6 +164,7 @@ pub const LaneHost = struct {
+         .info = infoFn,
+         .submit = submitFn,
+         .cancel = cancelFn,
++        .resume_held = holds.resumeFn,
+         .status = status.read,
+         .memory = memoryFn,
+         .keepalive = keepaliveFn,
+@@ -508,6 +512,7 @@ pub const LaneHost = struct {
+             var activity = @import("lane_activity.zig").Activity.enter(h.activity);
+             defer activity.end();
+             ends.takeCancels(h);
++            holds.take(h);
+             pressure.step(h);
+             rows_host.answer(h);
+             scoring.answer(h);
+@@ -532,7 +537,7 @@ pub const LaneHost = struct {
+                 ends.closeAll(h);
+                 continue;
+             }
+-            if (h.core.activeCount() == 0) {
++            if (lanes.hold.runnableCount(h.core.live.items) == 0) {
+                 if (h.filling.items.len > 0) {
+                     h.unlock();
+                     continue;
+diff --git a/zig/src/core/lane_host_hold.zig b/zig/src/core/lane_host_hold.zig
+new file mode 100644
+index 000000000..cd9e6fcde
+--- /dev/null
++++ b/zig/src/core/lane_host_hold.zig
+@@ -0,0 +1,74 @@
++//! Resumes the server queues for replies held at their EOS (Request.hold_eos), applied on the engine thread.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const LaneHost = @import("lane_host.zig").LaneHost;
++const Job = LaneHost.Job;
++
++/// A resume waiting for the engine thread, with its own copy of the tokens.
++pub const Pending = struct { id: api.Id, tokens: []u32, think_open: bool };
++
++/// Queues a resume from any thread; the engine thread applies it before its next round.
++pub fn resumeFn(ctx: *anyopaque, id: api.Id, r: api.hold.Resume) void {
++    const h: *LaneHost = @ptrCast(@alignCast(ctx));
++    const tokens = h.gpa.dupe(u32, r.tokens) catch null;
++    h.lock();
++    defer h.unlock();
++    // without memory for the result the reply cannot go on: it is cancelled rather than left held
++    const copy = tokens orelse return cancelLocked(h, id);
++    h.resumes.append(h.gpa, .{ .id = id, .tokens = copy, .think_open = r.think_open }) catch {
++        h.gpa.free(copy);
++        return cancelLocked(h, id);
++    };
++    h.wake.signal(h.io);
++}
++
++fn cancelLocked(h: *LaneHost, id: api.Id) void {
++    h.cancels.append(h.gpa, id) catch {};
++    h.wake.signal(h.io);
++}
++
++/// Applies the queued resumes to their held streams; a job no longer admitted drops its resume.
++pub fn take(h: *LaneHost) void {
++    h.lock();
++    var list = h.resumes;
++    h.resumes = .empty;
++    h.unlock();
++    defer {
++        for (list.items) |p| h.gpa.free(p.tokens);
++        list.deinit(h.gpa);
++    }
++    var ended = false;
++    for (list.items) |p| {
++        const job = admitted(h, p.id) orelse continue;
++        const s = &job.stream;
++        const out = lanes.hold.resumeHeld(s, h.gpa, p.tokens, p.think_open) catch blk: {
++            s.held = false;
++            s.paused = false;
++            s.finished = true;
++            s.reason = .@"error";
++            s.problem = "out of memory for a tool result";
++            break :blk .no_room;
++        };
++        switch (out) {
++            .resumed => {},
++            .ended, .no_room => ended = true,
++            .not_held => std.log.warn("lane host: a resume for request {d}, which is not held, was ignored", .{p.id}),
++        }
++    }
++    // an ended stream leaves the live list now: the round loop may not step again before its job is delivered
++    if (ended) h.core.sweep() catch {};
++}
++
++fn admitted(h: *LaneHost, id: api.Id) ?*Job {
++    h.lock();
++    defer h.unlock();
++    for (h.admitted.items) |job| if (job.id == id and job.started) return job;
++    return null;
++}
++
++/// Frees resumes no round took (the host is stopping).
++pub fn close(h: *LaneHost) void {
++    for (h.resumes.items) |p| h.gpa.free(p.tokens);
++    h.resumes.deinit(h.gpa);
++}
+diff --git a/zig/src/core/lane_host_hold_test.zig b/zig/src/core/lane_host_hold_test.zig
+new file mode 100644
+index 000000000..9d16e4ede
+--- /dev/null
++++ b/zig/src/core/lane_host_hold_test.zig
+@@ -0,0 +1,166 @@
++//! Replies held at their EOS through the lane host: the server sees the EOS, the engine idles, one resume continues.
++const std = @import("std");
++const lanes = @import("lanes");
++const api = @import("engine_api.zig");
++const LaneHost = @import("lane_host.zig").LaneHost;
++const Reason = api.Reason;
++const Id = api.Id;
++const Event = api.Event;
++const Request = api.Request;
++
++const gpa = std.testing.allocator;
++const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++const suffix = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88, 12, 23, 34 };
++
++/// A request's events as the server's mailbox keeps them.
++const Box = struct {
++    mutex: std.Io.Mutex = .init,
++    tokens: std.ArrayList(u32) = .empty,
++    done: ?Reason = null,
++    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++        const b: *@This() = @ptrCast(@alignCast(ctx));
++        b.mutex.lockUncancelable(std.testing.io);
++        defer b.mutex.unlock(std.testing.io);
++        switch (e.*) {
++            .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++            .finished => |f| b.done = f.reason,
++            else => {},
++        }
++    }
++    fn count(b: *@This()) struct { n: usize, done: ?Reason } {
++        b.mutex.lockUncancelable(std.testing.io);
++        defer b.mutex.unlock(std.testing.io);
++        return .{ .n = b.tokens.items.len, .done = b.done };
++    }
++    /// Waits until `n` tokens arrived (or the reply ended), up to 10 s.
++    fn reach(b: *@This(), n: usize) !void {
++        for (0..10_000) |_| {
++            const c = b.count();
++            if (c.n >= n or c.done != null) return;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.Timeout;
++    }
++    fn wait(b: *@This()) !Reason {
++        for (0..10_000) |_| {
++            if (b.count().done) |r| return r;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.Timeout;
++    }
++};
++
++/// The fake target's first draw after the prompt (index 2 or later) that no earlier draw repeats: a reachable EOS.
++fn eosAfter(p: []const u32) !struct { token: u32, at: usize } {
++    var h: std.ArrayList(u32) = .empty;
++    defer h.deinit(gpa);
++    try h.appendSlice(gpa, p);
++    var seen: [lanes.fake.vocab]bool = @splat(false);
++    for (0..64) |i| {
++        const t = lanes.fake.next(h.items, null, h.items.len);
++        if (i >= 2 and !seen[t]) return .{ .token = t, .at = i };
++        seen[t] = true;
++        try h.append(gpa, t);
++    }
++    return error.NoEos;
++}
++
++/// A planner that takes each prompt as one piece and its final in the next round.
++const Plan = struct {
++    const Seq = struct { key: usize, n: u64, done: bool = false };
++    seqs: std.ArrayList(Seq) = .empty,
++    fn self(ctx: *anyopaque) *@This() {
++        return @ptrCast(@alignCast(ctx));
++    }
++    fn beginAdmit(_: *anyopaque) void {}
++    fn admit(ctx: *anyopaque, ask: api.Rounds.Ask, _: *[]const u8) api.Rounds.Verdict {
++        self(ctx).seqs.append(gpa, .{ .key = ask.key, .n = ask.prompt.len }) catch return .refuse;
++        return .admit;
++    }
++    fn admitted(_: *anyopaque) anyerror!void {}
++    fn arm(_: *anyopaque, _: usize) void {}
++    fn began(_: *anyopaque, _: usize, _: bool) void {}
++    fn plan(ctx: *anyopaque, pieces: *std.ArrayList(api.Rounds.Piece), finals: *std.ArrayList(usize)) anyerror!void {
++        pieces.clearRetainingCapacity();
++        finals.clearRetainingCapacity();
++        for (self(ctx).seqs.items) |*x| if (!x.done) {
++            try pieces.append(gpa, .{ .key = x.key, .start = 0, .end = x.n - 1, .save = false });
++            try finals.append(gpa, x.key);
++            x.done = true;
++        };
++    }
++    fn left(ctx: *anyopaque, key: usize) void {
++        const p = self(ctx);
++        for (p.seqs.items, 0..) |x, i| if (x.key == key) {
++            _ = p.seqs.orderedRemove(i);
++            return;
++        };
++    }
++    fn after(_: *anyopaque, _: f64, _: f64) void {}
++};
++
++const End = enum { resume_twice, cancel };
++
++/// One hold_eos request on a started host (default loop, or the round planner's): held, idle, then `end`.
++fn heldReply(planner: bool, end: End) !void {
++    const eos = try eosAfter(&prompt);
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, if (planner) target.pieceBackend() else target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    var pl: Plan = .{};
++    defer pl.seqs.deinit(gpa);
++    if (planner) host.rounds = .{ .ctx = &pl, .vtable = &.{ .begin_admit = Plan.beginAdmit, .admit = Plan.admit, .admitted = Plan.admitted, .arm = Plan.arm, .began = Plan.began, .plan = Plan.plan, .left = Plan.left, .after = Plan.after } };
++    var box: Box = .{};
++    defer box.tokens.deinit(gpa);
++    const request: Request = .{ .prompt = &prompt, .max_tokens = 60, .eos = &.{eos.token}, .hold_eos = true };
++    const e = host.engine();
++    try host.start();
++    defer host.stop();
++    try e.submit(7, &request, .{ .ctx = &box, .event = Box.event });
++    try box.reach(eos.at + 1);
++    // held: the EOS reached the server, nothing finished, and the engine thread runs no rounds while it waits
++    const steps = core.steps;
++    std.Io.sleep(std.testing.io, .fromMilliseconds(60), .awake) catch {};
++    const c = box.count();
++    try std.testing.expectEqual(eos.at + 1, c.n);
++    try std.testing.expect(c.done == null);
++    try std.testing.expectEqual(steps, core.steps);
++    switch (end) {
++        .cancel => {
++            e.cancel(7);
++            try std.testing.expectEqual(Reason.cancelled, try box.wait());
++            return;
++        },
++        .resume_twice => {
++            try std.testing.expect(api.hold.resumeHeld(e, 7, .{ .tokens = &suffix }));
++            try std.testing.expect(api.hold.resumeHeld(e, 7, .{ .tokens = &suffix })); // queued; the engine ignores it
++        },
++    }
++    try std.testing.expectEqual(Reason.length, try box.wait());
++    const out = box.tokens.items;
++    try std.testing.expectEqual(@as(usize, 60), out.len);
++    try std.testing.expectEqualSlices(u32, &suffix, out[eos.at + 1 .. eos.at + 1 + suffix.len]);
++    var history: std.ArrayList(u32) = .empty;
++    defer history.deinit(gpa);
++    try history.appendSlice(gpa, &prompt);
++    for (out, 0..) |t, i| {
++        const forced = i > eos.at and i <= eos.at + suffix.len;
++        if (!forced) try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++        try history.append(gpa, t);
++    }
++}
++
++test "compute hold: a held reply idles at its EOS and one resume continues it exactly, in the default loop and a planner's" {
++    try heldReply(false, .resume_twice);
++    try heldReply(true, .resume_twice);
++}
++
++test "compute hold: a held reply that is cancelled ends cancelled, in the default loop and a planner's" {
++    try heldReply(false, .cancel);
++    try heldReply(true, .cancel);
++}
+diff --git a/zig/src/core/lane_host_lone.zig b/zig/src/core/lane_host_lone.zig
+index 46cbf3172..90c386018 100644
+--- a/zig/src/core/lane_host_lone.zig
++++ b/zig/src/core/lane_host_lone.zig
+@@ -15,7 +15,7 @@ fn takes(h: *LaneHost, job: *Job) bool {
+     const r = job.request;
+     const lone = h.lone orelse return false;
+     const think = lone.min_budget > 0 and (r.think_budget == 0 or r.think_budget > lone.min_budget);
+-    return !((r.sampling != null and !lone.sampled) or (!r.drafts and !lone.plain) or ((r.think_budget > 0 or r.loop_guard) and !think) or r.call != null or (r.structure != null and !lone.structures) or (r.images.len > 0 and !lone.images) or (r.logprobs != null and !lone.logprobs) or r.prompt_logprobs != null);
++    return !((r.sampling != null and !lone.sampled) or (!r.drafts and !lone.plain) or ((r.think_budget > 0 or r.loop_guard) and !think) or r.call != null or r.hold_eos or (r.structure != null and !lone.structures) or (r.images.len > 0 and !lone.images) or (r.logprobs != null and !lone.logprobs) or r.prompt_logprobs != null);
+ }
+ 
+ /// After a round: the lane core's last live stream goes back to the driver when nothing else waits or is due.
+diff --git a/zig/src/core/lane_host_tests.zig b/zig/src/core/lane_host_tests.zig
+index ab38b0e3d..996acc147 100644
+--- a/zig/src/core/lane_host_tests.zig
++++ b/zig/src/core/lane_host_tests.zig
+@@ -29,4 +29,5 @@ test {
+ 
+ test {
+     _ = @import("lane_activity_test.zig");
++    _ = @import("lane_host_hold_test.zig");
+ }
+diff --git a/zig/src/core/lane_rounds.zig b/zig/src/core/lane_rounds.zig
+index 5db725cad..65fdd63cd 100644
+--- a/zig/src/core/lane_rounds.zig
++++ b/zig/src/core/lane_rounds.zig
+@@ -160,7 +160,7 @@ fn round(h: *LaneHost, rd: Rounds) bool {
+         did = true;
+         runFinals(h);
+     }
+-    if (h.core.activeCount() > 0) {
++    if (lanes.hold.runnableCount(h.core.live.items) > 0) {
+         did = true;
+         const lt = @import("lane_trace.zig");
+         var traced = if (h.trace) |t| lt.Event.round(t, h.core.live.items.len) else undefined;
+@@ -275,6 +275,7 @@ pub fn run(h: *LaneHost, rd: Rounds) void {
+         var activity = @import("lane_activity.zig").Activity.enter(h.activity);
+         defer activity.end();
+         ends.takeCancels(h);
++        @import("lane_host_hold.zig").take(h);
+         pressure.step(h);
+         rows_host.answer(h);
+         @import("lane_host_score.zig").answer(h);
+diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
+index 279ab9795..dcbab2ffb 100644
+--- a/zig/src/core/lane_stream.zig
++++ b/zig/src/core/lane_stream.zig
+@@ -72,6 +72,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+         .untaught = r.untaught,
+         .images = r.images,
+         .key = r.cache_key,
++        .hold_eos = r.hold_eos and r.structure == null and r.logprobs == null, // forced rows would leave the grammar
+     }) catch {
+         freeProposer(h, job);
+         recalls.release(job);
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 6a589ee7a..4672256d5 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -419,7 +419,7 @@ pub const Engine = struct {
+         }
+         const landed = try s.commit(e.gpa, committed.items, committed_rows);
+         const got = committed.items[0..landed];
+-        if (s.finished and got.len < path.len) path = path[0 .. got.len + 1];
++        if ((s.finished or s.held) and got.len < path.len) path = path[0 .. got.len + @intFromBool(s.finished)]; // held: EOS row reruns
+         const keep = path.len;
+         s.cache_len += keep;
+         s.pending = committed.items[keep - 1];
+diff --git a/zig/src/core/lanes/hold.zig b/zig/src/core/lanes/hold.zig
+new file mode 100644
+index 000000000..7b9a27691
+--- /dev/null
++++ b/zig/src/core/lanes/hold.zig
+@@ -0,0 +1,45 @@
++//! A stream held at its EOS (Stream.hold_eos) for a server tool's result: its tokens forced after the EOS, or the end.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++const Stream = @import("stream.zig").Stream;
++
++/// Streams the next step decodes: a paused (held) stream waits outside the rounds.
++pub fn runnableCount(live: []const *Stream) usize {
++    var n: usize = 0;
++    for (live) |s| n += @intFromBool(!s.finished and !s.paused);
++    return n;
++}
++
++/// A server's resume of a held stream: the tokens forced after its EOS (empty: it ends), and whether they open a think.
++pub const Resume = struct { tokens: []const u32, think_open: bool = false };
++
++pub const Outcome = enum {
++    /// The tokens follow the EOS as forced rows; the model draws again after the last.
++    resumed,
++    /// No tokens: the reply ends as the EOS would have ended it.
++    ended,
++    /// The stream was not held (already resumed, never held or finished): nothing changed.
++    not_held,
++    /// The tokens and one draw do not fit the reply's budget: it ends at the EOS instead.
++    no_room,
++};
++
++/// Applies one resume on the engine thread between rounds; a stream takes at most one per hold.
++pub fn resumeHeld(s: *Stream, gpa: Allocator, tokens: []const u32, think_open: bool) Allocator.Error!Outcome {
++    if (!s.held or s.finished) return .not_held;
++    // the hold's EOS was drawn, so no forced token was waiting before it
++    std.debug.assert(s.force.items.len == 0);
++    const room = tokens.len > 0 and @as(i64, @intCast(tokens.len)) < s.budgetLeft();
++    if (!room) {
++        s.held = false;
++        s.paused = false;
++        s.finished = true;
++        s.reason = .stop;
++        return if (tokens.len == 0) .ended else .no_room;
++    }
++    try s.force.appendSlice(gpa, tokens);
++    s.held = false;
++    s.paused = false;
++    s.think_open = think_open;
++    return .resumed;
++}
+diff --git a/zig/src/core/lanes/hold_test.zig b/zig/src/core/lanes/hold_test.zig
+new file mode 100644
+index 000000000..bf6e65341
+--- /dev/null
++++ b/zig/src/core/lanes/hold_test.zig
+@@ -0,0 +1,165 @@
++//! A stream held at its EOS: other streams decode meanwhile, a resume forces the result once, the reply goes on exact.
++const std = @import("std");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const fake = @import("fake.zig");
++const hold = @import("hold.zig");
++const shared = @import("engine_test.zig");
++const p1 = shared.p1;
++const p2 = shared.p2;
++
++const gpa = std.testing.allocator;
++const suffix = [_]u32{ 11, 22, 33, 44, 55, 66, 77, 88, 12, 23, 34, 45, 56, 67, 78, 89, 13, 24 };
++
++/// The fake target's first draw after `prompt` (index 2 or later) that no earlier draw repeats: a reachable EOS.
++fn eosAfter(prompt: []const u32) !struct { token: u32, at: usize } {
++    var h: std.ArrayList(u32) = .empty;
++    defer h.deinit(gpa);
++    try h.appendSlice(gpa, prompt);
++    var seen: [fake.vocab]bool = @splat(false);
++    for (0..64) |i| {
++        const t = fake.next(h.items, null, h.items.len);
++        if (i >= 2 and !seen[t]) return .{ .token = t, .at = i };
++        seen[t] = true;
++        try h.append(gpa, t);
++    }
++    return error.NoEos;
++}
++
++/// Each token of `emitted` from `from` on is the fake target's draw after the prompt and everything before it.
++fn expectDecoded(prompt: []const u32, emitted: []const u32, from: usize) !void {
++    var h: std.ArrayList(u32) = .empty;
++    defer h.deinit(gpa);
++    try h.appendSlice(gpa, prompt);
++    try h.appendSlice(gpa, emitted[0..from]);
++    for (emitted[from..]) |t| {
++        try std.testing.expectEqual(fake.next(h.items, null, h.items.len), t);
++        try h.append(gpa, t);
++    }
++}
++
++const Run = struct {
++    engine: Engine,
++    target: fake.Fake,
++    clock: fake.FixedClock = .{},
++    cfg: @import("config.zig").Config,
++
++    fn init(r: *Run, mtp: bool) !void {
++        r.cfg = try shared.modelWith(mtp);
++        r.target = .{ .gpa = gpa };
++        r.clock = .{};
++        r.engine = Engine.init(gpa, &r.cfg, r.target.backend(), r.clock.clock());
++    }
++
++    fn deinit(r: *Run) void {
++        r.engine.deinit();
++        r.target.deinit();
++        r.cfg.deinit(gpa);
++    }
++
++    fn until(r: *Run, s: *const sm.Stream, comptime field: []const u8) !void {
++        var steps: usize = 0;
++        while (!@field(s, field) and steps < 400) : (steps += 1) try r.engine.step();
++        try std.testing.expect(@field(s, field));
++    }
++};
++
++/// The peer's reply alone, for the shared-round comparison.
++fn solo(mtp: bool, drafts: bool) ![]u32 {
++    var r: Run = undefined;
++    try r.init(mtp);
++    defer r.deinit();
++    var peer = try sm.Stream.init(gpa, .{ .id = "peer", .prompt = &p2, .max_new = 40, .drafts = drafts });
++    defer peer.deinit(gpa);
++    try r.engine.addStream(&peer);
++    try r.until(&peer, "finished");
++    return gpa.dupe(u32, peer.emitted());
++}
++
++test "compute hold: a held EOS keeps its stream while another decodes; one resume forces the suffix and the reply goes on exact" {
++    const eos = try eosAfter(&p1);
++    for ([_]bool{ true, false }) |mtp| for ([_]bool{ true, false }) |drafts| {
++        var r: Run = undefined;
++        try r.init(mtp);
++        defer r.deinit();
++        var s = try sm.Stream.init(gpa, .{ .id = "held", .prompt = &p1, .max_new = 70, .eos = &.{eos.token}, .drafts = drafts, .hold_eos = true });
++        defer s.deinit(gpa);
++        var peer = try sm.Stream.init(gpa, .{ .id = "peer", .prompt = &p2, .max_new = 40, .drafts = drafts });
++        defer peer.deinit(gpa);
++        try r.engine.addStream(&s);
++        try r.engine.addStream(&peer);
++        try r.until(&s, "held");
++        try std.testing.expect(s.paused and !s.finished);
++        try std.testing.expectEqual(eos.at + 1, s.emitted().len);
++        try std.testing.expectEqual(eos.token, s.emitted()[eos.at]);
++        // held: the stream draws nothing while the peer keeps its rounds
++        const peer_before = peer.emitted().len;
++        for (0..3) |_| try r.engine.step();
++        try std.testing.expectEqual(eos.at + 1, s.emitted().len);
++        try std.testing.expect(peer.finished or peer.emitted().len > peer_before);
++        try std.testing.expectEqual(hold.Outcome.resumed, try hold.resumeHeld(&s, gpa, &suffix, false));
++        try std.testing.expectEqual(hold.Outcome.not_held, try hold.resumeHeld(&s, gpa, &suffix, false));
++        try r.until(&s, "finished");
++        try std.testing.expect(s.reason == .length);
++        const out = s.emitted();
++        try std.testing.expectEqualSlices(u32, &suffix, out[eos.at + 1 .. eos.at + 1 + suffix.len]);
++        // the model's draws after the suffix are the fake target's over the whole history, EOS and suffix included
++        try expectDecoded(&p1, out, eos.at + 1 + suffix.len);
++        try expectDecoded(&p1, out[0 .. eos.at + 1], 0);
++        try r.until(&peer, "finished");
++        const alone = try solo(mtp, drafts);
++        defer gpa.free(alone);
++        try std.testing.expectEqualSlices(u32, alone, peer.emitted());
++    };
++}
++
++test "compute hold: an empty resume ends the held reply at its EOS, as a stream without a hold ends" {
++    const eos = try eosAfter(&p1);
++    var r: Run = undefined;
++    try r.init(true);
++    defer r.deinit();
++    var s = try sm.Stream.init(gpa, .{ .id = "held", .prompt = &p1, .max_new = 70, .eos = &.{eos.token}, .hold_eos = true });
++    defer s.deinit(gpa);
++    var plain = try sm.Stream.init(gpa, .{ .id = "plain", .prompt = &p1, .max_new = 70, .eos = &.{eos.token} });
++    defer plain.deinit(gpa);
++    try r.engine.addStream(&s);
++    try r.until(&s, "held");
++    try std.testing.expectEqual(hold.Outcome.ended, try hold.resumeHeld(&s, gpa, &.{}, false));
++    try std.testing.expect(s.finished and s.reason == .stop and !s.held);
++    try r.engine.step();
++    try std.testing.expectEqual(@as(usize, 0), r.engine.live.items.len);
++    try r.engine.addStream(&plain);
++    try r.until(&plain, "finished");
++    try std.testing.expectEqualSlices(u32, plain.emitted(), s.emitted());
++}
++
++test "compute hold: a resume past the reply's budget ends it at the EOS" {
++    const eos = try eosAfter(&p1);
++    var r: Run = undefined;
++    try r.init(true);
++    defer r.deinit();
++    var s = try sm.Stream.init(gpa, .{ .id = "held", .prompt = &p1, .max_new = @intCast(eos.at + 1 + 4), .eos = &.{eos.token}, .hold_eos = true });
++    defer s.deinit(gpa);
++    try r.engine.addStream(&s);
++    try r.until(&s, "held");
++    try std.testing.expectEqual(hold.Outcome.no_room, try hold.resumeHeld(&s, gpa, suffix[0..4], false));
++    try std.testing.expect(s.finished and s.reason == .stop);
++    try std.testing.expectEqual(eos.at + 1, s.emitted().len);
++}
++
++test "compute hold: a held stream is cancelled like any other: discarded, released, out of the live list" {
++    const eos = try eosAfter(&p1);
++    var r: Run = undefined;
++    try r.init(false);
++    defer r.deinit();
++    var s = try sm.Stream.init(gpa, .{ .id = "held", .prompt = &p1, .max_new = 70, .eos = &.{eos.token}, .hold_eos = true });
++    defer s.deinit(gpa);
++    try r.engine.addStream(&s);
++    try r.until(&s, "held");
++    try std.testing.expectEqual(@as(usize, 0), hold.runnableCount(r.engine.live.items));
++    try std.testing.expectEqual(@as(usize, 1), r.engine.activeCount());
++    r.engine.discard(&s);
++    try std.testing.expect(s.finished and s.reason == .cancelled);
++    try std.testing.expectEqual(@as(usize, 0), r.engine.live.items.len);
++    try std.testing.expectEqual(hold.Outcome.not_held, try hold.resumeHeld(&s, gpa, &suffix, false));
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 7804adf23..8a25ca9fb 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -35,6 +35,7 @@ pub const shared_drafts = @import("shared_drafts.zig");
+ pub const row_cost = @import("row_cost.zig");
+ pub const trail = @import("trail.zig");
+ pub const engine = @import("engine.zig");
++pub const hold = @import("hold.zig");
+ pub const fake = @import("fake.zig");
+ pub const shared_head_cost_check = @import("shared_head_cost_check.zig");
+ pub const shared_draft_check = @import("shared_draft_check.zig");
+@@ -64,6 +65,7 @@ test {
+     _ = @import("long_loop_test.zig");
+     _ = @import("loop_stop_test.zig");
+     _ = @import("handover_test.zig");
++    _ = @import("hold_test.zig");
+     _ = @import("open_first_test.zig");
+     _ = @import("open_trace_test.zig");
+     _ = @import("recorder_test.zig");
+diff --git a/zig/src/core/lanes/short_loop.zig b/zig/src/core/lanes/short_loop.zig
+new file mode 100644
+index 000000000..92f8a9230
+--- /dev/null
++++ b/zig/src/core/lanes/short_loop.zig
+@@ -0,0 +1,32 @@
++//! The short-period loop guard: an exact cycle of at most `loop_max_period` tokens repeated over `loop_min_run`.
++
++pub const loop_max_period: usize = 8;
++pub const loop_min_run: usize = 256;
++pub const loop_warm_in: usize = 64;
++
++/// Return the shortest exact cycle at the end of a combined token prefix.
++pub fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
++    if (n < loop_min_run + 1) return null;
++    for (1..loop_max_period + 1) |period| {
++        if (n < loop_min_run + period) break;
++        if (n - loop_min_run - period < loop_warm_in) break;
++        var matches = true;
++        for (1..loop_min_run + 1) |k| {
++            const right = n - k;
++            const left = right - period;
++            const right_token = if (right < head.len) head[right] else tail[right - head.len];
++            const left_token = if (left < head.len) head[left] else tail[left - head.len];
++            if (right_token != left_token) {
++                matches = false;
++                break;
++            }
++        }
++        if (matches) return @intCast(period);
++    }
++    return null;
++}
++
++/// Return the detected period at the end of committed tokens, or null.
++pub fn detectLoop(emitted: []const u32) ?u32 {
++    return cycleAt(emitted, &.{}, emitted.len);
++}
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 8c39822a3..14c45167d 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -11,6 +11,7 @@ const Penalties = @import("sampling.zig").Penalties;
+ const State = @import("depth.zig").State;
+ const Row = @import("logprob.zig").Row;
+ const long_loop = @import("long_loop.zig");
++const short_loop = @import("short_loop.zig");
+ 
+ pub const Reason = enum {
+     none,
+@@ -26,31 +27,10 @@ pub const Reason = enum {
+ 
+ pub const Mode = enum { pipe, drain, verify, exit };
+ 
+-pub const loop_max_period: usize = 8;
+-pub const loop_min_run: usize = 256;
+-pub const loop_warm_in: usize = 64;
+-
+-/// Return the shortest exact cycle at the end of a combined token prefix.
+-fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
+-    if (n < loop_min_run + 1) return null;
+-    for (1..loop_max_period + 1) |period| {
+-        if (n < loop_min_run + period) break;
+-        if (n - loop_min_run - period < loop_warm_in) break;
+-        var matches = true;
+-        for (1..loop_min_run + 1) |k| {
+-            const right = n - k;
+-            const left = right - period;
+-            const right_token = if (right < head.len) head[right] else tail[right - head.len];
+-            const left_token = if (left < head.len) head[left] else tail[left - head.len];
+-            if (right_token != left_token) {
+-                matches = false;
+-                break;
+-            }
+-        }
+-        if (matches) return @intCast(period);
+-    }
+-    return null;
+-}
++pub const loop_max_period = short_loop.loop_max_period;
++pub const loop_min_run = short_loop.loop_min_run;
++pub const loop_warm_in = short_loop.loop_warm_in;
++pub const detectLoop = short_loop.detectLoop;
+ 
+ /// Return the first token index in a candidate batch that would fire the guard.
+ pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
+@@ -58,16 +38,11 @@ pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
+     for (tokens, 0..) |token, i| {
+         if (@as(i64, token) == s.think_end) return null;
+         const n = s.emitted().len + i + 1;
+-        if (cycleAt(s.emitted(), tokens, n) != null or s.long_loop.cycleAt(s.emitted(), tokens, n) != null) return i;
++        if (short_loop.cycleAt(s.emitted(), tokens, n) != null or s.long_loop.cycleAt(s.emitted(), tokens, n) != null) return i;
+     }
+     return null;
+ }
+ 
+-/// Return the detected period at the end of committed tokens, or null.
+-pub fn detectLoop(emitted: []const u32) ?u32 {
+-    return cycleAt(emitted, &.{}, emitted.len);
+-}
+-
+ /// A stop-string check over the emitted tokens (the server's StopPolicy decodes their tail).
+ pub const StopCheck = struct {
+     ptr: *anyopaque,
+@@ -147,6 +122,7 @@ pub const Spec = struct {
+     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
+     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
+     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
++    hold_eos: bool = false, // an EOS holds the stream for a server tool's result (hold.zig) instead of ending it
+ };
+ 
+ pub const Stream = struct {
+@@ -236,6 +212,8 @@ pub const Stream = struct {
+     grammar_round: @import("grammar_time.zig").Round = .{},
+     gpu_seconds: ?f64 = null, // a timed backend's passes this stream ran in (TF_Q27_PROFILE); null: untimed
+     paused: bool = false,
++    hold_eos: bool = false,
++    held: bool = false, // paused at a committed EOS, which stays pending until hold.zig resumes or ends the stream
+     depth: ?State = null,
+     mode: ?Mode = null,
+     next: ?Held = null,
+@@ -284,6 +262,7 @@ pub const Stream = struct {
+             .decode_spans = spec.decode_spans,
+             .images = spec.images,
+             .key = spec.key,
++            .hold_eos = spec.hold_eos,
+         };
+         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
+         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
+@@ -491,7 +470,11 @@ pub const Stream = struct {
+             }
+             const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
+             const fire = if (guarded) detectLoop(s.emitted()) orelse s.longCycle() else null;
+-            if (s.isEos(t) or s.stopped()) {
++            if (s.isEos(t) and s.hold_eos) {
++                s.held = true;
++                s.paused = true;
++                break;
++            } else if (s.isEos(t) or s.stopped()) {
+                 s.finished = true;
+                 s.reason = .stop;
+             } else if (fire) |period| {
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index 0ec70eef6..9990a4552 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -131,6 +131,8 @@ pub const Served = struct {
+         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
+         s.host = api.LaneHost.init(gpa, io, &s.core, .{ .benchmark_ranks = m.session.nccl.size, .benchmark_group = m.benchmark_group, .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows });
+         s.host.info_.draft_sources = draftSources(m.pass != null, s.cfg.max_copy > 0);
++        // TF_DSV41_COMPUTE_LANE=1: built-in code runs on the CPU while its reply holds at EOS (core/compute_lane.zig)
++        s.host.info_.compute = try api.hold.compute_lane.Config.parse(&@import("serve_knobs.zig").env, "TF_DSV41_COMPUTE_LANE");
+         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
+         s.host.on_thread = .{ .ctx = m, .run = bindContext };
+         // /metrics' device memory: bytes this rank holds in cuda.DeviceBuffers (weights, KV pool, staging), peak
+@@ -300,7 +302,7 @@ pub const Recorder = struct {
+ 
+     pub fn engine(r: *Recorder) api.Engine {
+         if (r.path == null) return r.inner;
+-        return .{ .ctx = r, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++        return .{ .ctx = r, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory, .resume_held = resumeHeld } };
+     }
+ 
+     fn self(ctx: *anyopaque) *Recorder {
+@@ -312,6 +314,9 @@ pub const Recorder = struct {
+     fn cancel(ctx: *anyopaque, id: api.Id) void {
+         self(ctx).inner.cancel(id);
+     }
++    fn resumeHeld(ctx: *anyopaque, id: api.Id, r: api.hold.Resume) void {
++        _ = api.hold.resumeHeld(self(ctx).inner, id, r);
++    }
+     fn status(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
+         self(ctx).inner.status(out, stream_tokens);
+     }
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 773e455b7..edd9ae50d 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -210,6 +210,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     }
+     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, reasoning, request.think_budget, count);
+     request.prompt_logprobs = input.prompt_logprobs;
++    // the compute lane: a reply offered the built-in tool holds at each EOS for its results (not with stop strings)
++    request.hold_eos = stops_opt.strings.len == 0 and @import("compute_turns.zig").arms(srv, input, &request);
+     if (try engine_refusal.of(srv.engine, cx, &request)) |message| return cx.refuse(message);
+     const deadline: ?i96 = if (f.get("deadline_s")) |v| blk: {
+         const s = (if (v == .bool) null else v.float64()) orelse return cx.refuse("deadline_s must be a number of seconds");
+@@ -259,13 +261,16 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     srv.release(preparing, null); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false, .deadline_ns = prepared.deadline_ns };
++    var filter: @import("compute_turns.zig").Filter = .{ .a = a, .inner = if (sink) |x| x else undefined };
++    const shown: ?Sink = if (request.hold_eos and sink != null) filter.sink() else sink; // built-in calls stay hidden
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = shown, .hold = request.hold_eos, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false, .deadline_ns = prepared.deadline_ns };
+     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+         if (sink) |s| if (s.begin) |begin| begin(s.ctx, prepared.prompt_len) catch break :blk error.Cancelled;
+         if (sink != null and input.tools.len > 0 and srv.text.vtable.format != .kimi) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+         gen.loop(gone) catch |e| break :blk e;
++        if (gen.held) break :blk @import("compute_segments.zig").rest(&gen, cx, prepared, &filter, gone);
+         break :blk gen.finish(cx, prepared.prompt_len, received, prepared.thinking, prepared.reasoning, effort, prepared.sampled, prepared.drafts);
+     };
+     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index ac15550ce..c8942dc6c 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -57,6 +57,9 @@ pub const Generation = struct {
+     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
+     deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
+     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
++    hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
++    held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
++    skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
+ 
+     fn eos(g: *const Generation, t: u32) bool {
+         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
+@@ -88,6 +91,7 @@ pub const Generation = struct {
+             landed += 1;
+             if (g.eos(t)) {
+                 g.reason = "stop";
++                g.held = g.hold;
+             } else if (try g.stopHit()) {
+                 g.reason = "stop";
+                 g.srv.engine.cancel(g.id); // the engine ends EOS and length itself; a stop string is the server's
+@@ -156,7 +160,7 @@ pub const Generation = struct {
+     }
+ 
+     /// Waits for the engine's own end, so the request it holds may be freed.
+-    fn drain(g: *Generation) void {
++    pub fn drain(g: *Generation) void {
+         const m = g.box;
+         m.mutex.lockUncancelable(m.io);
+         defer m.mutex.unlock(m.io);
+@@ -216,15 +220,55 @@ pub const Generation = struct {
+                     return error.Cancelled;
+                 }) g.wrote_ns = now;
+             }
+-            const tokens = chunk orelse continue;
++            const tokens = try g.skipInserted(chunk orelse continue);
+             if (g.reason == null) try g.commit(tokens);
++            if (g.held) return;
+         }
+     }
+ 
++    /// Drops the inserted result that opens a resumed segment; a different token there fails the reply.
++    fn skipInserted(g: *Generation, tokens: []u32) Failure![]u32 {
++        const n = @min(tokens.len, g.skip.len);
++        if (!std.mem.eql(u32, tokens[0..n], g.skip[0..n])) {
++            log.line("error: {s}: the engine's tokens after a tool result are not the result it was given", .{g.reply_id});
++            g.cancel();
++            return error.Failed;
++        }
++        g.skip = g.skip[n..];
++        return tokens[n..];
++    }
++
++    /// A reply's text as `finish` reads it: stops, MiniMax calls as DSML, a call closed at its EOS, the think split.
++    pub const Read = struct { text: []const u8, close: []const u8, content: []const u8, reasoning: ?[]const u8 };
++
++    /// `raw`, the decoded `content_tokens`, as the client reads it: every format but Kimi's native reader.
++    pub fn readText(g: *const Generation, raw: []const u8, content_tokens: []const u32) Failure!Read {
++        const a = g.a;
++        const raw_visible = g.stops.visible(raw, false);
++        const visible = try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools); // MiniMax-M3's calls as DSML
++        // closed before the think split, so a call ending an unclosed think block is the answer
++        const close = try g.closeCall(visible);
++        const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
++        var r: Read = .{ .text = text, .close = close, .content = text, .reasoning = null };
++        if (g.thinking) {
++            const original_close = try reply_text.closeWhere(a, reply_text.decodeText, g.srv.text, content_tokens, g.srv.close_id);
++            const close_at = try @import("tool_minimax.zig").closeAfterRewrite(a, raw_visible, g.tools, original_close);
++            const split = try reply_text.splitThinkingAt(a, text, true, g.srv.markers, close_at);
++            r.reasoning = nonEmpty(reply_text.pyStrip(split.reasoning));
++            r.content = split.answer;
++        } else if (g.srv.info.capability(.reasoning)) {
++            const h = reply_text.parseHarmony(text);
++            r.content = h.content;
++            r.reasoning = h.reasoning;
++        }
++        r.content = try tool_lfm2.dsml(a, r.content, g.tools, true);
++        return r;
++    }
++
+     pub fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, thinking: bool, reasons: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
+         const a = g.a;
+         const m = g.box;
+-        if (!g.engine_done) g.drain();
++        if (!g.engine_done and !g.held) g.drain();
+         const natural: []const u8 = g.reason orelse switch (m.reason) {
+             .stop => "stop",
+             .length => "length",
+@@ -240,29 +284,8 @@ pub const Generation = struct {
+         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
+         const raw = try g.srv.text.decode(a, content_tokens);
+         const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else null;
+-        const raw_visible = g.stops.visible(raw, false);
+-        const visible = if (native) |n| n.content else try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools);
+-        // closed before the think split, so a call ending an unclosed think block is the answer
+-        const close = if (native != null) "" else try g.closeCall(visible);
+-        const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
+-        var content: []const u8 = text;
+-        var reasoning: ?[]const u8 = null;
+-        if (native) |n| {
+-            const r = reply_text.pyStrip(n.reasoning);
+-            reasoning = if (r.len > 0) r else null;
+-        } else if (g.thinking) {
+-            const original_close = try reply_text.closeWhere(a, reply_text.decodeText, g.srv.text, content_tokens, g.srv.close_id);
+-            const close_at = try @import("tool_minimax.zig").closeAfterRewrite(a, raw_visible, g.tools, original_close);
+-            const split = try reply_text.splitThinkingAt(a, text, true, g.srv.markers, close_at);
+-            const r = reply_text.pyStrip(split.reasoning);
+-            reasoning = if (r.len > 0) r else null;
+-            content = split.answer;
+-        } else if (g.srv.info.capability(.reasoning)) {
+-            const h = reply_text.parseHarmony(text);
+-            content = h.content;
+-            reasoning = h.reasoning;
+-        }
+-        if (native == null) content = try tool_lfm2.dsml(a, content, g.tools, true);
++        const read: Read = if (native) |n| .{ .text = n.content, .close = "", .content = n.content, .reasoning = nonEmpty(reply_text.pyStrip(n.reasoning)) } else try g.readText(raw, content_tokens);
++        const text, const close, const content, const reasoning = .{ read.text, read.close, read.content, read.reasoning };
+         if (g.sink) |sink| {
+             const thought = g.streamed_reasoning.text.items;
+             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
+@@ -363,3 +386,7 @@ pub const Generation = struct {
+         return reply;
+     }
+ };
++
++fn nonEmpty(s: []const u8) ?[]const u8 {
++    return if (s.len > 0) s else null;
++}
+diff --git a/zig/src/server/compute_lane_http_test.zig b/zig/src/server/compute_lane_http_test.zig
+new file mode 100644
+index 000000000..f45688c19
+--- /dev/null
++++ b/zig/src/server/compute_lane_http_test.zig
+@@ -0,0 +1,180 @@
++//! The compute lane through the chat route: a held python call runs, its result turn is forced in, the reply goes on.
++const std = @import("std");
++const json = @import("json");
++const api = @import("engine_api");
++const HfText = @import("hf_text.zig").HfText;
++const f = @import("hf_eos_fixture.zig");
++const tf = @import("control_tokens_fixture.zig");
++const lane = api.hold.compute_lane;
++const t = std.testing;
++const Allocator = std.mem.Allocator;
++
++/// An engine whose reply calls python, holds at the EOS, and after the result answers and holds again.
++const Script = struct {
++    a: Allocator,
++    call: []const u32, // the call segment, its EOS last
++    answer: []const u32, // the answer segment, its EOS last
++    sink: ?api.Sink = null,
++    id: api.Id = 0,
++    held_asked: bool = false,
++    resumes: std.ArrayList([]const u32) = .empty,
++
++    fn engine(s: *@This()) api.Engine {
++        return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory, .resume_held = resumeHeld } };
++    }
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 32768 };
++    }
++    fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const s: *@This() = @ptrCast(@alignCast(ctx));
++        s.held_asked = request.hold_eos;
++        s.sink = sink;
++        s.id = id;
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        sink.event(sink.ctx, id, &.{ .tokens = s.call });
++        if (!request.hold_eos) sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
++    }
++    fn resumeHeld(ctx: *anyopaque, id: api.Id, r: api.hold.Resume) void {
++        const s: *@This() = @ptrCast(@alignCast(ctx));
++        const sink = s.sink.?;
++        s.resumes.append(s.a, s.a.dupe(u32, r.tokens) catch unreachable) catch unreachable;
++        if (r.tokens.len == 0) return sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
++        // the forced rows come back as committed tokens, then the model's own
++        sink.event(sink.ctx, id, &.{ .tokens = r.tokens });
++        sink.event(sink.ctx, id, &.{ .tokens = s.answer });
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++const Reply = struct {
++    a: Allocator,
++    code: u16 = 0,
++    body: json.Value = .null,
++    fn out(r: *@This()) @import("openai.zig").Out {
++        return .{ .ctx = r, .vt = &.{ .open = open, .event = event, .reply = reply } };
++    }
++    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
++    fn event(_: *anyopaque, _: ?json.Value) error{Closed}!void {}
++    fn reply(ctx: *anyopaque, code: u16, v: json.Value) void {
++        const r: *@This() = @ptrCast(@alignCast(ctx));
++        r.code = code;
++        r.body = v;
++    }
++};
++
++fn obj(a: Allocator, text: []const u8) !json.Value {
++    return (try json.parseText(a, text)).ok;
++}
++
++fn appendTo(a: Allocator, list: json.Value, more: []const json.Value) !json.Value {
++    return .{ .array = try std.mem.concat(a, json.Value, &.{ list.array, more }) };
++}
++
++/// The mini DeepSeek tokenizer, byte-level both ways so a reply decodes back to its text, and its EOS.
++fn fixture(a: Allocator) !f.Fixture {
++    var out = try f.Fixture.init(a, t.io, null);
++    errdefer out.deinit();
++    const bytes = try std.Io.Dir.cwd().readFileAlloc(t.io, "zig/src/families/deepseek_v41/fixtures/serve/mini_tokenizer.json", a, .limited(1 << 20));
++    const tok = try obj(a, bytes);
++    try tok.object.put(a, "pre_tokenizer", try obj(a, "{\"type\":\"ByteLevel\",\"add_prefix_space\":false,\"trim_offsets\":false,\"use_regex\":false}"));
++    try tok.object.put(a, "decoder", try obj(a, "{\"type\":\"ByteLevel\"}"));
++    try out.tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer.json", .data = try json.stringify(a, tok, .{}) });
++    try out.tmp.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"deepseek_v41\"}" });
++    try out.tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\":\"<｜end▁of▁sentence｜>\"}" });
++    return out;
++}
++
++test "compute lane: a held python call's result is forced in as the template's tool turn and the reply goes on" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // the lane's executor runs on Linux only
++    const python = "/usr/bin/python3";
++    std.Io.Dir.accessAbsolute(t.io, python, .{}) catch return error.SkipZigTest;
++    var tmp = try fixture(a);
++    defer tmp.deinit();
++    var problem: []const u8 = "";
++    const hf = try HfText.load(a, t.io, tmp.path, null, a, &problem);
++    defer hf.deinit();
++    const text = hf.text();
++    // the model's segments, as the template spells an assistant call turn and a plain answer
++    const history = try tf.messages(a, "What is 6*7?");
++    const call_turn = try obj(a,
++        \\{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"python","arguments":"{\"code\":\"print(6*7)\"}"}}]}
++    );
++    const asked = try text.renderIds(a, history, .{ .add_generation_prompt = true }, &problem);
++    const called = try text.renderIds(a, try appendTo(a, history, &.{call_turn}), .{ .add_generation_prompt = false }, &problem);
++    try t.expect(std.mem.startsWith(u32, called, asked));
++    const eos = called[called.len - 1];
++    const answer = try std.mem.concat(a, u32, &.{ try text.encodePlain(a, "It is 42."), &.{eos} });
++    var script: Script = .{ .a = a, .call = called[asked.len..], .answer = answer };
++    const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), text, .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
++    defer srv.deinit();
++    // the pool without the trampoline: the test runner is not the server binary (the sandbox has its own tests)
++    const cfg: lane.Config = .{ .python = python };
++    srv.info.compute = cfg;
++    srv.compute = lane.Pool.init(cfg, &.{ "/bin/sh", "-c", "exec \"$0\" -I -B -u -c \"$1\"", python, lane.runner.runner });
++    var reply: Reply = .{ .a = a };
++    var conn = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
++    defer conn.deinit();
++    const body = try json.newObject(a);
++    try body.put(a, "model", .{ .string = "m" });
++    try body.put(a, "max_tokens", try json.intValue(a, 400));
++    try body.put(a, "messages", history);
++    try body.put(a, "tools", try obj(a, "[{\"type\":\"code_interpreter\"}]"));
++    @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
++    const said = try json.stringify(a, reply.body, .{});
++    errdefer std.debug.print("COMPUTE_LANE_REPLY {s}\n", .{said});
++    try t.expectEqual(@as(u16, 200), reply.code);
++    try t.expect(script.held_asked);
++    // one result inserted, then the answer's EOS ends the reply with an empty resume
++    try t.expectEqual(@as(usize, 2), script.resumes.items.len);
++    try t.expectEqual(@as(usize, 0), script.resumes.items[1].len);
++    const result = try obj(a, "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"42\"}");
++    const full = try text.renderIds(a, try appendTo(a, history, &.{ call_turn, result }), .{ .add_generation_prompt = true }, &problem);
++    try t.expect(std.mem.startsWith(u32, full, called));
++    try t.expectEqualSlices(u32, full[called.len..], script.resumes.items[0]);
++    // the client sees the answer, not the built-in call, and the lane's report of it
++    const choice = reply.body.get("choices").?.array[0];
++    try t.expectEqualStrings("stop", choice.get("finish_reason").?.string);
++    const message = choice.get("message").?;
++    try t.expect(std.mem.indexOf(u8, message.strField("content").?, "It is 42.") != null);
++    try t.expect(message.get("tool_calls") == null or message.get("tool_calls").? == .null);
++    const compute = reply.body.get("tensorfold").?.get("compute").?;
++    try t.expectEqual(@as(i64, @intCast(script.resumes.items[0].len)), compute.get("inserted_tokens").?.int64().?);
++    const report = compute.get("calls").?.array[0];
++    try t.expectEqualStrings("42", report.strField("output").?);
++    try t.expectEqualStrings("ok", report.strField("status").?);
++    try t.expect(report.get("inserted").?.bool);
++}
++
++test "compute lane: code_interpreter on a server without the lane is refused before the engine sees it" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var tmp = try fixture(a);
++    defer tmp.deinit();
++    var problem: []const u8 = "";
++    const hf = try HfText.load(a, t.io, tmp.path, null, a, &problem);
++    defer hf.deinit();
++    var script: Script = .{ .a = a, .call = &.{}, .answer = &.{} };
++    const srv = try @import("server.zig").Server.init(a, t.io, script.engine(), hf.text(), .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
++    defer srv.deinit();
++    var reply: Reply = .{ .a = a };
++    var conn = try @import("http_conn.zig").Conn.init(a, -1, "fixture");
++    defer conn.deinit();
++    const body = try json.newObject(a);
++    try body.put(a, "model", .{ .string = "m" });
++    try body.put(a, "max_tokens", try json.intValue(a, 4));
++    try body.put(a, "messages", try tf.messages(a, "H"));
++    try body.put(a, "tools", try obj(a, "[{\"type\":\"code_interpreter\"}]"));
++    @import("openai.zig").run(srv, a, reply.out(), .{ .conn = &conn }, true, .{ .object = body });
++    try t.expect(reply.code >= 400);
++    try t.expect(script.sink == null);
++}
+diff --git a/zig/src/server/compute_segments.zig b/zig/src/server/compute_segments.zig
+new file mode 100644
+index 000000000..d8252ac73
+--- /dev/null
++++ b/zig/src/server/compute_segments.zig
+@@ -0,0 +1,263 @@
++//! A lane reply's segments: at each held EOS its built-in calls run, their result turn is forced in, it goes on.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json");
++const chat = @import("chat.zig");
++const reply_text = @import("reply_text.zig");
++const tool_parse = @import("tool_parse.zig");
++const tool_stream = @import("tool_stream.zig");
++const prompt_mod = @import("prompt.zig");
++const turns = @import("compute_turns.zig");
++const log = @import("log.zig");
++const Generation = @import("chat_generation.zig").Generation;
++const Server = @import("server.zig").Server;
++const lane = api.hold.compute_lane;
++const Value = json.Value;
++const Cx = @import("errors.zig").Cx;
++const Allocator = std.mem.Allocator;
++
++/// Tokens the reply keeps free after an inserted result, so the model can still answer.
++const answer_room = 16;
++
++/// What the earlier segments of a reply said and did, merged into its last segment's reply.
++const Merge = struct {
++    content: std.ArrayList(u8) = .empty,
++    reasoning: std.ArrayList(u8) = .empty,
++    completion: usize = 0,
++    reasoning_tokens: usize = 0,
++    ids: std.ArrayList(u32) = .empty, // the engine's whole continuation: segments and inserted results
++    inserted: usize = 0,
++    calls: std.ArrayList(Value) = .empty, // one report a call
++    history: std.ArrayList(Value) = .empty, // the request's messages, then each segment's call turn and results
++};
++
++/// Continues a reply whose first segment `first` ended held at its EOS, until the engine ends it.
++pub fn rest(first: *Generation, cx: *Cx, p: chat.Prepared, filter: *turns.Filter, gone: anytype) chat.Failure!chat.Reply {
++    const a = cx.a;
++    const srv = first.srv;
++    const cfg = srv.info.compute.?;
++    var m: Merge = .{};
++    if (p.input.messages == .array) try m.history.appendSlice(a, p.input.messages.array);
++    var g = first;
++    var run_calls: u32 = 0;
++    while (g.held) {
++        const used = m.ids.items.len + g.collected.items.len;
++        const answer = try segmentAnswer(g);
++        const calls = builtInOnly(answer.calls);
++        var plan: ?[]const u32 = null;
++        var assistant: Value = .null;
++        var reports: []Value = &.{};
++        if (calls.len > 0 and used + answer_room < p.request.max_tokens) {
++            assistant = try assistantTurn(a, answer.prose, answer.reasoning, calls);
++            reports = try runAll(a, srv, cfg, calls, &run_calls, gone);
++            plan = try suffix(srv, cx, p, &m.history, assistant, calls, reports);
++            if (plan) |s| if (used + s.len + answer_room > p.request.max_tokens) {
++                plan = null;
++            };
++        }
++        const s = plan orelse {
++            // no call to run, a client's call, or no room: the reply ends at this EOS as it would without the lane
++            _ = api.hold.resumeHeld(srv.engine, g.id, .{ .tokens = &.{} });
++            g.held = false;
++            try g.loop(gone);
++            for (reports) |r| {
++                try r.object.put(a, "inserted", .{ .bool = false });
++                try m.calls.append(a, r);
++            }
++            return merge(a, &m, try finish(g, cx, p), g.collected.items);
++        };
++        _ = api.hold.resumeHeld(srv.engine, g.id, .{ .tokens = s, .think_open = p.thinking });
++        const seg = try finish(g, cx, p);
++        try note(a, &m, g, seg, s);
++        try m.history.append(a, assistant);
++        for (calls, reports) |c, r| try m.history.append(a, try toolTurn(a, c, r.get("output").?.string));
++        for (reports) |r| {
++            try r.object.put(a, "inserted", .{ .bool = true });
++            try m.calls.append(a, r);
++            if (g.sink != null) filter.direct(try reportDelta(a, r)) catch return error.Cancelled;
++        }
++        g = try next(g, s, p.request.max_tokens - (used + s.len));
++        filter.nextSegment();
++        try g.loop(gone);
++    }
++    return merge(a, &m, try finish(g, cx, p), g.collected.items);
++}
++
++fn finish(g: *Generation, cx: *Cx, p: chat.Prepared) chat.Failure!chat.Reply {
++    return g.finish(cx, p.prompt_len, p.received, p.thinking, p.reasoning, p.effort, p.sampled, p.drafts);
++}
++
++/// The segment after an inserted result: the same reply, its first tokens the result's, its own text and calls.
++fn next(g: *Generation, inserted: []const u32, left: usize) chat.Failure!*Generation {
++    const n = try g.a.create(Generation);
++    n.* = .{ .srv = g.srv, .a = g.a, .box = g.box, .id = g.id, .reply_id = g.reply_id, .seed = g.seed, .sink = g.sink, .thinking = g.thinking, .chat = g.chat, .stops = g.stops, .ignore_eos = g.ignore_eos, .max_tokens = @intCast(left), .single = g.single, .tools = g.tools, .token_ids = g.token_ids, .loop_stop = g.loop_stop, .hold = true, .skip = inserted, .consumed = g.consumed, .chunk_index = g.chunk_index, .first_ns = g.first_ns, .wrote_ns = g.wrote_ns, .deadline_ns = g.deadline_ns, .deadline_hit = g.deadline_hit };
++    if (g.calls != null) n.calls = try tool_stream.Streamer.init(g.a, g.tools);
++    return n;
++}
++
++/// The segment's calls when every one is the built-in tool's (a client's call ends the reply for its client).
++fn builtInOnly(calls: ?[]Value) []Value {
++    const all = calls orelse return &.{};
++    for (all) |c| if (!turns.isBuiltInCall(c)) return &.{};
++    return all;
++}
++
++const Answer = struct { prose: []const u8, reasoning: ?[]const u8, calls: ?[]Value };
++
++/// The segment's answer as `Generation.finish` reads it, then its calls parsed out of the answer.
++fn segmentAnswer(g: *Generation) chat.Failure!Answer {
++    const tokens = reply_text.stripTrailing(g.collected.items, g.srv.eos);
++    const read = try g.readText(try g.srv.text.decode(g.a, tokens), tokens);
++    const parsed = try tool_parse.parse(g.a, read.content, g.tools, null);
++    return .{ .prose = parsed.content, .reasoning = read.reasoning, .calls = parsed.calls };
++}
++
++/// Runs each call in order (results stay in call order); past the reply's call cap a call gets that note instead.
++fn runAll(a: Allocator, srv: *Server, cfg: lane.Config, calls: []const Value, ran: *u32, gone: anytype) chat.Failure![]Value {
++    const Watch = struct {
++        gone: @TypeOf(gone),
++        fn left(ctx: *anyopaque) bool {
++            const w: *@This() = @ptrCast(@alignCast(ctx));
++            return w.gone.check();
++        }
++    };
++    var watch: Watch = .{ .gone = gone };
++    const out = try a.alloc(Value, calls.len);
++    for (calls, out) |c, *slot| {
++        const code = try codeOf(a, c);
++        var o: lane.Outcome = .{ .status = .unavailable, .stderr = "the call has no string argument \"code\"" };
++        var body: []const u8 = undefined;
++        if (ran.* >= cfg.max_calls) {
++            body = "[call limit reached: answer without running more code]";
++        } else {
++            if (code) |src| o = try srv.compute.?.run(a, src, .{ .ctx = &watch, .gone = Watch.left });
++            if (o.status == .cancelled) return error.Cancelled;
++            body = try lane.runner.body(a, o, cfg.max_ms, cfg.max_output_bytes);
++            ran.* += 1;
++        }
++        slot.* = try report(a, c, code orelse "", o, try capTokens(a, srv, body, cfg.max_result_tokens));
++    }
++    return out;
++}
++
++/// The call's "code" argument, its arguments a JSON object or a JSON string; null when missing or not a string.
++fn codeOf(a: Allocator, call: Value) Allocator.Error!?[]const u8 {
++    const f = call.get("function") orelse return null;
++    const args = f.get("arguments") orelse return null;
++    const obj: Value = if (args == .string) switch (try json.parseText(a, args.string)) {
++        .ok => |v| v,
++        .err => return null,
++    } else args;
++    const code = obj.strField("code") orelse return null;
++    return if (std.mem.trim(u8, code, " \t\r\n").len > 0) code else null;
++}
++
++/// The result text cut to `max` tokens (decoded back at a character boundary), with a note when cut.
++fn capTokens(a: Allocator, srv: *Server, body: []const u8, max: u32) Allocator.Error![]const u8 {
++    const ids = srv.text.encodePlain(a, body) catch return body;
++    if (ids.len <= max) return body;
++    var n: usize = max;
++    while (n > 0) : (n -= 1) {
++        const text = try srv.text.decode(a, ids[0..n]);
++        if (std.unicode.utf8ValidateSlice(text)) return std.fmt.allocPrint(a, "{s}\n[output truncated at {d} tokens]", .{ text, max });
++    }
++    return std.fmt.allocPrint(a, "[output truncated at {d} tokens]", .{max});
++}
++
++fn report(a: Allocator, call: Value, code: []const u8, o: lane.Outcome, output: []const u8) Allocator.Error!Value {
++    const r = try json.newObject(a);
++    try r.put(a, "name", .{ .string = turns.name });
++    try r.put(a, "id", call.get("id") orelse .null);
++    try r.put(a, "code", .{ .string = code });
++    try r.put(a, "status", .{ .string = @tagName(o.status) });
++    try r.put(a, "exit_code", if (o.exit_code) |x| try json.intValue(a, x) else .null);
++    try r.put(a, "exec_ms", .{ .float = @as(f64, @floatFromInt(o.exec_ns)) / 1e6 });
++    try r.put(a, "output", .{ .string = output });
++    return .{ .object = r };
++}
++
++fn reportDelta(a: Allocator, r: Value) Allocator.Error!Value {
++    const d = try json.newObject(a);
++    try d.put(a, "compute", r);
++    return .{ .object = d };
++}
++
++/// The assistant turn the segment wrote, as a client would send it back: its prose, reasoning and calls.
++fn assistantTurn(a: Allocator, prose: []const u8, reasoning: ?[]const u8, calls: []Value) Allocator.Error!Value {
++    const o = try json.newObject(a);
++    try o.put(a, "role", .{ .string = "assistant" });
++    try o.put(a, "content", .{ .string = prose });
++    if (reasoning) |r| try o.put(a, "reasoning_content", .{ .string = r });
++    try o.put(a, "tool_calls", .{ .array = calls });
++    return .{ .object = o };
++}
++
++fn toolTurn(a: Allocator, call: Value, output: []const u8) Allocator.Error!Value {
++    const o = try json.newObject(a);
++    try o.put(a, "role", .{ .string = "tool" });
++    try o.put(a, "tool_call_id", call.get("id") orelse .null);
++    try o.put(a, "content", .{ .string = output });
++    return .{ .object = o };
++}
++
++/// The template's tokens after the held EOS: render(history + call turn + results) past render(history + call turn).
++fn suffix(srv: *Server, cx: *Cx, p: chat.Prepared, history: *const std.ArrayList(Value), assistant: Value, calls: []const Value, reports: []const Value) chat.Failure!?[]const u32 {
++    const a = cx.a;
++    var with: std.ArrayList(Value) = .empty;
++    try with.appendSlice(a, history.items);
++    try with.append(a, assistant);
++    const before = prompt_mod.renderIds(srv, cx, .{ .array = try a.dupe(Value, with.items) }, p.input.tools, p.thinking, p.effort, false) catch |e| return lost(e);
++    for (calls, reports) |c, r| try with.append(a, try toolTurn(a, c, r.get("output").?.string));
++    const after = prompt_mod.renderIds(srv, cx, .{ .array = with.items }, p.input.tools, p.thinking, p.effort, true) catch |e| return lost(e);
++    // the history must end at the model's own EOS and stand unchanged under the results: else no exact insert exists
++    const ends = before.len > 0 and std.mem.indexOfScalar(u32, srv.eos, before[before.len - 1]) != null;
++    if (!ends or after.len <= before.len or !std.mem.eql(u32, after[0..before.len], before)) {
++        log.line("warning: compute lane: this template's tool-result turn does not extend the call turn; the reply ends at the call", .{});
++        return null;
++    }
++    return after[before.len..];
++}
++
++fn lost(e: anyerror) chat.Failure!?[]const u32 {
++    if (e == error.OutOfMemory) return error.OutOfMemory;
++    log.line("warning: compute lane: the tool-result turn did not render ({t}); the reply ends at the call", .{e});
++    return null;
++}
++
++/// A finished held segment into the merge: its words, its tokens and the result inserted after it.
++fn note(a: Allocator, m: *Merge, g: *const Generation, seg: chat.Reply, inserted: []const u32) Allocator.Error!void {
++    try m.content.appendSlice(a, (try tool_parse.parse(a, seg.content, g.tools, null)).content);
++    if (seg.reasoning) |r| try m.reasoning.appendSlice(a, r);
++    m.completion += seg.completion_tokens;
++    m.reasoning_tokens += seg.reasoning_tokens;
++    try m.ids.appendSlice(a, g.collected.items);
++    try m.ids.appendSlice(a, inserted);
++    m.inserted += inserted.len;
++}
++
++/// The last segment's reply with the earlier segments' words, counts, calls and tokens in front.
++fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.Failure!chat.Reply {
++    var r = last;
++    if (m.content.items.len > 0) r.content = try std.mem.concat(a, u8, &.{ m.content.items, last.content });
++    if (m.reasoning.items.len > 0) r.reasoning = try std.mem.concat(a, u8, &.{ m.reasoning.items, last.reasoning orelse "" });
++    r.completion_tokens += m.completion;
++    r.reasoning_tokens += m.reasoning_tokens;
++    if (m.calls.items.len == 0 and m.inserted == 0) return r;
++    const rt = r.runtime.object;
++    const tail = if (rt.get("token_ids")) |t| t.array else &[_]Value{};
++    const full = try a.alloc(Value, m.ids.items.len + tail.len);
++    for (m.ids.items, full[0..m.ids.items.len]) |t, *slot| slot.* = try json.intValue(a, t);
++    @memcpy(full[m.ids.items.len..], tail);
++    if (rt.get("token_ids") != null) try rt.put(a, "token_ids", .{ .array = full });
++    // the shas hash the same whole continuation the ids list, inserted results included
++    const all = try std.mem.concat(a, u32, &.{ m.ids.items, last_ids });
++    const tokens = @import("tokens.zig");
++    try rt.put(a, "token_sha", .{ .string = try a.dupe(u8, &tokens.tokenSha(all)) });
++    try rt.put(a, "token_sha256", .{ .string = try a.dupe(u8, &tokens.tokenSha256(all)) });
++    const c = try json.newObject(a);
++    try c.put(a, "calls", .{ .array = m.calls.items });
++    try c.put(a, "inserted_tokens", try json.intValue(a, m.inserted));
++    try c.put(a, "prefix_tokens", try json.intValue(a, m.ids.items.len));
++    try rt.put(a, "compute", .{ .object = c });
++    return r;
++}
+diff --git a/zig/src/server/compute_turns.zig b/zig/src/server/compute_turns.zig
+new file mode 100644
+index 000000000..7f8076467
+--- /dev/null
++++ b/zig/src/server/compute_turns.zig
+@@ -0,0 +1,189 @@
++//! The compute lane's request side: the built-in `python` tool a request opts into, arming, and the client's view.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json");
++const errors = @import("errors.zig");
++const chat = @import("chat.zig");
++const tool_specs = @import("tool_specs.zig");
++const Server = @import("server.zig").Server;
++const lane = api.hold.compute_lane;
++const Value = json.Value;
++const Cx = errors.Cx;
++const Allocator = std.mem.Allocator;
++
++/// The built-in tool's name, the type a request lists to opt in, and its description (which marks it as ours).
++pub const name = "python";
++pub const opt_in = "code_interpreter";
++const description = "Run Python 3 code in a sandbox with no network, no files and no installs, and get its stdout and " ++
++    "stderr. print() what you need; the value of a final bare expression is printed too.";
++const definition =
++    \\{"type":"function","function":{"name":"python","description":"
++++ description ++
++    \\","parameters":{"type":"object","properties":{"code":{"type":"string","description":"Python 3 source to run"}},"required":["code"]}}}
++;
++
++/// The server's sandbox pool for an engine that serves the lane; boot fails when an opted-in sandbox cannot run.
++pub fn open(srv: *Server, cfg: lane.Config) !lane.Pool {
++    if (srv.engine.vtable.resume_held == null) {
++        std.log.err("compute lane: this engine cannot hold a reply for a tool result", .{});
++        return error.ComputeLaneUnsupported;
++    }
++    var pool = lane.Pool.init(cfg, &.{ "/proc/self/exe", "__compute_sandbox" });
++    var arena: std.heap.ArenaAllocator = .init(srv.gpa);
++    defer arena.deinit();
++    pool.selfTest(arena.allocator()) catch |e| {
++        std.log.err("compute lane: the sandbox self-test failed ({t}); unset the compute lane flag or fix the sandbox", .{e});
++        return error.ComputeLaneUnavailable;
++    };
++    std.log.info("compute lane: {s} in a sandbox, {d} at a time, {d} ms, {d} MiB, results up to {d} tokens, {d} calls a reply", .{ cfg.python, cfg.workers, cfg.max_ms, cfg.mem_mb, cfg.max_result_tokens, cfg.max_calls });
++    return pool;
++}
++
++/// The request's tools as tool_specs reads them, with `{"type": "code_interpreter"}` turned into the built-in tool.
++pub fn tools(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value) errors.Refused![]Value {
++    const list = (raw orelse return active(srv, cx, raw, choice));
++    if (list != .array) return active(srv, cx, raw, choice);
++    var rest: std.ArrayList(Value) = .empty;
++    var asked = false;
++    for (list.array) |t| {
++        const kind = if (t == .object) t.strField("type") orelse "" else "";
++        if (std.mem.eql(u8, kind, opt_in)) asked = true else try rest.append(cx.a, t);
++    }
++    if (!asked) return active(srv, cx, raw, choice);
++    if (srv.compute == null) return cx.other("code_interpreter is not enabled on this server");
++    const specs = try active(srv, cx, .{ .array = rest.items }, choice);
++    for (specs) |t| if (std.mem.eql(u8, toolName(t), name)) return cx.other("a request with code_interpreter cannot also offer a function named python");
++    // only an automatic choice lets the model call it: "none", "required" and a named function leave it out
++    if (choice) |c| if (!(c == .null or (c == .string and std.mem.eql(u8, c.string, "auto")))) return specs;
++    const built = switch (try json.parse(cx.a, definition)) {
++        .ok => |v| v,
++        .err => unreachable,
++    };
++    return std.mem.concat(cx.a, Value, &.{ specs, &.{built} });
++}
++
++/// The client's own tools as the server reads them: DeepSeek's native encoder checks its tool schema first.
++fn active(srv: *Server, cx: *Cx, raw: ?Value, choice: ?Value) errors.Refused![]Value {
++    if (srv.text.native_deepseek) return @import("deepseek_request.zig").active(cx, raw, choice);
++    return tool_specs.active(cx, raw, choice);
++}
++
++fn toolName(t: Value) []const u8 {
++    const f = t.get("function") orelse return "";
++    return f.strField("name") orelse "";
++}
++
++/// Whether `t` is the built-in tool (its name and our description), as `tools` added it.
++pub fn isBuiltIn(t: Value) bool {
++    const f = t.get("function") orelse return false;
++    return std.mem.eql(u8, f.strField("name") orelse "", name) and std.mem.eql(u8, f.strField("description") orelse "", description);
++}
++
++/// Whether a call names the built-in tool.
++pub fn isBuiltInCall(call: Value) bool {
++    return std.mem.eql(u8, toolName(call), name);
++}
++
++/// Whether a prepared request holds at its EOS for the lane: offered the tool, nothing that forced rows would break.
++pub fn arms(srv: *const Server, input: chat.Input, r: *const api.Request) bool {
++    if (srv.compute == null or r.eos.len == 0 or r.background or r.max_tokens == 0) return false;
++    if (srv.text.vtable.format == .kimi) return false; // its native reader keeps calls apart from the text
++    if (r.structure != null or r.call != null or r.logprobs != null or r.prompt_logprobs != null) return false;
++    for (input.tools) |t| if (isBuiltIn(t)) return true;
++    return false;
++}
++
++/// A lane reply as the client streams it: built-in calls stay hidden; client calls number on across segments.
++pub const Filter = struct {
++    a: Allocator,
++    inner: chat.Sink,
++    base: i64 = 0, // client calls earlier segments showed
++    seen: i64 = 0, // client calls this segment showed
++    map: std.AutoHashMapUnmanaged(i64, ?i64) = .empty, // this segment's call index -> the client's (null: built-in)
++
++    pub fn sink(f: *Filter) chat.Sink {
++        return .{ .ctx = f, .call = call, .begin = if (f.inner.begin != null) begin else null };
++    }
++
++    /// A resumed segment numbers its calls from 0 again.
++    pub fn nextSegment(f: *Filter) void {
++        f.base += f.seen;
++        f.seen = 0;
++        f.map.clearRetainingCapacity();
++    }
++
++    /// A delta straight to the client (the lane's own reports).
++    pub fn direct(f: *Filter, delta: Value) error{Closed}!void {
++        return f.inner.call(f.inner.ctx, delta);
++    }
++
++    fn begin(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
++        const f: *Filter = @ptrCast(@alignCast(ctx));
++        return f.inner.begin.?(f.inner.ctx, prompt_len);
++    }
++
++    fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
++        const f: *Filter = @ptrCast(@alignCast(ctx));
++        const list = if (delta == .object) delta.get("tool_calls") else null;
++        if (list == null or list.? != .array) return f.inner.call(f.inner.ctx, delta);
++        var kept: std.ArrayList(Value) = .empty;
++        for (list.?.array) |one| {
++            const at = (one.get("index") orelse continue).int64() orelse continue;
++            if (one.get("function")) |fun| if (fun.strField("name")) |n| if (!f.map.contains(at)) {
++                const client: ?i64 = if (std.mem.eql(u8, n, name)) null else f.base + f.seen;
++                if (client != null) f.seen += 1;
++                f.map.put(f.a, at, client) catch return error.Closed;
++            };
++            const to = (f.map.get(at) orelse continue) orelse continue;
++            if (one != .object) continue;
++            one.object.put(f.a, "index", json.intValue(f.a, to) catch return error.Closed) catch return error.Closed;
++            kept.append(f.a, one) catch return error.Closed;
++        }
++        if (kept.items.len == 0) return;
++        delta.object.put(f.a, "tool_calls", .{ .array = kept.items }) catch return error.Closed;
++        return f.inner.call(f.inner.ctx, delta);
++    }
++};
++
++test "compute lane: the filter drops built-in call deltas and numbers client calls on across segments" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const Seen = struct {
++        out: std.ArrayList([]const u8) = .empty,
++        a: Allocator,
++        fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
++            const s: *@This() = @ptrCast(@alignCast(ctx));
++            s.out.append(s.a, json.stringify(s.a, delta, .{}) catch return error.Closed) catch return error.Closed;
++        }
++    };
++    var seen: Seen = .{ .a = a };
++    var f: Filter = .{ .a = a, .inner = .{ .ctx = &seen, .call = Seen.call } };
++    const s = f.sink();
++    const deltas = [_][]const u8{
++        \\{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"python","arguments":""}}]}
++        ,
++        \\{"tool_calls":[{"index":0,"function":{"arguments":"print(1)"}}]}
++        ,
++        \\{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"lookup","arguments":"{}"}}]}
++        ,
++    };
++    for (deltas) |d| try s.call(s.ctx, (try json.parse(a, d)).ok);
++    try s.call(s.ctx, .{ .string = "prose" });
++    f.nextSegment();
++    try s.call(s.ctx, (try json.parse(a, deltas[2])).ok);
++    try std.testing.expectEqual(@as(usize, 3), seen.out.items.len);
++    try std.testing.expect(std.mem.indexOf(u8, seen.out.items[0], "\"index\": 0") != null);
++    try std.testing.expect(std.mem.indexOf(u8, seen.out.items[0], "lookup") != null);
++    try std.testing.expectEqualStrings("\"prose\"", seen.out.items[1]);
++    try std.testing.expect(std.mem.indexOf(u8, seen.out.items[2], "\"index\": 1") != null);
++}
++
++test "compute lane: the built-in definition parses and is recognized; another function named python is not" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const built = (try json.parse(arena.allocator(), definition)).ok;
++    try std.testing.expect(isBuiltIn(built));
++    const other = (try json.parse(arena.allocator(), "{\"type\":\"function\",\"function\":{\"name\":\"python\"}}")).ok;
++    try std.testing.expect(!isBuiltIn(other));
++}
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 74f078d82..3f35fc953 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -54,6 +54,8 @@ pub fn main(init: std.process.Init) !u8 {
+     const a = init.arena.allocator();
+     const argv = try init.minimal.args.toSlice(a);
+     if (comptime @import("builtin").os.tag != .windows) if (argv.len == 2 and std.mem.eql(u8, argv[1], pdf_worker.arg)) pdf_worker.serve();
++    // the compute lane's sandbox: this binary re-run to confine itself, then exec the interpreter (never returns)
++    if (@import("builtin").os.tag == .linux and argv.len >= 2 and std.mem.eql(u8, argv[1], "__compute_sandbox")) api.hold.compute_lane.sandbox.main(argv[2..]);
+     // These commands must work without a model, driver, GPU or checkout.
+     if (argv.len == 2 and std.mem.eql(u8, argv[1], "--version")) {
+         try std.Io.File.stdout().writeStreamingAll(io, "tensorfold-native " ++ @import("build_options").version ++ "\n");
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 9acfc5462..3aaa19d91 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -134,7 +134,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value, format: ?[]const u8, c
+     var input: chat.Input = .{ .fields = undefined, .format = format };
+     if (is_chat) {
+         input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.media());
+-        input.tools = if (srv.text.native_deepseek) try @import("deepseek_request.zig").active(cx, body.get("tools"), body.get("tool_choice")) else try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
++        input.tools = try @import("compute_turns.zig").tools(srv, cx, body.get("tools"), body.get("tool_choice"));
+     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+         input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, srv.media());
+     };
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index bbadedfd3..2c62ffd7d 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -203,6 +203,9 @@ test {
+     _ = @import("cortheon/research.zig");
+     _ = @import("cortheon/program.zig");
+     _ = @import("recall_routes.zig");
++    _ = @import("compute_turns.zig");
++    _ = @import("compute_segments.zig");
++    _ = @import("compute_lane_http_test.zig");
+     // the benchmark command's serve child runs under POSIX signals and waits; Windows refuses the command
+     if (comptime @import("builtin").os.tag != .windows) {
+         _ = @import("benchmark_suite.zig");
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index c0b97638f..ebc1cefae 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -163,6 +163,8 @@ pub const Server = struct {
+     keepalive: ?*api.keepalive.Keepalive = null,
+     /// The idle-unload manager (--idle-unload); null when off. Its thread parks the engine; a wake reloads it.
+     idle_manager: ?*idle_unload.Manager = null,
++    /// The compute lane's sandboxes when the engine serves it (Info.compute); null: code_interpreter is refused.
++    compute: ?api.hold.compute_lane.Pool = null,
+     preparing: std.atomic.Value(i64) = .init(0),
+     speech_inflight: std.atomic.Value(u32) = .init(0),
+     arena: std.heap.ArenaAllocator,
+@@ -208,6 +210,7 @@ pub const Server = struct {
+             if (config.cortheon) return error.CortheonRequiresTextGeneration;
+             return srv;
+         }
++        if (srv.info.compute) |c| srv.compute = try @import("compute_turns.zig").open(srv, c);
+         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
+         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
+             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {

@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 21:33:06 +0700
+Subject: [PATCH 56/79] core lanes: the engine's rule takes Config.head_stops,
+ as her 0007 Engine.init gave it
+
+0b619d2e6 carried draft_stops / draft_stops_most into Config.head_stops / head_stops_most and
+Rule.stopsNow, but Engine.init never copied them into its Rule, so on the served path stopsNow was
+always false. At one or two live streams her round loop then sized chains by the rates' depth rule
+(lone rounds) or allocation (shared rounds) instead of asking the room's most and letting her
+head's running product stop them: the c1 gap (port 125 rounds / 458 drafted against her 119 / 505).
+
+Only her family's facts set draft_stops, so every other family's Rule is unchanged.
+
+New test (test-flashnext-mia-host): the Rule her facts build through Config and Engine.init asks
+the most at one live stream (depth) and at two (budgets), and allocates past product_streams.
+It fails without this change (stopsNow false at live 1).
+
+Port: head stops in Engine.init (0007 core/lanes/engine.zig hunk) from her 0007 (MiaAI-Lab)
+---
+ zig/src/core/lanes/engine.zig                 |  2 ++
+ .../native/cuda_flashnext_mia_sched_test.zig  | 31 +++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 4c2a1c427..127782ac4 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -74,6 +74,8 @@ pub const Engine = struct {
+                 .node_probabilities = cfg.node_probabilities,
+                 .granted_depth = cfg.granted_depth,
+                 .confidence_floor = cfg.draft_confidence,
++                .head_stops = cfg.head_stops,
++                .head_stops_most = cfg.head_stops_most,
+                 .batch_rows = cfg.batch_rows,
+                 .batched_heads = cfg.draft_streams,
+                 .pooled_budgets = cfg.pooled_budgets,
+diff --git a/zig/src/native/cuda_flashnext_mia_sched_test.zig b/zig/src/native/cuda_flashnext_mia_sched_test.zig
+index 1485dd437..601e23485 100644
+--- a/zig/src/native/cuda_flashnext_mia_sched_test.zig
++++ b/zig/src/native/cuda_flashnext_mia_sched_test.zig
+@@ -111,3 +111,34 @@ test "flashnext_mia family: four live streams' budgets are db281878's allocation
+     // her prior's chains 0.82, 0.6232, 0.4487, 0.3051 at 8 ms overhead: (4 + 4 * 1.8919) / 34 = 0.3402 is the best
+     try t.expectEqualSlices(i64, &.{ 3, 3, 3, 3 }, &out); // f212 priced: two each (9.7728 / 42 > 11.5676 / 52)
+ }
++
++test "flashnext_mia family: at one or two live streams her engine's rule asks the room's most, her head stops it" {
++    var toy: Toy = .{ .gpa = gpa };
++    var b = served(&toy, 4);
++    defer b.deinit();
++    var cfg = try lanes.Config.init(gpa, b.facts(), L.max_rows, L.max_rows - 1);
++    defer cfg.deinit(gpa);
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
++    defer core.deinit();
++    var states: [2]?lanes.depth.State = @splat(null);
++    defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
++    var whos: [2]lanes.depth.Who = undefined;
++    for (&whos, &states) |*w, *s| w.* = .{ .state = s, .draft_room = 400, .finished = false, .forced = false };
++    const No = struct {
++        fn copy(_: *anyopaque, _: *const lanes.depth.Who) bool {
++            return false;
++        }
++    };
++    var unused: u8 = 0;
++    const most: i64 = cfg.most_drafts;
++    core.rule.live = 1; // a lone stream (c1): her 0007 Engine.init gave the rule cfg.head_stops
++    try t.expect(core.rule.stopsNow());
++    try t.expectEqual(most, try core.rule.depth(whos[0]));
++    core.rule.live = 2; // her product_streams: a shared round still asks the most of each
++    var out: [2]i64 = undefined;
++    try core.rule.budgets(&whos, .{ .ptr = &unused, .copy = No.copy }, false, &out);
++    try t.expectEqualSlices(i64, &.{ most, most }, &out);
++    core.rule.live = 3; // past it: allocation (the test above)
++    try t.expect(!core.rule.stopsNow());
++}

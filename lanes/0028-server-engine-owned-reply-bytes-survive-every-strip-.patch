@@ -1,0 +1,530 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 17:28:00 +0700
+Subject: [PATCH 28/79] server: engine-owned reply bytes survive every strip,
+ at the format's own call openers
+
+reply_owned.zig: an Owned span of a reply's content (where the engine's cell
+writes landed) that no prose strip may cut. The strips take the reply's call
+openers (reply_text.Openers, openersOf(markers)), so DSML is one format among
+Qwen's <tool_call> JSON and XML, Gemma's, LFM2's and MiniMax's; an owned span
+ends before the first call block either the stream or the parser sees.
+
+- reply_owned.of projects cell-write records ({field, token, landed}) onto
+  the content; content the server rewrote (MiniMax, LFM2 as DSML) owns none.
+- tool_parse.parseOwned, tool_stream.endProseOwned, reply_owned.finishedProse
+  and cutProse keep the owned bytes; with none owned each is the existing
+  function, so no format's bytes change.
+- Reply.owned and Generation.owned carry the span through the chat route,
+  the compute lane's segments and the client's calls; nothing sets it until
+  the runner feeds its cell writes.
+
+Ported from the dsv41 release line's runner_owned.zig and reply_text.Owned.
+---
+ zig/src/server/chat.zig             |   1 +
+ zig/src/server/chat_generation.zig  |   6 +-
+ zig/src/server/compute_segments.zig |   7 +-
+ zig/src/server/compute_turns.zig    |   8 +-
+ zig/src/server/openai_calls.zig     |   9 ++-
+ zig/src/server/reply_owned.zig      | 119 ++++++++++++++++++++++++++++
+ zig/src/server/reply_owned_test.zig | 103 ++++++++++++++++++++++++
+ zig/src/server/root.zig             |   1 +
+ zig/src/server/tool_parse.zig       |  27 ++++++-
+ zig/src/server/tool_stream.zig      |   9 +++
+ 10 files changed, 277 insertions(+), 13 deletions(-)
+ create mode 100644 zig/src/server/reply_owned.zig
+ create mode 100644 zig/src/server/reply_owned_test.zig
+
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index f274c74f7..4b21c46b5 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -76,6 +76,7 @@ pub const Reply = struct {
+     prompt_logprobs: ?Value = null,
+     loop_stop: ?u32 = null, // the loop period when --loop-guard-stop ended the reply in its reasoning
+     compute_ran: usize = 0, // the lane's built-in calls the sandbox ran (not malformed or past the cap)
++    owned: ?@import("reply_owned.zig").Owned = null, // engine-owned bytes of `content`, which no strip may cut
+ };
+ 
+ pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index 386db9db3..a07bff258 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -4,6 +4,7 @@ const api = @import("engine_api");
+ const json = @import("json");
+ const chat = @import("chat.zig");
+ const reply_text = @import("reply_text.zig");
++const reply_owned = @import("reply_owned.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const tool_lfm2 = @import("tool_lfm2.zig");
+@@ -58,6 +59,7 @@ pub const Generation = struct {
+     deadline_ns: ?i96 = null, // "deadline_s": when the server ends the reply itself
+     deadline_hit: bool = false, // it did: the engine was cancelled there; what it gave before its end still lands
+     lane_own: bool = false, // Input.lane_own: a call max_tokens cut never shows as prose, as the reply's own call
++    owned: ?reply_owned.Owned = null, // engine-owned bytes of this segment's content (reply_owned.of its cell writes)
+     hold: bool = false, // the engine holds the reply at an EOS (Request.hold_eos): this segment ends there
+     held: bool = false, // it did: the engine has not finished, and compute_turns.zig resumes or ends it
+     skip: []const u32 = &.{}, // a resumed segment's first tokens: the inserted tool result, checked and not shown
+@@ -292,7 +294,8 @@ pub const Generation = struct {
+             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
+                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
+             const cut = g.lane_own and std.mem.eql(u8, reason, "length");
+-            const shown = if (cut) try reply_text.cutProse(a, content) else if (g.calls != null) try tool_stream.endProse(a, content, if (g.thinking) content else text, g.tools, reason, g.single) else content;
++            const o = reply_text.openersOf(g.srv.markers);
++            const shown = if (cut) try reply_owned.cutProse(a, content, o, g.owned) else if (g.calls != null) try tool_stream.endProseOwned(a, content, if (g.thinking) content else text, g.tools, reason, g.single, o, g.owned) else content;
+             const sent = g.streamed.text.items;
+             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
+             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });
+@@ -361,6 +364,7 @@ pub const Generation = struct {
+             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
+             .native_tool_format = native != null,
+             .native_calls = if (native) |n| n.calls else null,
++            .owned = g.owned,
+             .finish_reason = reason,
+             .prompt_tokens = prompt_len,
+             .cached_tokens = cached_tokens.within(m.cached, prompt_len),
+diff --git a/zig/src/server/compute_segments.zig b/zig/src/server/compute_segments.zig
+index 8db1f6cca..b30434662 100644
+--- a/zig/src/server/compute_segments.zig
++++ b/zig/src/server/compute_segments.zig
+@@ -5,6 +5,7 @@ const json = @import("json");
+ const chat = @import("chat.zig");
+ const reply_text = @import("reply_text.zig");
+ const tool_parse = @import("tool_parse.zig");
++const reply_owned = @import("reply_owned.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const prompt_mod = @import("prompt.zig");
+ const turns = @import("compute_turns.zig");
+@@ -29,6 +30,7 @@ const Merge = struct {
+     inserted: usize = 0,
+     calls: std.ArrayList(Value) = .empty, // one report a call
+     ran: usize = 0, // the calls the sandbox ran (Reply.compute_ran)
++    owned: ?reply_owned.Owned = null, // the segments' engine-owned bytes in `content`
+     history: std.ArrayList(Value) = .empty, // the request's messages, then each segment's call turn and results
+ };
+ 
+@@ -228,7 +230,9 @@ fn lost(e: anyerror) chat.Failure!?[]const u32 {
+ 
+ /// A finished held segment into the merge: its words, its tokens and the result inserted after it.
+ fn note(a: Allocator, m: *Merge, g: *const Generation, seg: chat.Reply, inserted: []const u32) Allocator.Error!void {
+-    try m.content.appendSlice(a, (try tool_parse.parse(a, seg.content, g.tools, null)).content);
++    const parsed = try tool_parse.parseOwned(a, seg.content, g.tools, null, seg.owned);
++    m.owned = reply_owned.Owned.join(m.owned, reply_owned.Owned.shift(parsed.owned, m.content.items.len));
++    try m.content.appendSlice(a, parsed.content);
+     if (seg.reasoning) |r| try m.reasoning.appendSlice(a, r);
+     m.completion += seg.completion_tokens;
+     m.reasoning_tokens += seg.reasoning_tokens;
+@@ -241,6 +245,7 @@ fn note(a: Allocator, m: *Merge, g: *const Generation, seg: chat.Reply, inserted
+ fn merge(a: Allocator, m: *Merge, last: chat.Reply, last_ids: []const u32) chat.Failure!chat.Reply {
+     var r = last;
+     if (m.content.items.len > 0) r.content = try std.mem.concat(a, u8, &.{ m.content.items, last.content });
++    r.owned = reply_owned.Owned.join(m.owned, reply_owned.Owned.shift(last.owned, m.content.items.len));
+     if (m.reasoning.items.len > 0) r.reasoning = try std.mem.concat(a, u8, &.{ m.reasoning.items, last.reasoning orelse "" });
+     r.completion_tokens += m.completion;
+     r.reasoning_tokens += m.reasoning_tokens;
+diff --git a/zig/src/server/compute_turns.zig b/zig/src/server/compute_turns.zig
+index 04ac0c7f3..4d576e75f 100644
+--- a/zig/src/server/compute_turns.zig
++++ b/zig/src/server/compute_turns.zig
+@@ -5,6 +5,8 @@ const json = @import("json");
+ const errors = @import("errors.zig");
+ const chat = @import("chat.zig");
+ const tool_specs = @import("tool_specs.zig");
++const reply_text = @import("reply_text.zig");
++const reply_owned = @import("reply_owned.zig");
+ const Server = @import("server.zig").Server;
+ const lane = api.hold.compute_lane;
+ const Value = json.Value;
+@@ -166,8 +168,8 @@ pub fn ownedByServer(srv: *const Server, raw: ?Value, specs: []const Value) bool
+     return false;
+ }
+ 
+-/// A reply's calls for its client (`own`: the default's tool `n`, whose unrun calls end the reply at length, unseen).
+-pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, found: ?[]Value, prose: []const u8) Allocator.Error!?[]Value {
++/// A reply's calls for its client (`own`: the default's tool `n`, unrun calls cut `prose` at `o`, `owned` bytes kept).
++pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, found: ?[]Value, prose: []const u8, o: reply_text.Openers, owned: ?reply_owned.Owned) Allocator.Error!?[]Value {
+     if (!own) return found;
+     const all: []const Value = found orelse &.{};
+     var kept: std.ArrayList(Value) = .empty;
+@@ -175,7 +177,7 @@ pub fn ownCalls(a: Allocator, own: bool, n: []const u8, reply: *chat.Reply, foun
+     const dropped = kept.items.len < all.len;
+     // a call the lane could not run (no room left), or one max_tokens cut: the budget ended the reply
+     if (dropped or (found == null and std.mem.eql(u8, reply.finish_reason, "length"))) {
+-        reply.content = try @import("reply_text.zig").cutProse(a, prose);
++        reply.content = try reply_owned.cutProse(a, prose, o, owned);
+         reply.finish_reason = "length";
+     }
+     return if (kept.items.len > 0) kept.items else null;
+diff --git a/zig/src/server/openai_calls.zig b/zig/src/server/openai_calls.zig
+index 22fcec3db..e065d123f 100644
+--- a/zig/src/server/openai_calls.zig
++++ b/zig/src/server/openai_calls.zig
+@@ -15,20 +15,21 @@ const choice: u32 = 0;
+ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
+     const tools = r.plan.input.tools;
+     if (tools.len == 0) return null;
++    const o = @import("reply_text.zig").openersOf(r.srv.markers);
+     if (reply.native_tool_format) {
+-        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, reply.native_calls, reply.content);
++        const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, reply.native_calls, reply.content, o, null);
+         const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse return null;
+         reply.content = try r.plan.policy.parsedContent(r.a, reply.content);
+         reply.finish_reason = "tool_calls";
+         reply.tool_calls_streamed = false;
+         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+     }
+-    const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
++    const parsed = try tool_parse.parseOwned(r.a, reply.content, tools, r.plan.policy.maxCalls(), reply.owned);
+     if (parsed.rejected_envelopes > 0) log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
+     // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
+     const cut = if (!r.plan.policy.single and std.mem.eql(u8, reply.finish_reason, "length")) try tool_stream.cutCalls(r.a, reply.content, tools) else null;
+-    if (cut != null) reply.content = try @import("reply_text.zig").cutProse(r.a, reply.content);
+-    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content);
++    if (cut != null) reply.content = try @import("reply_owned.zig").cutProse(r.a, reply.content, o, reply.owned);
++    const found = try @import("compute_turns.zig").ownCalls(r.a, r.plan.input.lane_own, r.srv.info.compute_tool.name, reply, cut orelse parsed.calls, if (cut != null) reply.content else parsed.content, o, if (cut != null) reply.owned else parsed.owned);
+     const calls = (if (r.turn != null) cortheon.clientCalls(found) else found) orelse {
+         if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+         return null;
+diff --git a/zig/src/server/reply_owned.zig b/zig/src/server/reply_owned.zig
+new file mode 100644
+index 000000000..d1d50e554
+--- /dev/null
++++ b/zig/src/server/reply_owned.zig
+@@ -0,0 +1,119 @@
++//! Engine-owned bytes in a reply's content, which no strip may cut; strip points are the format's call openers.
++const std = @import("std");
++const json = @import("json");
++const reply_text = @import("reply_text.zig");
++const tool_parse = @import("tool_parse.zig");
++const Openers = reply_text.Openers;
++const Allocator = std.mem.Allocator;
++
++/// Owned bytes of a reply's text: [lo, hi) from the first owned byte to the last, before any call block.
++pub const Owned = struct {
++    lo: usize,
++    hi: usize,
++
++    pub fn join(x: ?Owned, y: ?Owned) ?Owned {
++        const p = x orelse return y;
++        const q = y orelse return p;
++        return .{ .lo = @min(p.lo, q.lo), .hi = @max(p.hi, q.hi) };
++    }
++
++    pub fn shift(x: ?Owned, by: usize) ?Owned {
++        const o = x orelse return null;
++        return .{ .lo = o.lo + by, .hi = o.hi + by };
++    }
++};
++
++/// Where `text`'s first call block starts, as the stream's openers `o` or the final parser reads it; null: none.
++pub fn callStart(a: Allocator, text: []const u8, o: Openers) Allocator.Error!?usize {
++    var first = try tool_parse.firstEnvelope(a, text);
++    for (o.calls, 0..) |c, which| {
++        var pos: usize = 0;
++        while (reply_text.findTag(text, pos, c[0])) |at| {
++            if (first != null and at >= first.?) break;
++            pos = at + c[0].len;
++            if (reply_text.payloadOf(text[pos..], o, which, true) == .call) {
++                first = at;
++                break;
++            }
++        }
++    }
++    return first;
++}
++
++/// The owned span of `content` (in `raw`, `pieces` its tokens' bytes) before its first call block: `records`' writes.
++pub fn of(a: Allocator, records: []const []const u8, base: usize, pieces: []const []const u8, raw: []const u8, content: []const u8, o: Openers) Allocator.Error!?Owned {
++    if (records.len == 0) return null; // each a cell write: {"field":"content","token":T,"landed":N}
++    const from = @intFromPtr(content.ptr) -% @intFromPtr(raw.ptr); // past raw.len: content is not raw's bytes
++    // each token's first byte in `raw`, which the token bytes must spell exactly (a lossy decode is no map)
++    const at = try a.alloc(usize, pieces.len + 1);
++    at[0] = 0;
++    for (pieces, 0..) |p, i| {
++        at[i + 1] = at[i] + p.len;
++        if (at[i + 1] > raw.len or !std.mem.eql(u8, raw[at[i]..at[i + 1]], p)) return null;
++    }
++    if (at[pieces.len] != raw.len) return null;
++    const limit = (try callStart(a, content, o)) orelse content.len;
++    var span: ?Owned = null;
++    for (records) |text| {
++        const r = switch (try json.parse(a, text)) {
++            .ok => |v| v,
++            .err => continue,
++        };
++        if (!std.mem.eql(u8, r.strField("field") orelse "", "content")) continue;
++        const token = std.math.cast(usize, (r.get("token") orelse continue).int64() orelse continue) orelse continue;
++        const landed = std.math.cast(usize, (r.get("landed") orelse continue).int64() orelse continue) orelse continue;
++        if (token < base or token - base >= pieces.len) continue; // another segment's write
++        const lo = at[token - base];
++        const hi = at[@min(token - base + landed, pieces.len)];
++        if (lo < from or hi - from > limit or hi == lo) continue; // outside the content, in or past a call, or no bytes
++        span = Owned.join(span, .{ .lo = lo - from, .hi = hi - from });
++    }
++    return span;
++}
++
++/// ``pyRstrip(s).len``, never below an owned byte (the engine's, so its span stays in the text the client gets).
++fn keptEnd(s: []const u8, owned: ?Owned) usize {
++    const o = owned orelse return reply_text.pyRstrip(s).len;
++    if (o.hi > s.len) return reply_text.pyRstrip(s).len; // a span past `s`: not its offsets
++    return @max(reply_text.pyRstrip(s).len, aligned(s, o).hi);
++}
++
++/// `o` widened to whole code points of `s`, so a trim never splits one (the bytes it adds are kept, not owned).
++fn aligned(s: []const u8, o: Owned) Owned {
++    var lo = o.lo;
++    var hi = o.hi;
++    while (lo > 0 and lo < s.len and s[lo] & 0xc0 == 0x80) lo -= 1;
++    while (hi < s.len and s[hi] & 0xc0 == 0x80) hi += 1;
++    return .{ .lo = lo, .hi = hi };
++}
++
++/// ``pyStrip(s)`` with the engine's owned bytes kept: `owned` is in `s`'s offsets (Owned.shift moves it).
++pub fn strip(s: []const u8, owned: ?Owned) []const u8 {
++    const o = owned orelse return reply_text.pyStrip(s);
++    if (o.hi > s.len) return reply_text.pyStrip(s);
++    const lead = s.len - reply_text.pyLstrip(s).len;
++    return s[@min(lead, aligned(s, o).lo)..keptEnd(s, o)];
++}
++
++/// ``pyRstrip(s)`` with the engine's owned bytes kept.
++pub fn rstrip(s: []const u8, owned: ?Owned) []const u8 {
++    return s[0..keptEnd(s, owned)];
++}
++
++/// ``reply_text.finishedProse`` that keeps the owned bytes, its strip points the openers `o` (none owned: as before).
++pub fn finishedProse(a: Allocator, text: []const u8, o: Openers, owned: ?Owned) Allocator.Error![]const u8 {
++    if (owned == null) return reply_text.finishedProse(a, text);
++    // final parsing has not yet decided whether to strip the reply's content
++    if (reply_text.pyLstrip(text).len != text.len) return text[0..0];
++    var out: std.ArrayList(u8) = .empty;
++    const prose = try reply_text.hideInto(a, &out, text, true, true, o);
++    return if (prose.len != text.len) prose[0..keptEnd(prose, owned)] else prose;
++}
++
++/// ``reply_text.cutProse`` that keeps the owned bytes, its strip points the openers `o` (none owned: as before).
++pub fn cutProse(a: Allocator, text: []const u8, o: Openers, owned: ?Owned) Allocator.Error![]const u8 {
++    if (owned == null) return reply_text.cutProse(a, text);
++    var out: std.ArrayList(u8) = .empty;
++    const prose = try reply_text.hideInto(a, &out, text, false, false, o);
++    return if (prose.len != text.len) prose[0..keptEnd(prose, owned)] else prose;
++}
+diff --git a/zig/src/server/reply_owned_test.zig b/zig/src/server/reply_owned_test.zig
+new file mode 100644
+index 000000000..0d257df35
+--- /dev/null
++++ b/zig/src/server/reply_owned_test.zig
+@@ -0,0 +1,103 @@
++//! Owned bytes through each call format's strip points: Qwen's JSON and XML calls (Flash-Next) and DSML (DSV41).
++const std = @import("std");
++const json = @import("json");
++const reply_text = @import("reply_text.zig");
++const reply_owned = @import("reply_owned.zig");
++const tool_parse = @import("tool_parse.zig");
++const tool_stream = @import("tool_stream.zig");
++const Owned = reply_owned.Owned;
++const t = std.testing;
++
++const prose = "The value is 2^66 = 73786976294838206464 \n";
++const answer = "73786976294838206464 "; // the cell's write, its trailing blank the engine's too
++const qwen_json = "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\": \"1\"}}\n</tool_call>";
++const qwen_xml = "<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>";
++const dsml = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"f\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"x\" " ++
++    "string=\"true\">1</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
++const formats = [_][]const u8{ qwen_json, qwen_xml, dsml };
++const tools_json =
++    \\[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"x":{"type":"string"}}}}}]
++;
++
++fn span() Owned {
++    const lo = std.mem.indexOf(u8, prose, answer).?;
++    return .{ .lo = lo, .hi = lo + answer.len };
++}
++
++test "reply owned: every call format strips its prose up to the owned bytes, never into them" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = reply_text.shared_openers;
++    const kept = prose[0..span().hi];
++    inline for (formats) |call| {
++        const text = prose ++ call;
++        try t.expectEqual(@as(?usize, prose.len), try reply_owned.callStart(a, text, o));
++        try t.expectEqualStrings(kept, try reply_owned.finishedProse(a, text, o, span()));
++        try t.expectEqualStrings(kept, try reply_owned.cutProse(a, text[0 .. text.len - 5], o, span()));
++        // nothing owned: the strips as before, the trailing blank gone
++        try t.expectEqualStrings(try reply_text.finishedProse(a, text), try reply_owned.finishedProse(a, text, o, null));
++        try t.expectEqualStrings(try reply_text.cutProse(a, text), try reply_owned.cutProse(a, text, o, null));
++        try t.expectEqualStrings(kept[0 .. kept.len - 1], try reply_owned.finishedProse(a, text, o, null));
++        const tools = (try json.parse(a, tools_json)).ok.array;
++        const end = try tool_stream.endProseOwned(a, text, text, tools, "stop", true, o, span());
++        try t.expectEqualStrings(kept, end);
++        try t.expectEqualStrings(try tool_stream.endProse(a, text, text, tools, "stop", false), try tool_stream.endProseOwned(a, text, text, tools, "stop", false, o, null));
++    }
++}
++
++test "reply owned: the parser keeps owned bytes and gives them in the content's offsets, for each format" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, tools_json)).ok.array;
++    inline for (formats) |call| {
++        const text = "  " ++ prose ++ call;
++        const owned = Owned.shift(span(), 2);
++        const p = try tool_parse.parseOwned(a, text, tools, null, owned);
++        try t.expectEqual(@as(usize, 1), p.calls.?.len);
++        try t.expectEqualStrings(prose[0..span().hi], p.content);
++        try t.expectEqual(span(), p.owned.?);
++        const plain = try tool_parse.parse(a, text, tools, null);
++        try t.expectEqualStrings(std.mem.trimEnd(u8, prose, " \n"), plain.content);
++        try t.expectEqual(null, plain.owned);
++    }
++}
++
++test "reply owned: a strip never splits a code point; a span past the text is not its offsets" {
++    // the span ends inside U+3000 (a blank): the trim keeps the whole code point, not its first byte
++    try t.expectEqualStrings("ab\u{3000}", reply_owned.strip("ab\u{3000}", .{ .lo = 0, .hi = 3 }));
++    try t.expectEqualStrings("ab", reply_owned.strip("ab\u{3000}", null));
++    try t.expectEqualStrings(" ab", reply_owned.strip("  ab", .{ .lo = 1, .hi = 4 })); // an owned leading blank
++    try t.expectEqualStrings("ab", reply_owned.strip("ab  ", .{ .lo = 0, .hi = 40 }));
++    try t.expectEqual(Owned{ .lo = 1, .hi = 9 }, Owned.join(.{ .lo = 4, .hi = 9 }, .{ .lo = 1, .hi = 2 }).?);
++    try t.expectEqual(null, Owned.shift(null, 3));
++}
++
++fn record(a: std.mem.Allocator, field: []const u8, token: usize, landed: usize) ![]const u8 {
++    return std.fmt.allocPrint(a, "{{\"cell\":0,\"field\":\"{s}\",\"token\":{d},\"landed\":{d}}}", .{ field, token, landed });
++}
++
++test "reply owned: a cell write's tokens become its bytes in the content, before the format's first call" {
++    var arena: std.heap.ArenaAllocator = .init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const o = reply_text.shared_openers;
++    inline for (formats) |call| {
++        const pieces = [_][]const u8{ "plan", "</think>", "[2^66 = ", "73786976294838206464]", "\n", call };
++        const raw = try std.mem.concat(a, u8, &pieces);
++        const content = raw["plan</think>".len..];
++        const write = try record(a, "content", 7, 3);
++        try t.expectEqual(Owned{ .lo = 0, .hi = 30 }, (try reply_owned.of(a, &.{write}, 5, &pieces, raw, content, o)).?);
++        // another segment's write (base past it), a reasoning write, an empty one, one past the tokens: none
++        try t.expectEqual(null, try reply_owned.of(a, &.{write}, 8, &pieces, raw, content, o));
++        try t.expectEqual(null, try reply_owned.of(a, &.{try record(a, "reasoning", 7, 3)}, 5, &pieces, raw, content, o));
++        try t.expectEqual(null, try reply_owned.of(a, &.{try record(a, "content", 7, 0)}, 5, &pieces, raw, content, o));
++        try t.expectEqual(null, try reply_owned.of(a, &.{try record(a, "content", 12, 1)}, 5, &pieces, raw, content, o));
++        // a write in the call block owns nothing the prose keeps
++        try t.expectEqual(null, try reply_owned.of(a, &.{try record(a, "content", 10, 1)}, 5, &pieces, raw, content, o));
++        // content the server rewrote (not raw's bytes) owns nothing: offsets would not be its own
++        const copy = try a.dupe(u8, content);
++        try t.expectEqual(null, try reply_owned.of(a, &.{write}, 5, &pieces, raw, copy, o));
++    }
++}
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index b653c7cb5..ca77cf5d5 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -208,6 +208,7 @@ test {
+     _ = @import("compute_lane_http_test.zig");
+     _ = @import("compute_default_test.zig");
+     _ = @import("compute_default_fit_test.zig");
++    _ = @import("reply_owned_test.zig");
+     // the benchmark command's serve child runs under POSIX signals and waits; Windows refuses the command
+     if (comptime @import("builtin").os.tag != .windows) {
+         _ = @import("benchmark_suite.zig");
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index 149f673ff..dcbfa7dab 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const json = @import("json");
+ const ids = @import("ids.zig");
+ const reply_text = @import("reply_text.zig");
++const reply_owned = @import("reply_owned.zig");
+ const tool_closers = @import("tool_closers.zig");
+ const tool_dsml = @import("tool_dsml.zig");
+ const tool_params = @import("tool_params.zig");
+@@ -20,7 +21,7 @@ const Error = tool_dsml.Error;
+ const Call = tool_dsml.Call;
+ const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
+ 
+-pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0 };
++pub const Parsed = struct { content: []const u8, calls: ?[]Value, rejected_envelopes: usize = 0, owned: ?reply_owned.Owned = null };
+ 
+ fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
+     if (from > hay.len) return null;
+@@ -97,9 +98,20 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+     return kept.items;
+ }
+ 
++/// Where the first tool-call block of `text` starts, as `parse` finds them; null: none.
++pub fn firstEnvelope(a: Allocator, text: []const u8) Allocator.Error!?usize {
++    const envs = try envelopes(a, text);
++    return if (envs.len > 0) envs[0].start else null;
++}
++
+ /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
+ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
+-    if (tools.len == 0) return .{ .content = text, .calls = null };
++    return parseOwned(a, text, tools, max_calls, null);
++}
++
++/// ``parse`` whose strip keeps the engine's `owned` bytes of `text` (reply_owned.zig), given in the content's offsets.
++pub fn parseOwned(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, owned: ?reply_owned.Owned) Allocator.Error!Parsed {
++    if (tools.len == 0) return .{ .content = text, .calls = null, .owned = owned };
+     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+     for (tools) |tool| {
+         const name = try tool_specs.toolName(a, tool);
+@@ -108,7 +120,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+     if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
+     const schemas = try tool_params.schemas(a, tools);
+     const envs = try envelopes(a, text);
+-    if (envs.len == 0) return .{ .content = text, .calls = null };
++    if (envs.len == 0) return .{ .content = text, .calls = null, .owned = owned };
+     var calls: std.ArrayList(Value) = .empty;
+     var residue: std.ArrayList(u8) = .empty;
+     var cursor: usize = 0;
+@@ -152,7 +164,14 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+         }
+     }
+     try residue.appendSlice(a, text[cursor..]);
+-    return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected };
++    // owned bytes come before the first envelope, so the residue's offsets are the text's there
++    const content = reply_owned.strip(residue.items, owned);
++    var kept: ?reply_owned.Owned = null;
++    if (owned) |o| if (o.hi <= residue.items.len) {
++        const lead = @intFromPtr(content.ptr) -% @intFromPtr(residue.items.ptr);
++        if (o.lo >= lead and lead <= residue.items.len) kept = .{ .lo = o.lo - lead, .hi = o.hi - lead };
++    };
++    return .{ .content = content, .calls = if (calls.items.len > 0) calls.items else null, .rejected_envelopes = rejected, .owned = kept };
+ }
+ 
+ /// What closes the call ``text`` ends inside (the model's end token came before its ``
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+index 08672eed7..70c1a76f5 100644
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const json = @import("json");
+ const ids = @import("ids.zig");
+ const reply_text = @import("reply_text.zig");
++const reply_owned = @import("reply_owned.zig");
+ const tool_dsml = @import("tool_dsml.zig");
+ const tool_dsml_stream = @import("tool_dsml_stream.zig");
+ const tool_glm_cut = @import("tool_glm_cut.zig");
+@@ -378,6 +379,14 @@ pub fn endProse(a: Allocator, content: []const u8, text: []const u8, tools: []co
+     return if (cut) reply_text.cutProse(a, content) else reply_text.finishedProse(a, content);
+ }
+ 
++/// ``endProse`` keeping the engine's `owned` bytes of `content`, its strip points the reply's openers `o`.
++pub fn endProseOwned(a: Allocator, content: []const u8, text: []const u8, tools: []const Value, reason: []const u8, single: bool, o: reply_text.Openers, owned: ?reply_owned.Owned) Allocator.Error![]const u8 {
++    if (owned == null) return endProse(a, content, text, tools, reason, single);
++    if (single) return reply_owned.rstrip(try reply_owned.finishedProse(a, content, o, owned), owned);
++    const cut = std.mem.eql(u8, reason, "length") and (try cutCalls(a, text, tools)) != null;
++    return if (cut) reply_owned.cutProse(a, content, o, owned) else reply_owned.finishedProse(a, content, o, owned);
++}
++
+ /// A reply max_tokens cut inside a call: the calls its stream sent, the cut one included; null when none was left open.
+ pub fn cutCalls(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error!?[]Value {
+     var s: Streamer = try .init(a, tools);

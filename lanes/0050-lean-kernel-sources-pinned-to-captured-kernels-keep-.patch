@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jay Leaton <58495321+jayleaton@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 15:34:14 +0700
+Subject: [PATCH 50/79] lean: kernel sources pinned to captured kernels keep
+ their comments; a documentation address in a rank test
+
+Her Triton sources (triton/kv8.py, triton/prompt_mm.py) must stay byte-identical to the sources her captured kernel set hashes, so lean_check checks only their length. The rank-1 settings test uses 192.0.2.1 (TEST-NET-1) for the master address.
+---
+ tools/zig/lean_check.py                        | 7 +++++++
+ tools/zig/lean_check_test.py                   | 9 +++++++++
+ zig/src/families/flashnext_mia/cuda_native.zig | 2 +-
+ 3 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/tools/zig/lean_check.py b/tools/zig/lean_check.py
+index f56728f6c..9676b8324 100644
+--- a/tools/zig/lean_check.py
++++ b/tools/zig/lean_check.py
+@@ -21,6 +21,11 @@ GENERATOR_OUTPUT = (
+     "zig/src/families/flashnext/roles_gen.zig",
+     "zig/kernels/metal/flashnext/sources_gen.zig",
+ )
++# Kernel sources pinned to captured kernels' hashes (Triton hashes docstrings): comments as written; length checked.
++PINNED_SOURCES = (
++    "tools/zig/flashnext_mia/triton/kv8.py",
++    "tools/zig/flashnext_mia/triton/prompt_mm.py",
++)
+ # A setting read by name instead of through platform/environment.zig, which refuses malformed text.
+ DIRECT_GETENV = re.compile(r'\bgetenv\(\s*"((?:TF|TENSORFOLD)_[A-Za-z0-9_]*)"')
+ # A getenv of a name that is not a literal: a new wrapper or a held name would hide its setting from DIRECT_GETENV.
+@@ -68,6 +73,8 @@ def problems(path: Path) -> list[str]:
+     rel, found = path.relative_to(ROOT), []
+     if len(lines) > MAX_LINES and path.name not in GENERATED:
+         found.append(f"{rel}: {len(lines)} lines (split past {MAX_LINES})")
++    if rel.as_posix() in PINNED_SOURCES:
++        return found
+     comment = COMMENT[path.suffix]
+     settings = path.suffix == ".zig" and not test_only(rel.as_posix())
+     names_given = rel.as_posix() in NAME_READERS
+diff --git a/tools/zig/lean_check_test.py b/tools/zig/lean_check_test.py
+index 176082aba..016397dbc 100644
+--- a/tools/zig/lean_check_test.py
++++ b/tools/zig/lean_check_test.py
+@@ -96,5 +96,14 @@ class DirectGetenv(unittest.TestCase):
+         self.assertNotIn("TENSORFOLD_NO_UPDATE_CHECK", lean_check.lenient())
+ 
+ 
++class PinnedSources(unittest.TestCase):
++    def test_a_pinned_source_keeps_its_comments_but_not_its_length(self):
++        pinned = lean_check.PINNED_SOURCES[0]
++        text = '"""Two-line\ndocstring."""\n# a\n# b\n'
++        self.assertEqual(lean_check.problems(Text(pinned, text)), [])
++        self.assertEqual(len(lean_check.problems(Text("tools/zig/other.py", text))), 2)
++        with patch.object(lean_check, "MAX_LINES", 2):
++            self.assertEqual(lean_check.problems(Text(pinned, text)), [f"{Path(pinned)}: 4 lines (split past 2)"])
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/zig/src/families/flashnext_mia/cuda_native.zig b/zig/src/families/flashnext_mia/cuda_native.zig
+index 9f1edb65e..597e7dd4e 100644
+--- a/zig/src/families/flashnext_mia/cuda_native.zig
++++ b/zig/src/families/flashnext_mia/cuda_native.zig
+@@ -435,7 +435,7 @@ test "the settings text names everything both ranks must share" {
+     const a = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 0 }, 6, null);
+     defer gpa.free(a);
+     // rank 1's text differs only where its settings do: the rank itself is not part of it
+-    const b = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 1, .master = "10.0.34.1" }, 6, null);
++    const b = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 32768, .drafts = true, .tp = 2, .rank = 1, .master = "192.0.2.1" }, 6, null);
+     defer gpa.free(b);
+     try std.testing.expectEqualStrings(a, b);
+     const c = try settingsText(gpa, "fc694b54", @splat(1), @splat(2), .{ .context = 65536, .drafts = true, .tp = 2 }, 6, .{ .factor = 4, .original = 262144 });
